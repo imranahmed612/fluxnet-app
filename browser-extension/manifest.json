@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "FluxNet Download Detection",
+  "version": "0.2.0",
+  "description": "Automatically detect browser media and eligible downloads and send user-approved links to FluxNet.",
+  "icons": {
+    "16": "icons/fluxnet-16.png",
+    "32": "icons/fluxnet-32.png",
+    "48": "icons/fluxnet-48.png",
+    "128": "icons/fluxnet-128.png"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "nativeMessaging",
+    "tabs",
+    "webRequest",
+    "downloads"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "FluxNet detected media and downloads",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/fluxnet-16.png",
+      "32": "icons/fluxnet-32.png"
+    }
+  }
+}

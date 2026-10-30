@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Download with FluxNet</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body class="prompt-body">
+    <main class="prompt-main">
+      <header class="prompt-header">
+        <img class="brand-mark" src="icons/fluxnet-48.png" alt="">
+        <div><h1>Download with FluxNet</h1><p id="prompt-kind">Browser download detected</p></div>
+      </header>
+      <section class="prompt-details">
+        <strong id="filename">Loading…</strong>
+        <span id="source"></span>
+        <span id="type"></span>
+        <span id="size"></span>
+        <p id="limitation" class="prompt-limitation"></p>
+      </section>
+      <label class="remember-choice"><input id="remember" type="checkbox"> Remember my choice for this file type</label>
+      <p id="prompt-feedback" role="status"></p>
+      <div class="prompt-actions">
+        <button id="accept" class="primary">Download with FluxNet</button>
+        <button id="continue" class="secondary">Continue with browser</button>
+      </div>
+    </main>
+    <script type="module" src="prompt.js"></script>
+  </body>
+</html>

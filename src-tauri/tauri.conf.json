@@ -24,7 +24,16 @@
   "bundle": {
     "active": true,
     "publisher": "Imran",
-    "targets": "all",
+    "targets": ["nsis"],
+    "resources": {
+      "../browser-extension/install-native-host.ps1": "install-native-host.ps1",
+      "../browser-extension/uninstall-native-host.ps1": "uninstall-native-host.ps1"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows/installer-hooks.nsh"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

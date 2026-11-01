@@ -3194,34 +3194,10 @@ h2 {
   line-height: 1.6;
 }
 
-.video-setup-steps code,
-.video-pairing-code code {
+.video-setup-steps code {
   color: #75d7df;
   font: 10px Consolas, monospace;
   overflow-wrap: anywhere;
-}
-
-.video-pairing-code {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 11px;
-  margin-top: 15px;
-  padding: 11px;
-  border: 1px solid rgba(71, 203, 215, 0.17);
-  border-radius: 5px;
-  background: rgba(9, 17, 28, 0.72);
-}
-
-.video-pairing-code > span {
-  color: #9cabc0;
-  font-size: 10px;
-}
-
-.video-pairing-code > code {
-  flex: 1;
-  min-width: 180px;
-  user-select: all;
 }
 
 .video-setup-note,

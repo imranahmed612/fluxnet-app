@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNod
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save } from "@tauri-apps/plugin-dialog";
+import { createBrowserHandoffRunner } from "./browserHandoff.mjs";
 import fluxnetSymbol from "./assets/fluxnet-symbol-128.png";
 import "./App.css";
 
@@ -41,6 +42,8 @@ type NetworkInterface = {
   linkSpeedMbps: number | null;
   bytesReceived: string | null;
   bytesSent: string | null;
+  downloadMbps: number | null;
+  uploadMbps: number | null;
   wifiSsid: string | null;
   wifiSignalQuality: number | null;
   wifiFrequencyMhz: number | null;
@@ -94,6 +97,10 @@ type QualityMonitorUpdate = {
     level: "excellent" | "good" | "fair" | "poor" | "disconnected" | "noData";
     explanation: string;
   };
+  interfaces: NetworkInterface[];
+  downloadMbps: number;
+  uploadMbps: number;
+  interfaceError: string | null;
 };
 
 type QualityMonitorStatus = {
@@ -405,22 +412,25 @@ function MetricCard({
   title,
   icon,
   detail,
+  value,
 }: {
   title: string;
   icon: IconName;
   detail: string;
+  value: number | null;
 }) {
+  const unit = title === "Latency" ? "ms" : title === "Packet loss" ? "%" : "Mbps";
   return (
     <article className="metric-card">
       <div className="metric-top">
         <span className="metric-icon"><Icon name={icon} size={18} /></span>
         <span className="metric-title">{title}</span>
-        <span className="unavailable-dot" title="Telemetry unavailable" />
+        <span className={value === null ? "unavailable-dot" : "available-dot"} title={value === null ? "Waiting for telemetry" : "Live Windows telemetry"} />
       </div>
-      <div className="metric-value">—<span className="metric-unit"> {title === "Latency" ? "ms" : title === "Packet loss" ? "%" : "Mbps"}</span></div>
+      <div className="metric-value">{value === null ? "—" : value.toFixed(2)}<span className="metric-unit"> {unit}</span></div>
       <div className="metric-bottom">
         <span>{detail}</span>
-        <span className="metric-unavailable">Unavailable</span>
+        <span className={value === null ? "metric-unavailable" : "metric-available"}>{value === null ? "Waiting" : "Live"}</span>
       </div>
     </article>
   );
@@ -697,6 +707,7 @@ function Dashboard({
   isDiagnosticLoading,
   diagnosticError,
   onTestConnection,
+  telemetry,
 }: {
   onNavigate: (page: string) => void;
   interfaces: NetworkInterface[] | null;
@@ -709,6 +720,7 @@ function Dashboard({
   isDiagnosticLoading: boolean;
   diagnosticError: string | null;
   onTestConnection: () => void;
+  telemetry: QualityMonitorUpdate | null;
 }) {
   const operationalCount = interfaces?.filter(
     (networkInterface) => networkInterface.operationalStatus === "Up",
@@ -780,14 +792,14 @@ function Dashboard({
           <div className="eyebrow">PERFORMANCE</div>
           <h2>Connection metrics</h2>
         </div>
-        <span className="data-note"><span /> Traffic metrics require a future data source</span>
+        <span className="data-note"><span /> Shared Windows network telemetry</span>
       </div>
 
       <div className="metrics-grid">
-        <MetricCard title="Latency" icon="latency" detail="Round-trip time" />
-        <MetricCard title="Packet loss" icon="packet" detail="Packets lost" />
-        <MetricCard title="Download" icon="download" detail="Current throughput" />
-        <MetricCard title="Upload" icon="upload" detail="Current throughput" />
+        <MetricCard title="Latency" icon="latency" detail="ICMP round-trip time" value={telemetry?.probe.status === "success" ? telemetry.probe.latencyMs : null} />
+        <MetricCard title="Packet loss" icon="packet" detail="Rolling ICMP packet loss" value={telemetry?.rollingStats.packetLossPercent ?? null} />
+        <MetricCard title="Download" icon="download" detail="Physical Ethernet and Wi-Fi" value={telemetry?.downloadMbps ?? null} />
+        <MetricCard title="Upload" icon="upload" detail="Physical Ethernet and Wi-Fi" value={telemetry?.uploadMbps ?? null} />
       </div>
 
       <div className="content-grid">
@@ -1053,21 +1065,14 @@ function SettingsPage({
               ? `Connected · authenticated ${browserStatus.lastHandshakeAtMs ? `${Math.max(0, Math.floor((Date.now() - browserStatus.lastHandshakeAtMs) / 1000))}s ago` : "recently"}`
               : browserStatus?.connectionStatus === "disconnected"
                 ? "Disconnected · handshake failed or expired"
-                : "Awaiting pairing · no authenticated handshake"}
+                : "Awaiting extension connection"}
           </strong></div>
-          <div><span>Pairing</span><strong>{browserStatus?.connectionStatus === "connected" ? "Paired · recent handshake" : "Paste the current code into the extension popup"}</strong></div>
         </div>
         <div className="settings-browser-actions">
           <button className="secondary-button" type="button" onClick={() => void refreshBrowserStatus()}>Refresh connection status</button>
-          <button className="secondary-button" type="button" onClick={() => {
-            void invoke("copy_browser_pairing_code").then(
-              () => setFeedback({ kind: "success", message: "Pairing code copied to the Windows clipboard." }),
-              (error: unknown) => setFeedback({ kind: "error", message: `Could not copy pairing code: ${error instanceof Error ? error.message : String(error)}` }),
-            );
-          }} disabled={!browserStatus?.pairingCode}>Copy pairing code</button>
           <button className="secondary-button" type="button" onClick={() => onNavigate("Video Detection")}>Troubleshoot / setup</button>
         </div>
-        <p className="settings-note">Refresh rereads the Windows host registration and recent authenticated extension handshake. “Connected” means a valid Native Messaging request was received within the last 30 seconds; Native Messaging itself is not a persistent connection. Start a new handshake from the extension popup. No cookies or authorization data are shared.</p>
+        <p className="settings-note">The extension connects automatically and retries when FluxNet becomes available; no pairing code is required. Refresh rereads the Windows host registration and recent authenticated extension handshake. “Connected” means a valid Native Messaging request was received within the last 150 seconds. Native Messaging itself is not a persistent connection. No cookies or authorization data are shared.</p>
       </section>
 
       <section className="panel settings-section">
@@ -1172,43 +1177,14 @@ function NetworkInterfacesPage({
   onRefresh: () => void;
 }) {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  const [rates, setRates] = useState<Record<string, { download: number; upload: number }>>({});
-  const previousCounters = useRef(new Map<string, { received: bigint; sent: bigint; at: number }>());
   const adapterKey = (networkInterface: NetworkInterface) =>
     `${networkInterface.name}\u0000${networkInterface.adapterType ?? ""}`;
-
-  useEffect(() => {
-    if (!interfaces) return;
-    const now = performance.now();
-    const nextPrevious = new Map<string, { received: bigint; sent: bigint; at: number }>();
-    const nextRates: Record<string, { download: number; upload: number }> = {};
-    for (const networkInterface of interfaces) {
-      const key = adapterKey(networkInterface);
-      const received = parseNetworkCounter(networkInterface.bytesReceived);
-      const sent = parseNetworkCounter(networkInterface.bytesSent);
-      if (received === null || sent === null) continue;
-      const previous = previousCounters.current.get(key);
-      if (previous && now > previous.at) {
-        const elapsedMs = now - previous.at;
-        const downloadDelta = received >= previous.received ? received - previous.received : 0n;
-        const uploadDelta = sent >= previous.sent ? sent - previous.sent : 0n;
-        nextRates[key] = {
-          download: Number(downloadDelta * 8n) / (elapsedMs * 1000),
-          upload: Number(uploadDelta * 8n) / (elapsedMs * 1000),
-        };
-      }
-      nextPrevious.set(key, { received, sent, at: now });
-    }
-    previousCounters.current = nextPrevious;
-    setRates(nextRates);
-  }, [interfaces]);
 
   const activeAdapter = interfaces?.find((networkInterface) => (
     adapterKey(networkInterface) === selectedKey
   )) ?? interfaces?.find((networkInterface) => networkInterface.operationalStatus === "Up")
     ?? interfaces?.[0] ?? null;
   const activeKey = activeAdapter ? adapterKey(activeAdapter) : null;
-  const activeRates = activeKey ? rates[activeKey] : undefined;
 
   return (
     <section className="network-page">
@@ -1219,7 +1195,7 @@ function NetworkInterfacesPage({
           <p className="page-subtitle">Live adapter details and system-reported traffic counters.</p>
         </div>
         <div className="network-page-actions">
-          <span className="network-live"><i /> AUTO REFRESH · 2 SEC</span>
+          <span className="network-live"><i /> SHARED LIVE MONITOR</span>
           <button
             className="refresh-button"
             type="button"
@@ -1311,11 +1287,11 @@ function NetworkInterfacesPage({
             <div className="network-throughput">
               <div className="network-throughput-card">
                 <span><Icon name="download" size={16} /> DOWNLOAD</span>
-                <strong>{activeRates ? activeRates.download.toFixed(2) : "—"} <small>Mbps</small></strong>
+                <strong>{activeAdapter.downloadMbps !== null ? activeAdapter.downloadMbps.toFixed(2) : "—"} <small>Mbps</small></strong>
               </div>
               <div className="network-throughput-card is-upload">
                 <span><Icon name="upload" size={16} /> UPLOAD</span>
-                <strong>{activeRates ? activeRates.upload.toFixed(2) : "—"} <small>Mbps</small></strong>
+                <strong>{activeAdapter.uploadMbps !== null ? activeAdapter.uploadMbps.toFixed(2) : "—"} <small>Mbps</small></strong>
               </div>
             </div>
 
@@ -1618,6 +1594,10 @@ function NetworkQualityPage({
     setIsStopping(true);
     try {
       await invoke("stop_quality_monitor");
+      runningRef.current = false;
+      setIsRunning(false);
+      setIsStopping(false);
+      setStatus("stopped");
     } catch (stopError) {
       setIsStopping(false);
       setError(stopError instanceof Error ? stopError.message : String(stopError));
@@ -1750,7 +1730,6 @@ function NetworkQualityPage({
             <input
               value={target}
               maxLength={253}
-              disabled={isRunning}
               onChange={(event) => setTarget(event.currentTarget.value)}
               onBlur={() => void persistMonitorOptions(target, intervalSeconds)}
             />
@@ -1759,7 +1738,6 @@ function NetworkQualityPage({
             Probe interval
             <select
               value={intervalSeconds}
-              disabled={isRunning}
               onChange={(event) => {
                 const nextInterval = Number(event.currentTarget.value);
                 setIntervalSeconds(nextInterval);
@@ -2522,7 +2500,6 @@ function displayDownloadUrl(value: string): string {
 }
 
 type BrowserBridgeStatus = {
-  pairingCode: string;
   connectionStatus: "connected" | "disconnected" | "awaitingPairing";
   lastHandshakeAtMs: number | null;
   nativeHostStatus: "installed" | "notInstalled" | "unsupported";
@@ -2556,7 +2533,7 @@ function mapBrowserMediaResource(
   const initial: BrowserMediaResource = {
     ...payload,
     queueState: unsupported ? "unsupported" : "detected",
-    message: unsupported ? "Manifest detected; FluxNet does not download HLS or DASH streams." : null,
+    message: unsupported ? "Manifest detected; segment merging is unavailable, so FluxNet cannot create a complete video file." : null,
   };
   if (unsupported) return initial;
   const entry = downloads.find((download) => download.url === payload.url);
@@ -2703,7 +2680,7 @@ function VideoDetectionPage({ defaultDownloadDirectory }: { defaultDownloadDirec
     ? `Connected · ${bridge.lastHandshakeAtMs ? `${Math.max(0, Math.floor((Date.now() - bridge.lastHandshakeAtMs) / 1000))}s ago` : "recent handshake"}`
     : bridge?.connectionStatus === "disconnected"
       ? "Disconnected"
-      : "Awaiting pairing";
+      : "Awaiting connection";
 
   return (
     <div className="page video-page">
@@ -2722,26 +2699,16 @@ function VideoDetectionPage({ defaultDownloadDirectory }: { defaultDownloadDirec
         <div className="panel-heading">
           <div>
             <div className="eyebrow">SECURE EXTENSION HANDOFF</div>
-            <h2>Pair Chrome or Edge</h2>
+            <h2>Connect Chrome or Edge</h2>
           </div>
         </div>
         <ol className="video-setup-steps">
           <li>Build the native host with <code>cargo build --manifest-path src-tauri\Cargo.toml --release --bin fluxnet_native_host</code>.</li>
           <li>Load <code>browser-extension\</code> as an unpacked extension from <code>chrome://extensions</code> or <code>edge://extensions</code> with Developer mode enabled.</li>
-          <li>Copy the extension ID(s) and run <code>browser-extension\install-native-host.ps1</code> with those IDs and the built host executable path. Supply both IDs if Chrome and Edge assign different IDs.</li>
-          <li>Open the extension popup, paste the pairing code below into its settings, then choose Connect.</li>
+          <li>Run <code>browser-extension\install-native-host.ps1 -HostExePath src-tauri\target\release\fluxnet_native_host.exe -Browser Both</code>.</li>
+          <li>Keep FluxNet open; the extension connects automatically and retries when the app becomes available.</li>
         </ol>
-        <div className="video-pairing-code">
-          <span>FluxNet pairing code</span>
-          <code>{bridge?.pairingCode ?? "Loading…"}</code>
-          <button type="button" className="secondary-button" disabled={!bridge?.pairingCode}
-            onClick={() => {
-              void invoke("copy_browser_pairing_code")
-                .then(() => reportFeedback("Pairing code copied to the Windows clipboard."))
-                .catch((copyError: unknown) => reportFeedback(`Could not copy pairing code: ${copyError instanceof Error ? copyError.message : String(copyError)}`, "error"));
-            }}>Copy code</button>
-        </div>
-        <p className="video-setup-note">Native Messaging is Windows-only in this version. The bridge uses a per-user named pipe; pair only extensions you trust. “Connected” means a valid authenticated Native Messaging request was received within the last 30 seconds; the host does not keep a persistent connection.</p>
+        <p className="video-setup-note">Native Messaging is Windows-only in this version. The extension's stable ID is allowlisted by the per-user Native Messaging host; no pairing code is required. “Connected” means a valid Native Messaging request was received within the last 150 seconds; the host does not keep a persistent connection.</p>
       </section>
 
       {feedback && (
@@ -2772,7 +2739,7 @@ function VideoDetectionPage({ defaultDownloadDirectory }: { defaultDownloadDirec
           <div className="download-empty-state">
             <Icon name="video" size={24} />
             <strong>No resources sent yet</strong>
-            <span>Browse normally; the extension detects eligible media and downloads automatically. Manual scanning remains available.</span>
+            <span>Browse normally; the extension detects supported video resources. Downloads start only after you choose them in the player overlay. Manual scanning remains available.</span>
           </div>
         ) : (
           <div className="video-resource-list">
@@ -3154,6 +3121,7 @@ function App() {
     () => localStorage.getItem("fluxnet.tray-notice-dismissed") !== "true",
   );
   const [interfaces, setInterfaces] = useState<NetworkInterface[] | null>(null);
+  const [networkTelemetry, setNetworkTelemetry] = useState<QualityMonitorUpdate | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [diagnosticHostname, setDiagnosticHostname] = useState("1.1.1.1");
@@ -3180,7 +3148,7 @@ function App() {
   const [browserHandoffError, setBrowserHandoffError] = useState<string | null>(null);
   const speedTestStartedAt = useRef<number | null>(null);
   const interfaceRefreshInFlight = useRef(false);
-  const handledBrowserHandoffs = useRef(new Set<string>());
+  const runBrowserHandoff = useRef(createBrowserHandoffRunner());
 
   useEffect(() => {
     let disposed = false;
@@ -3226,36 +3194,38 @@ function App() {
     let unlisten: (() => void) | undefined;
     void listen<BrowserMediaPayload>("browser-download-handoff", async (event) => {
       const resource = event.payload;
-      if (handledBrowserHandoffs.current.has(resource.url)) return;
-      handledBrowserHandoffs.current.add(resource.url);
-      setBrowserHandoffError(null);
-      setActivePage("Video Detection");
-      try {
-        const downloads = await invoke<DownloadEntry[]>("get_downloads");
-        const existing = downloads.find((entry) => entry.url === resource.url
-          && ["queued", "downloading", "paused", "completed"].includes(entry.status));
-        if (existing) {
-          setActivePage("Download Manager");
-          return;
-        }
-        const suggestedFilename = resource.filename
-          || await invoke<string>("get_download_filename", { url: resource.url });
-        const defaultPath = appSettings.defaultDownloadDirectory
-          ? `${appSettings.defaultDownloadDirectory.replace(/[\\/]$/, "")}\\${suggestedFilename}`
-          : suggestedFilename;
-        const destination = await save({
-          title: "Save browser download with FluxNet",
-          defaultPath,
-        });
-        if (!destination) return;
-        await invoke<DownloadEntry>("start_download", { url: resource.url, destination });
-        setActivePage("Download Manager");
-      } catch (handoffError) {
-        const detail = handoffError instanceof Error ? handoffError.message : String(handoffError);
-        console.error("Could not queue the accepted browser download:", handoffError);
-        setBrowserHandoffError(`FluxNet could not queue this item (${detail}). Your original browser download continues.`);
+      await runBrowserHandoff.current(resource.url, async () => {
+        setBrowserHandoffError(null);
         setActivePage("Video Detection");
-      }
+        try {
+          const downloads = await invoke<DownloadEntry[]>("get_downloads");
+          const existing = downloads.find((entry) => entry.url === resource.url
+            && ["queued", "downloading", "paused", "completed"].includes(entry.status));
+          if (existing) {
+            setActivePage("Download Manager");
+            return true;
+          }
+          const suggestedFilename = resource.filename
+            || await invoke<string>("get_download_filename", { url: resource.url });
+          const defaultPath = appSettings.defaultDownloadDirectory
+            ? `${appSettings.defaultDownloadDirectory.replace(/[\\/]$/, "")}\\${suggestedFilename}`
+            : suggestedFilename;
+          const destination = await save({
+            title: "Save browser download with FluxNet",
+            defaultPath,
+          });
+          if (!destination) return false;
+          await invoke<DownloadEntry>("start_download", { url: resource.url, destination });
+          setActivePage("Download Manager");
+          return true;
+        } catch (handoffError) {
+          const detail = handoffError instanceof Error ? handoffError.message : String(handoffError);
+          console.error("Could not queue the accepted browser download:", handoffError);
+          setBrowserHandoffError(`FluxNet could not queue this item (${detail}). Your original browser download continues.`);
+          setActivePage("Video Detection");
+          return false;
+        }
+      });
     }).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
@@ -3408,12 +3378,24 @@ function App() {
   }, [refreshInterfaces]);
 
   useEffect(() => {
-    if (activePage !== "Network Interfaces") return;
-    const timer = window.setInterval(() => {
-      void refreshInterfaces(false);
-    }, 2000);
-    return () => window.clearInterval(timer);
-  }, [activePage, refreshInterfaces]);
+    let unlisten: (() => void) | undefined;
+    let active = true;
+    void listen<QualityMonitorUpdate>("network-monitor-update", (event) => {
+      setNetworkTelemetry(event.payload);
+      setInterfaces(event.payload.interfaces);
+      setError(event.payload.interfaceError);
+      setIsLoading(false);
+    }).then((stopListening) => {
+      if (active) unlisten = stopListening;
+      else stopListening();
+    }).catch((listenError: unknown) => {
+      console.error("Could not subscribe to shared network telemetry:", listenError);
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     if (!isSpeedTestRunning) return;
@@ -3476,6 +3458,7 @@ function App() {
             isDiagnosticLoading={isDiagnosticLoading}
             diagnosticError={diagnosticError}
             onTestConnection={() => void testConnection()}
+            telemetry={networkTelemetry}
           />
         ) : (
           activePage === "Network Interfaces" ? (

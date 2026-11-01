@@ -3,6 +3,7 @@
   "name": "FluxNet Download Detection",
   "version": "0.2.0",
   "description": "Automatically detect browser media and eligible downloads and send user-approved links to FluxNet.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsB0DWM3+mHTgpmsCMQ7/lpaDi1HUpe1hl/izVc6Ah5B0izmGIECBhn3i8utFPDEvETxWXLgTSVIUDdgPpIIbOaxbOfHqskYZFgNyhutXmK3rAU7ZSRCPBlWF3nxE1rjKWgbaK0lcb/P/n69c33kIBJZuJsQYKSrco6KjUluXd7s9eYCEsnfVe5bFCE6nkIUL2rvILEYC1zCJKeawHtQCiolwNWdyRpvOKQ5Us8U4y19ev5YtG4dxjpPw4xj6sY9A2JdvIlELISTKF8RXEJXmlbIBLO62ZzYxpktXTy9OOVI67U6O0zwkYNDcbKeYol7bdtPbW3T3kBJ2PYeVxDI1jQIDAQAB",
   "icons": {
     "16": "icons/fluxnet-16.png",
     "32": "icons/fluxnet-32.png",
@@ -14,6 +15,7 @@
     "scripting",
     "storage",
     "nativeMessaging",
+    "alarms",
     "tabs",
     "webRequest",
     "downloads"
@@ -29,7 +31,7 @@
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["content.js"],
+      "js": ["video-sources.js", "content.js"],
       "run_at": "document_idle"
     }
   ],

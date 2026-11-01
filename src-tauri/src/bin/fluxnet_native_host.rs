@@ -10,6 +10,7 @@ fn main() {
     }
 
     const MAX_NATIVE_MESSAGE: usize = 64 * 1024;
+    const TRUSTED_EXTENSION_ID: &str = "clgiddogjgpjllmjgpffopnmighkmhae";
     let result = (|| -> Result<(), String> {
         let origin = std::env::args_os()
             .nth(1)
@@ -19,12 +20,8 @@ fn main() {
             .strip_prefix("chrome-extension://")
             .and_then(|value| value.strip_suffix('/'))
             .ok_or_else(|| "The Native Messaging caller origin is invalid.".to_owned())?;
-        if extension_id.len() != 32
-            || !extension_id
-                .chars()
-                .all(|character| ('a'..='p').contains(&character))
-        {
-            return Err("The Native Messaging caller is not a valid Chromium extension.".into());
+        if extension_id != TRUSTED_EXTENSION_ID {
+            return Err("The Native Messaging caller is not the FluxNet extension.".into());
         }
         let config_dir = std::env::var_os("APPDATA").ok_or_else(|| {
             "The Windows roaming application data path is unavailable.".to_owned()
@@ -58,10 +55,28 @@ fn main() {
         if length == 0 || length > MAX_NATIVE_MESSAGE {
             return Err("Native message length is outside the permitted range.".into());
         }
-        let mut payload = vec![0; length];
+        let mut browser_message = vec![0; length];
         input
-            .read_exact(&mut payload)
+            .read_exact(&mut browser_message)
             .map_err(|error| error.to_string())?;
+        let mut message: serde_json::Value = serde_json::from_slice(&browser_message)
+            .map_err(|_| "The browser message is invalid.".to_owned())?;
+        let message_object = message
+            .as_object_mut()
+            .ok_or_else(|| "The browser message must be a JSON object.".to_owned())?;
+        if !matches!(
+            message_object
+                .get("action")
+                .and_then(serde_json::Value::as_str),
+            Some("ping" | "sendMedia" | "sendDownload" | "reportUnsupported")
+        ) {
+            return Err("The browser action is not supported.".into());
+        }
+        message_object.insert(
+            "extensionId".into(),
+            serde_json::Value::String(extension_id.to_owned()),
+        );
+        let payload = serde_json::to_vec(&message).map_err(|error| error.to_string())?;
         let mut pipe = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

@@ -13,15 +13,8 @@
         <div><h1>Download detection</h1><p>Automatic media monitoring</p></div>
         <span id="connection" class="connection">Needs setup</span>
       </header>
-      <section class="pairing">
-        <label for="pairing-code">FluxNet pairing code</label>
-        <div class="pairing-row">
-          <input id="pairing-code" type="password" maxlength="64" autocomplete="off" placeholder="Paste code from FluxNet">
-          <button id="connect" class="secondary">Connect</button>
-        </div>
-      </section>
       <button id="scan" class="primary">Scan this tab</button>
-      <p id="feedback" role="status">Automatic detection is active; scan remains available as a manual refresh.</p>
+      <p id="feedback" role="status">Automatic detection is active; scan remains available as a manual refresh. FluxNet connects automatically when available.</p>
       <section>
         <div class="section-title">Detected video resources</div>
         <div id="resources" aria-live="polite"></div>
@@ -31,11 +24,6 @@
         <label class="setting-check"><input id="automatic-video" type="checkbox"> Automatic video detection</label>
         <label class="setting-check"><input id="automatic-download" type="checkbox"> Automatic browser download prompts</label>
         <label class="setting-check"><input id="video-overlay" type="checkbox"> Video player overlay</label>
-        <label for="notification-behavior">Video notification behavior</label>
-        <select id="notification-behavior">
-          <option value="badgeOnly">Badge only</option>
-          <option value="desktopPrompt">Open a prompt for each new direct video</option>
-        </select>
         <label for="file-types">Allowed file types (comma-separated)</label>
         <textarea id="file-types" rows="3"></textarea>
         <label for="excluded-domains">Excluded domains (comma-separated)</label>

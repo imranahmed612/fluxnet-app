@@ -1,8 +1,5 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateNotNullOrEmpty()]
-  [string[]]$ExtensionId,
-  [Parameter(Mandatory = $true)]
   [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
   [string]$HostExePath,
   [ValidateSet('Chrome', 'Edge', 'Both')]
@@ -10,11 +7,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-foreach ($id in $ExtensionId) {
-  if ($id -notmatch '^[a-p]{32}$') {
-    throw "Invalid Chromium extension ID: $id"
-  }
-}
+$extensionId = 'clgiddogjgpjllmjgpffopnmighkmhae'
 $hostName = 'com.fluxnet.browser'
 $hostPath = (Resolve-Path -LiteralPath $HostExePath).Path
 $manifestDirectory = Join-Path $env:LOCALAPPDATA 'FluxNet\browser-native-host'
@@ -25,7 +18,7 @@ $manifest = @{
   description = 'FluxNet browser media handoff'
   path = $hostPath
   type = 'stdio'
-  allowed_origins = @($ExtensionId | ForEach-Object { "chrome-extension://$_/" })
+  allowed_origins = @("chrome-extension://$extensionId/")
 } | ConvertTo-Json -Depth 4
 [System.IO.File]::WriteAllText(
   $manifestPath,
@@ -47,4 +40,4 @@ foreach ($registryPath in $registryPaths) {
 }
 Write-Host "Registered FluxNet Native Messaging host for $Browser."
 Write-Host "Manifest: $manifestPath"
-Write-Host "Extension ID(s) allowlisted: $($ExtensionId -join ', ')"
+Write-Host "Extension ID allowlisted: $extensionId"

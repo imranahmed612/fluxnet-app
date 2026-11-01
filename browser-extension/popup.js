@@ -8,7 +8,6 @@ import {
 } from "./media.js";
 
 const byId = (id) => document.getElementById(id);
-const pairingInput = byId("pairing-code");
 const statusNode = byId("connection");
 const feedback = byId("feedback");
 const resourceContainer = byId("resources");
@@ -32,20 +31,14 @@ function sendNativeMessage(message) {
   });
 }
 
-async function loadPairingCode() {
-  const { pairingCode } = await chrome.storage.local.get("pairingCode");
-  pairingInput.value = typeof pairingCode === "string" ? pairingCode : "";
-  if (!/^[0-9a-f]{32}$/i.test(pairingInput.value)) {
-    setStatus("needsSetup");
-    return;
-  }
+async function connectToFluxNet() {
   try {
-    await sendNativeMessage({ action: "ping", pairingCode: pairingInput.value });
+    await sendNativeMessage({ action: "ping" });
     setStatus("connected");
-    feedback.textContent = "Connected to FluxNet. Automatic detection is active; confirm every handoff.";
+    feedback.textContent = "Connected to FluxNet. Automatic detection is active; approve each download handoff.";
   } catch (error) {
     setStatus("disconnected");
-    feedback.textContent = `${error.message}. Open FluxNet and retry the connection.`;
+    feedback.textContent = `${error.message}. FluxNet will reconnect automatically when available.`;
   }
 }
 
@@ -53,7 +46,6 @@ function populateSettings(settings) {
   byId("automatic-video").checked = settings.automaticVideoDetection;
   byId("automatic-download").checked = settings.automaticDownloadDetection;
   byId("video-overlay").checked = settings.videoOverlay;
-  byId("notification-behavior").value = settings.notificationBehavior;
   byId("file-types").value = settings.fileTypes.join(", ");
   byId("excluded-domains").value = settings.excludedDomains.join(", ");
 }
@@ -102,7 +94,6 @@ function renderResources(resources) {
     send.className = "send";
     send.textContent = resource.downloadable ? "Send to FluxNet" : "Report unsupported manifest";
     send.addEventListener("click", async () => {
-      const { pairingCode } = await chrome.storage.local.get("pairingCode");
       const message = {
         url: resource.url,
         mediaType: resource.mediaType,
@@ -123,16 +114,10 @@ function renderResources(resources) {
         feedback.textContent = "This resource failed local URL validation.";
         return;
       }
-      if (!pairingCode) {
-        feedback.textContent = "Connect the extension to FluxNet before sending a resource.";
-        setStatus("needsSetup");
-        return;
-      }
       send.disabled = true;
       try {
         await sendNativeMessage({
           action: resource.downloadable ? "sendMedia" : "reportUnsupported",
-          pairingCode,
           resource: message,
         });
         setStatus("connected");
@@ -156,24 +141,6 @@ async function loadResources() {
   renderResources(deduplicateResources(detectedResources));
 }
 
-byId("connect").addEventListener("click", async () => {
-  const pairingCode = pairingInput.value.trim();
-  if (!/^[0-9a-f]{32}$/i.test(pairingCode)) {
-    feedback.textContent = "Enter the 32-character pairing code shown in FluxNet.";
-    setStatus("needsSetup");
-    return;
-  }
-  try {
-    await chrome.storage.local.set({ pairingCode });
-    await sendNativeMessage({ action: "ping", pairingCode });
-    setStatus("connected");
-    feedback.textContent = "Connected to FluxNet. Automatic detection is active; confirm every handoff.";
-  } catch (error) {
-    setStatus("disconnected");
-    feedback.textContent = error.message;
-  }
-});
-
 byId("scan").addEventListener("click", async () => {
   feedback.textContent = "Refreshing the active tab…";
   try {
@@ -184,11 +151,8 @@ byId("scan").addEventListener("click", async () => {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: () => {
-        const resources = performance.getEntriesByType("resource").map((entry) => ({
-          url: entry.name,
-          observedBytes: Number.isFinite(entry.transferSize) && entry.transferSize > 0 ? entry.transferSize : null,
-        }));
-        const mediaElements = [...document.querySelectorAll("video, audio")];
+        const resources = [];
+        const mediaElements = [...document.querySelectorAll("video")];
         for (const element of mediaElements) {
           for (const url of [element.currentSrc, element.src, ...[...element.querySelectorAll("source")].map((source) => source.src)]) {
             if (url) resources.push({
@@ -196,7 +160,8 @@ byId("scan").addEventListener("click", async () => {
               observedBytes: null,
               width: element.videoWidth || null,
               height: element.videoHeight || null,
-              mimeType: element.querySelector(`source[src="${CSS.escape(url)}"]`)?.type || "",
+              mimeType: [...element.querySelectorAll("source")].find((source) => source.src === url)?.type
+                || element.getAttribute("type") || "",
             });
           }
         }
@@ -228,7 +193,6 @@ byId("save-settings").addEventListener("click", async () => {
     automaticVideoDetection: byId("automatic-video").checked,
     automaticDownloadDetection: byId("automatic-download").checked,
     videoOverlay: byId("video-overlay").checked,
-    notificationBehavior: byId("notification-behavior").value,
     fileTypes: byId("file-types").value.split(/[,\s]+/),
     excludedDomains: byId("excluded-domains").value.split(/[,\s]+/),
   });
@@ -245,6 +209,6 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "fluxnet:resource-updated") void loadResources();
 });
 
-void Promise.all([loadPairingCode(), loadSettings(), loadResources()]).catch((error) => {
+void Promise.all([connectToFluxNet(), loadSettings(), loadResources()]).catch((error) => {
   feedback.textContent = `Could not load extension settings: ${error.message}`;
 });

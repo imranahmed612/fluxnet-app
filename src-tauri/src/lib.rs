@@ -99,6 +99,9 @@ pub fn run() {
                 },
             )
             .map_err(std::io::Error::other)?;
+            #[cfg(windows)]
+            network::start_network_monitor_service(app.handle().clone())
+                .map_err(std::io::Error::other)?;
             app.state::<download_manager::DownloadManager>()
                 .initialize(app.handle())
                 .map_err(std::io::Error::other)?;

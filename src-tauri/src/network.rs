@@ -28,6 +28,7 @@ const QUALITY_FAIR_MAX_PACKET_LOSS_PERCENT: f64 = 5.0;
 pub struct QualityMonitorControl {
     running: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    quality_enabled: Arc<AtomicBool>,
     history: Arc<Mutex<VecDeque<QualityProbe>>>,
     settings: Arc<Mutex<QualityMonitorSettings>>,
     alert_settings: Arc<Mutex<QualityAlertSettings>>,
@@ -38,6 +39,7 @@ impl Default for QualityMonitorControl {
         Self {
             running: Arc::default(),
             cancelled: Arc::default(),
+            quality_enabled: Arc::default(),
             history: Arc::default(),
             settings: Arc::new(Mutex::new(QualityMonitorSettings {
                 target: "1.1.1.1".into(),
@@ -107,6 +109,10 @@ pub struct QualityMonitorUpdate {
     pub probe: QualityProbe,
     pub rolling_stats: QualityStats,
     pub quality_rating: QualityRating,
+    pub interfaces: Vec<NetworkInterface>,
+    pub download_mbps: f64,
+    pub upload_mbps: f64,
+    pub interface_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -141,6 +147,17 @@ fn append_quality_probe(history: &mut VecDeque<QualityProbe>, probe: QualityProb
         history.pop_front();
     }
     history.push_back(probe);
+}
+
+fn counter_delta_mbps(previous: u64, current: u64, elapsed_seconds: f64) -> Option<f64> {
+    if elapsed_seconds <= 0.0 || !elapsed_seconds.is_finite() {
+        return None;
+    }
+    Some(current.saturating_sub(previous) as f64 * 8.0 / elapsed_seconds / 1_000_000.0)
+}
+
+fn is_traffic_interface(category: &str, is_virtual: bool, operational_status: &str) -> bool {
+    !is_virtual && operational_status == "Up" && matches!(category, "Ethernet" | "Wi-Fi")
 }
 
 #[derive(Default)]
@@ -353,7 +370,7 @@ impl Drop for AnalysisRunningGuard {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkInterface {
     pub name: String,
@@ -373,6 +390,8 @@ pub struct NetworkInterface {
     pub link_speed_mbps: Option<f64>,
     pub bytes_received: Option<String>,
     pub bytes_sent: Option<String>,
+    pub download_mbps: Option<f64>,
+    pub upload_mbps: Option<f64>,
     pub wifi_ssid: Option<String>,
     pub wifi_signal_quality: Option<u32>,
     pub wifi_frequency_mhz: Option<u32>,
@@ -413,8 +432,8 @@ mod windows {
         BDIX_MAX_PROBES, BDIX_MAX_TIMEOUT_MS, BDIX_MIN_TIMEOUT_MS, BdixAnalysisResult,
         ConnectivityDiagnostic, ConnectivityProbe, NetworkInterface, QUALITY_INTERVALS,
         QualityAlertSettings, QualityAlertTracker, QualityMonitorSettings, QualityMonitorStatus,
-        QualityMonitorUpdate, QualityProbe, append_quality_probe, quality_rating, quality_stats,
-        should_send_quality_alert,
+        QualityMonitorUpdate, QualityProbe, append_quality_probe, counter_delta_mbps,
+        is_traffic_interface, quality_rating, quality_stats, should_send_quality_alert,
     };
     use std::{
         collections::VecDeque,
@@ -911,6 +930,8 @@ mod windows {
                     }),
                 bytes_received: counter.map(|item| item.bytes_received.to_string()),
                 bytes_sent: counter.map(|item| item.bytes_sent.to_string()),
+                download_mbps: None,
+                upload_mbps: None,
                 wifi_ssid: wifi.ssid,
                 wifi_signal_quality: wifi.signal_quality,
                 wifi_frequency_mhz: wifi.frequency_mhz,
@@ -1307,19 +1328,19 @@ mod windows {
 
     pub fn run_quality_monitor(
         app: AppHandle,
-        hostname: String,
         settings: Arc<Mutex<QualityMonitorSettings>>,
         cancelled: Arc<AtomicBool>,
         history: Arc<Mutex<VecDeque<QualityProbe>>>,
         alert_settings: Arc<Mutex<QualityAlertSettings>>,
+        quality_enabled: Arc<AtomicBool>,
     ) {
         let result = run_quality_monitor_loop(
             &app,
-            hostname,
             &settings,
             &cancelled,
             &history,
             &alert_settings,
+            &quality_enabled,
         );
         let status = match result {
             Ok(()) => QualityMonitorStatus {
@@ -1335,84 +1356,128 @@ mod windows {
                 message: Some(message),
             },
         };
+        quality_enabled.store(false, Ordering::Release);
         let _ = app.emit("quality-monitor-status", status);
     }
 
     fn run_quality_monitor_loop(
         app: &AppHandle,
-        hostname: String,
         settings: &Mutex<QualityMonitorSettings>,
         cancelled: &AtomicBool,
         history: &Mutex<VecDeque<QualityProbe>>,
         alert_settings: &Mutex<QualityAlertSettings>,
+        quality_enabled: &AtomicBool,
     ) -> Result<(), String> {
-        let resolved = match resolve_addresses(&hostname, cancelled) {
-            Ok(addresses) => addresses,
-            Err(ResolutionFailure::Cancelled) => return Ok(()),
-            Err(ResolutionFailure::Dns(message) | ResolutionFailure::DnsTimeout(message)) => {
-                return Err(message);
-            }
-            Err(ResolutionFailure::NoIpv4) => {
-                return Err("The target resolved without any IP addresses.".into());
-            }
-        };
-        let destination = resolved[0];
         let handle = IcmpHandle::create()?;
         let mut alert_tracker = QualityAlertTracker::default();
+        let mut current_target = String::new();
+        let mut destination = None;
+        let mut previous_counters = std::collections::HashMap::new();
+        let mut previous_sample_at = Instant::now();
         while !cancelled.load(Ordering::Acquire) {
             let current_settings = settings
                 .lock()
                 .map_err(|_| "Network quality monitor settings lock was poisoned.".to_owned())?
                 .clone();
-            validate_quality_settings(&hostname, current_settings.interval_seconds)?;
+            validate_quality_settings(&current_settings.target, current_settings.interval_seconds)?;
             if !(500..=5000).contains(&current_settings.ping_timeout_ms) {
                 return Err("Choose a ping timeout from 500 to 5000 milliseconds.".into());
             }
-            let mut fatal_error = None;
-            let probe = match send_analysis_probe(
-                handle.0,
-                destination,
-                0,
-                current_settings.ping_timeout_ms as u32,
-            ) {
-                Ok(probe) => QualityProbe {
-                    target: hostname.clone(),
-                    timestamp_ms: current_timestamp_ms(),
-                    status: probe.status,
-                    latency_ms: probe.latency_ms,
-                    detail: probe.detail,
-                },
-                Err(message) => {
-                    if cancelled.load(Ordering::Acquire) {
-                        break;
+            let probe = if current_target != current_settings.target || destination.is_none() {
+                current_target = current_settings.target.clone();
+                match resolve_addresses(&current_target, cancelled) {
+                    Ok(addresses) if !addresses.is_empty() => {
+                        destination = Some(addresses[0]);
+                        None
                     }
-                    fatal_error = Some(message);
-                    QualityProbe {
-                        target: hostname.clone(),
+                    Ok(_) | Err(ResolutionFailure::NoIpv4) => {
+                        destination = None;
+                        Some(QualityProbe {
+                            target: current_target.clone(),
+                            timestamp_ms: current_timestamp_ms(),
+                            status: "unreachable".into(),
+                            latency_ms: None,
+                            detail: Some("The target resolved without any IP addresses.".into()),
+                        })
+                    }
+                    Err(ResolutionFailure::Cancelled) => return Ok(()),
+                    Err(
+                        ResolutionFailure::Dns(message) | ResolutionFailure::DnsTimeout(message),
+                    ) => {
+                        destination = None;
+                        Some(QualityProbe {
+                            target: current_target.clone(),
+                            timestamp_ms: current_timestamp_ms(),
+                            status: "dnsResolutionFailed".into(),
+                            latency_ms: None,
+                            detail: Some(message),
+                        })
+                    }
+                }
+            } else {
+                None
+            };
+            let probe = if let Some(probe) = probe {
+                probe
+            } else {
+                match send_analysis_probe(
+                    handle.0,
+                    destination.expect("resolved monitor destination"),
+                    0,
+                    current_settings.ping_timeout_ms as u32,
+                ) {
+                    Ok(probe) => QualityProbe {
+                        target: current_target.clone(),
                         timestamp_ms: current_timestamp_ms(),
-                        status: "error".into(),
-                        latency_ms: None,
-                        detail: fatal_error.clone(),
+                        status: probe.status,
+                        latency_ms: probe.latency_ms,
+                        detail: probe.detail,
+                    },
+                    Err(message) => {
+                        if cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                        QualityProbe {
+                            target: current_target.clone(),
+                            timestamp_ms: current_timestamp_ms(),
+                            status: "error".into(),
+                            latency_ms: None,
+                            detail: Some(message),
+                        }
                     }
                 }
             };
             let probe_succeeded = probe.status == "success";
-            publish_quality_probe(app, history, probe)?;
+            let now = Instant::now();
+            let elapsed_seconds = now.duration_since(previous_sample_at).as_secs_f64();
+            previous_sample_at = now;
+            let (mut interfaces, interface_error) = match get_network_interfaces() {
+                Ok(interfaces) => (interfaces, None),
+                Err(error) => (Vec::new(), Some(error)),
+            };
+            let (download_mbps, upload_mbps) =
+                update_interface_rates(&mut interfaces, &mut previous_counters, elapsed_seconds);
+            publish_quality_probe(
+                app,
+                history,
+                probe,
+                interfaces,
+                download_mbps,
+                upload_mbps,
+                interface_error,
+                quality_enabled.load(Ordering::Acquire),
+            )?;
             let settings = alert_settings
                 .lock()
                 .map_err(|_| "Network quality alert settings lock was poisoned.".to_owned())?
                 .clone();
             notify_if_quality_alert_is_due(
                 app,
-                &hostname,
+                &current_target,
                 &settings,
                 &mut alert_tracker,
                 probe_succeeded,
             );
-            if let Some(message) = fatal_error {
-                return Err(message);
-            }
-
             let wait_started = Instant::now();
             let interval = Duration::from_secs(current_settings.interval_seconds);
             while wait_started.elapsed() < interval {
@@ -1452,6 +1517,11 @@ mod windows {
         app: &AppHandle,
         history: &Mutex<VecDeque<QualityProbe>>,
         probe: QualityProbe,
+        interfaces: Vec<NetworkInterface>,
+        download_mbps: f64,
+        upload_mbps: f64,
+        interface_error: Option<String>,
+        quality_enabled: bool,
     ) -> Result<(), String> {
         let rolling_stats = {
             let mut history = history
@@ -1460,15 +1530,74 @@ mod windows {
             append_quality_probe(&mut history, probe.clone());
             quality_stats(&history)
         };
-        app.emit(
-            "quality-monitor-probe",
-            QualityMonitorUpdate {
-                probe,
-                quality_rating: quality_rating(&rolling_stats),
-                rolling_stats,
-            },
-        )
-        .map_err(|error| format!("Could not publish network quality sample: {error}"))
+        let update = QualityMonitorUpdate {
+            probe,
+            quality_rating: quality_rating(&rolling_stats),
+            rolling_stats,
+            interfaces,
+            download_mbps,
+            upload_mbps,
+            interface_error,
+        };
+        app.emit("network-monitor-update", update.clone())
+            .map_err(|error| format!("Could not publish shared network telemetry: {error}"))?;
+        if quality_enabled {
+            app.emit("quality-monitor-probe", update)
+                .map_err(|error| format!("Could not publish network quality sample: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn update_interface_rates(
+        interfaces: &mut [NetworkInterface],
+        previous: &mut std::collections::HashMap<String, (u64, u64)>,
+        elapsed_seconds: f64,
+    ) -> (f64, f64) {
+        let mut next = std::collections::HashMap::new();
+        let mut total_download = 0.0;
+        let mut total_upload = 0.0;
+
+        for network_interface in interfaces {
+            let key = format!(
+                "{}\0{}\0{}",
+                network_interface.name,
+                network_interface.category,
+                network_interface.mac_address.as_deref().unwrap_or_default()
+            );
+            let received = network_interface
+                .bytes_received
+                .as_deref()
+                .and_then(|value| value.parse::<u64>().ok());
+            let sent = network_interface
+                .bytes_sent
+                .as_deref()
+                .and_then(|value| value.parse::<u64>().ok());
+            let (Some(received), Some(sent)) = (received, sent) else {
+                continue;
+            };
+            if network_interface.operational_status == "Up" {
+                if let Some((old_received, old_sent)) = previous.get(&key) {
+                    if let (Some(download), Some(upload)) = (
+                        counter_delta_mbps(*old_received, received, elapsed_seconds),
+                        counter_delta_mbps(*old_sent, sent, elapsed_seconds),
+                    ) {
+                        network_interface.download_mbps = Some(download);
+                        network_interface.upload_mbps = Some(upload);
+                        if is_traffic_interface(
+                            &network_interface.category,
+                            network_interface.is_virtual,
+                            &network_interface.operational_status,
+                        ) {
+                            total_download += download;
+                            total_upload += upload;
+                        }
+                    }
+                }
+            }
+            next.insert(key, (received, sent));
+        }
+        *previous = next;
+        (total_download, total_upload)
     }
 
     fn validate_analysis_settings(probe_count: usize, timeout_ms: u64) -> Result<(), String> {
@@ -2127,42 +2256,72 @@ fn start_quality_monitor_inner(
     interval_seconds: u64,
 ) -> Result<(), String> {
     windows::validate_quality_settings(&hostname, interval_seconds)?;
-    if control
-        .running
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err("Network quality monitoring is already running.".into());
-    }
-    control.cancelled.store(false, Ordering::Release);
-
     match control.settings.lock() {
         Ok(mut settings) => {
             settings.target = hostname.clone();
             settings.interval_seconds = interval_seconds;
         }
-        Err(_) => {
-            control.running.store(false, Ordering::Release);
-            return Err("Network quality monitor settings lock was poisoned.".into());
-        }
+        Err(_) => return Err("Network quality monitor settings lock was poisoned.".into()),
     }
 
     match control.history.lock() {
         Ok(mut history) => history.clear(),
-        Err(_) => {
-            control.running.store(false, Ordering::Release);
-            return Err("Network quality history lock was poisoned.".into());
-        }
+        Err(_) => return Err("Network quality history lock was poisoned.".into()),
     }
+    control.quality_enabled.store(true, Ordering::Release);
+    if control
+        .running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(());
+    }
+    control.cancelled.store(false, Ordering::Release);
 
     let running = Arc::clone(&control.running);
     let cancelled = Arc::clone(&control.cancelled);
+    let quality_enabled = Arc::clone(&control.quality_enabled);
     let history = Arc::clone(&control.history);
     let settings = Arc::clone(&control.settings);
     let alert_settings = Arc::clone(&control.alert_settings);
     tauri::async_runtime::spawn_blocking(move || {
         let _running_guard = QualityRunningGuard(running);
-        windows::run_quality_monitor(app, hostname, settings, cancelled, history, alert_settings);
+        windows::run_quality_monitor(
+            app,
+            settings,
+            cancelled,
+            history,
+            alert_settings,
+            quality_enabled,
+        );
+    });
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn start_network_monitor_service(app: tauri::AppHandle) -> Result<(), String> {
+    let control = app.state::<QualityMonitorControl>();
+    control
+        .running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| "The shared network monitor is already running.".to_owned())?;
+    control.cancelled.store(false, Ordering::Release);
+    let running = Arc::clone(&control.running);
+    let cancelled = Arc::clone(&control.cancelled);
+    let quality_enabled = Arc::clone(&control.quality_enabled);
+    let history = Arc::clone(&control.history);
+    let settings_handle = Arc::clone(&control.settings);
+    let alert_settings = Arc::clone(&control.alert_settings);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _running_guard = QualityRunningGuard(running);
+        windows::run_quality_monitor(
+            app,
+            settings_handle,
+            cancelled,
+            history,
+            alert_settings,
+            quality_enabled,
+        );
     });
     Ok(())
 }
@@ -2192,10 +2351,9 @@ pub fn stop_quality_monitor(
 }
 
 fn stop_quality_monitor_inner(control: &QualityMonitorControl) -> Result<(), String> {
-    if !control.running.load(Ordering::Acquire) {
+    if !control.quality_enabled.swap(false, Ordering::AcqRel) {
         return Err("Network quality monitoring is not running.".into());
     }
-    control.cancelled.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -2209,11 +2367,8 @@ pub fn configure_quality_monitor_options(
     hostname: String,
     interval_seconds: u64,
 ) -> Result<(), String> {
-    if control.running.load(Ordering::Acquire) {
-        return Err(
-            "Stop Network Quality monitoring before changing its target or interval.".into(),
-        );
-    }
+    #[cfg(windows)]
+    windows::validate_quality_settings(hostname.trim(), interval_seconds)?;
     if ![1, 2, 5].contains(&interval_seconds) {
         return Err("Choose a probe interval of 1, 2, or 5 seconds.".into());
     }
@@ -2290,6 +2445,7 @@ fn update_quality_monitor_preferences(
 }
 
 pub fn request_quality_monitor_stop(control: &QualityMonitorControl) -> Arc<AtomicBool> {
+    control.quality_enabled.store(false, Ordering::Release);
     control.cancelled.store(true, Ordering::Release);
     Arc::clone(&control.running)
 }
@@ -2340,7 +2496,7 @@ pub fn get_quality_monitor_snapshot(
         .clone();
     let rolling_stats = quality_stats(&history);
     Ok(QualityMonitorSnapshot {
-        running: control.running.load(Ordering::Acquire),
+        running: control.quality_enabled.load(Ordering::Acquire),
         target: settings.target,
         interval_seconds: settings.interval_seconds,
         history: history.into_iter().collect(),
@@ -2475,6 +2631,22 @@ mod quality_monitor_tests {
         assert_eq!(settings.interval_seconds, 5);
         assert_eq!(settings.ping_timeout_ms, 1_500);
         assert!(update_quality_monitor_preferences(&control, 3, 1_500).is_err());
+    }
+
+    #[test]
+    fn interface_counter_rates_use_elapsed_time_and_reset_safely() {
+        assert_eq!(counter_delta_mbps(1_000_000, 9_000_000, 1.0), Some(64.0));
+        assert_eq!(counter_delta_mbps(9_000_000, 1_000_000, 1.0), Some(0.0));
+        assert_eq!(counter_delta_mbps(10, 20, 0.0), None);
+    }
+
+    #[test]
+    fn aggregate_traffic_excludes_virtual_and_disconnected_adapters() {
+        assert!(is_traffic_interface("Ethernet", false, "Up"));
+        assert!(is_traffic_interface("Wi-Fi", false, "Up"));
+        assert!(!is_traffic_interface("Ethernet", true, "Up"));
+        assert!(!is_traffic_interface("Ethernet", false, "Down"));
+        assert!(!is_traffic_interface("Unknown", false, "Up"));
     }
 
     fn probe(status: &str, latency_ms: Option<f64>, timestamp_ms: u64) -> QualityProbe {

@@ -9,7 +9,9 @@ use tauri::{AppHandle, Emitter, Manager};
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_URL_LENGTH: usize = 8 * 1024;
 const MAX_TEXT_LENGTH: usize = 512;
-const CONNECTION_FRESHNESS_MS: u64 = 30_000;
+const CONNECTION_FRESHNESS_MS: u64 = 150_000;
+const TRUSTED_EXTENSION_ID: &str = "clgiddogjgpjllmjgpffopnmighkmhae";
+const TRUSTED_EXTENSION_ORIGIN: &str = "chrome-extension://clgiddogjgpjllmjgpffopnmighkmhae/";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,7 +49,8 @@ pub struct BrowserMediaResource {
 #[serde(rename_all = "camelCase")]
 struct NativeMessage {
     action: String,
-    pairing_code: String,
+    pairing_code: Option<String>,
+    extension_id: Option<String>,
     resource: Option<BrowserMediaResource>,
 }
 
@@ -129,8 +132,10 @@ impl BrowserBridge {
         let (native_host_status, registered_browsers) = Self::native_host_installation();
         let last_handshake_at_ms = self.last_handshake_at_ms.load(Ordering::Acquire);
         let now_ms = current_timestamp_ms();
+        let connection_attempted =
+            self.connection_attempted.load(Ordering::Acquire) || native_host_status == "installed";
         let connected = connection_status(
-            self.connection_attempted.load(Ordering::Acquire),
+            connection_attempted,
             self.connected.load(Ordering::Acquire),
             last_handshake_at_ms,
             now_ms,
@@ -139,7 +144,7 @@ impl BrowserBridge {
         BrowserBridgeStatus {
             pairing_code: self.pairing_code.clone(),
             connection_status: connection_status(
-                self.connection_attempted.load(Ordering::Acquire),
+                connection_attempted,
                 connected,
                 last_handshake_at_ms,
                 now_ms,
@@ -260,18 +265,7 @@ impl BrowserBridge {
             .get("allowed_origins")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|origins| {
-                !origins.is_empty()
-                    && origins.iter().all(|origin| {
-                        origin.as_str().is_some_and(|origin| {
-                            let Some(id) = origin
-                                .strip_prefix("chrome-extension://")
-                                .and_then(|value| value.strip_suffix('/'))
-                            else {
-                                return false;
-                            };
-                            id.len() == 32 && id.bytes().all(|byte| (b'a'..=b'p').contains(&byte))
-                        })
-                    })
+                origins.len() == 1 && origins[0].as_str() == Some(TRUSTED_EXTENSION_ORIGIN)
             });
         manifest.get("name").and_then(serde_json::Value::as_str) == Some("com.fluxnet.browser")
             && manifest.get("type").and_then(serde_json::Value::as_str) == Some("stdio")
@@ -470,19 +464,21 @@ fn validate_resource(resource: BrowserMediaResource) -> Result<BrowserMediaResou
     if path.ends_with(".m3u8") || path.ends_with(".mpd") {
         return Err("HLS and DASH manifests are not supported as direct downloads.".into());
     }
-    let supported_video_type = matches!(
-        resource.media_type.as_str(),
-        "mp4" | "webm" | "mov" | "m4v" | "mkv" | "avi" | "ogv" | "mpeg" | "mpg" | "3gp"
-    );
-    if resource.media_type != "video" && !supported_video_type {
+    let supported_video_type = matches!(resource.media_type.as_str(), "mp4" | "webm");
+    if !supported_video_type {
         return Err("The media type is not supported.".into());
     }
-    if (supported_video_type && !path.ends_with(&format!(".{}", resource.media_type)))
-        || (resource.media_type == "video"
-            && !resource
-                .mime_type
-                .as_deref()
-                .is_some_and(|mime_type| mime_type.to_ascii_lowercase().starts_with("video/")))
+    let expected_mime = format!("video/{}", resource.media_type);
+    let path_has_supported_extension = path.ends_with(".mp4") || path.ends_with(".webm");
+    let path_matches_type = path.ends_with(&format!(".{}", resource.media_type));
+    let mime_matches_type = resource.mime_type.as_deref().is_some_and(|mime_type| {
+        mime_type
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case(&expected_mime))
+    });
+    if (path_has_supported_extension && !path_matches_type)
+        || (!path_has_supported_extension && !mime_matches_type)
     {
         return Err("The media type does not match the URL.".into());
     }
@@ -695,10 +691,10 @@ fn parse_native_message(bytes: &[u8], pairing_code: &str) -> Result<NativeMessag
     }
     let message: NativeMessage =
         serde_json::from_slice(bytes).map_err(|_| "The browser message is invalid.")?;
-    if message.pairing_code != pairing_code {
-        return Err(
-            "Pairing code did not match. Check the code in FluxNet and the extension.".into(),
-        );
+    let trusted_extension = message.extension_id.as_deref() == Some(TRUSTED_EXTENSION_ID);
+    let paired_extension = message.pairing_code.as_deref() == Some(pairing_code);
+    if !trusted_extension && !paired_extension {
+        return Err("The Native Messaging caller is not the installed FluxNet extension.".into());
     }
     Ok(message)
 }
@@ -793,7 +789,7 @@ mod tests {
         assert_eq!(connection_status(true, false, 0, 100_000), "disconnected");
         assert_eq!(connection_status(true, true, 80_001, 100_000), "connected");
         assert_eq!(
-            connection_status(true, true, 70_000, 100_001),
+            connection_status(true, true, 10_000, 160_001),
             "disconnected"
         );
         assert_eq!(connection_status(true, true, 100_001, 100_000), "connected");
@@ -827,11 +823,15 @@ mod tests {
     }
 
     #[test]
-    fn accepts_additional_direct_video_formats_and_video_mime_urls() {
-        assert!(validate_resource(resource("https://cdn.example/clip.mkv", "mkv")).is_ok());
-        let mut extensionless = resource("https://cdn.example/stream?id=8", "video");
-        extensionless.mime_type = Some("video/mp4".into());
+    fn accepts_only_mp4_webm_and_matching_video_mime_urls() {
+        assert!(validate_resource(resource("https://cdn.example/clip.webm", "webm")).is_ok());
+        assert!(validate_resource(resource("https://cdn.example/clip.mkv", "mkv")).is_err());
+        let mut extensionless = resource("https://cdn.example/stream?id=8", "mp4");
+        extensionless.mime_type = Some("video/mp4; codecs=\"avc1.42E01E\"".into());
         assert!(validate_resource(extensionless).is_ok());
+        let mut mismatched = resource("https://cdn.example/clip.webm", "mp4");
+        mismatched.mime_type = Some("video/mp4".into());
+        assert!(validate_resource(mismatched).is_err());
     }
 
     #[test]
@@ -896,6 +896,14 @@ mod tests {
         assert!(parse_native_message(payload, "secret").is_ok());
         assert!(parse_native_message(payload, "other").is_err());
         assert!(parse_native_message(b"not json", "secret").is_err());
+    }
+
+    #[test]
+    fn accepts_the_exact_installed_extension_identity_without_manual_pairing() {
+        let payload = br#"{"action":"ping","extensionId":"clgiddogjgpjllmjgpffopnmighkmhae"}"#;
+        assert!(parse_native_message(payload, "secret").is_ok());
+        let unauthorized = br#"{"action":"ping","extensionId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        assert!(parse_native_message(unauthorized, "secret").is_err());
     }
 
     #[test]

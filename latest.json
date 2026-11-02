@@ -1,0 +1,9 @@
+{
+  "version": "0.1.0",
+  "platforms": {
+    "windows-x86_64": {
+      "url": "https://github.com/imranahmed612/fluxnet-app/releases/download/v0.1.0/FluxNet_0.1.0_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRa1F1SkxTTVdvOS9xcVRBTHZrcG0wT0dBdjEvWi84bDZRQ3Z0cWw5TDRDVzlGbTBINFVvWk5VUVdXTVdPSkt5UW96eEZjU3V4K3V2TkVMcHpZMG1jVTZYNk10dC9xUXdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNjEyMDA2CWZpbGU6Rmx1eE5ldF8wLjEuMF94NjQtc2V0dXAuZXhlCXZlcnNpb246MC4xLjAKVUZBN0NHUXdSL2lsS01zdmZWQzJlMWlxUHoyR3hBeStiSUxCM3U4dm9wd2tvY2dEVlY0UjVLMTc2K1lpY3RqazJzdk5CR3JzN0lpalBYMFFIRkVBRGc9PQo="
+    }
+  }
+}

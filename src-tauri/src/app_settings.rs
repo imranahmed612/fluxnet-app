@@ -17,6 +17,7 @@ pub struct AppSettings {
     pub network_alerts_enabled: bool,
     pub network_alert_failure_threshold: u32,
     pub network_alert_cooldown_seconds: u64,
+    pub auto_check_updates: bool,
 }
 
 impl Default for AppSettings {
@@ -32,6 +33,7 @@ impl Default for AppSettings {
             network_alerts_enabled: false,
             network_alert_failure_threshold: 3,
             network_alert_cooldown_seconds: 300,
+            auto_check_updates: false,
         }
     }
 }
@@ -195,6 +197,13 @@ mod tests {
         settings.network_interval_seconds = 1;
         settings.ping_timeout_ms = 499;
         assert!(validate_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn older_settings_default_automatic_update_checks_to_off() {
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"theme":"light"}"#).expect("legacy settings should load");
+        assert!(!settings.auto_check_updates);
     }
 
     #[test]

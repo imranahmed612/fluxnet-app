@@ -17,6 +17,19 @@
   --dim: #536176;
   --cyan: #45d6e8;
   --blue: #5799ff;
+  --theme-bg: #080d17;
+  --theme-sidebar: #0a101b;
+  --theme-surface: #0d1421;
+  --theme-surface-subtle: #101a2a;
+  --theme-surface-inset: #080e18;
+  --theme-text: #e8eef8;
+  --theme-text-secondary: #9aa8bb;
+  --theme-text-muted: #78869c;
+  --theme-border: rgba(144, 166, 199, 0.12);
+  --theme-accent: #45d6e8;
+  --theme-success: #45d6b1;
+  --theme-warning: #e0a850;
+  --theme-danger: #e47f73;
 }
 
 * {
@@ -1421,6 +1434,86 @@ h2 {
   color: #75849a;
   font-size: 10px;
   line-height: 1.6;
+}
+
+.update-version-value {
+  color: var(--theme-text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.update-status-list {
+  margin-top: 12px;
+}
+
+.update-release-notes {
+  margin-top: 12px;
+  padding: 11px 12px;
+  border: 1px solid var(--theme-border);
+  border-radius: 5px;
+  background: var(--theme-surface-subtle);
+  color: var(--theme-text-secondary);
+  font-size: 10px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.update-release-notes strong {
+  color: var(--theme-text);
+}
+
+.update-release-notes p {
+  margin: 5px 0 0;
+  white-space: pre-wrap;
+}
+
+.update-download-progress {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+  color: var(--theme-text-secondary);
+  font-size: 10px;
+}
+
+.update-progress-label {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+}
+
+.update-progress-track {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--theme-surface-inset);
+}
+
+.update-progress-track > span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--theme-accent);
+  transition: width 150ms ease;
+}
+
+.update-progress-track.is-indeterminate > span {
+  width: 35%;
+  animation: update-progress-indeterminate 1.2s ease-in-out infinite alternate;
+}
+
+@keyframes update-progress-indeterminate {
+  from { transform: translateX(0); }
+  to { transform: translateX(185%); }
+}
+
+.update-error {
+  margin-top: 12px;
+}
+
+.update-actions {
+  align-items: center;
 }
 
 .settings-readonly > span:last-child {
@@ -3570,183 +3663,539 @@ h2 {
   }
 }
 
-html[data-theme="light"] {
+html[data-color-scheme="light"] {
   color-scheme: light;
-  --surface: #f5f8fc;
+  --surface: var(--theme-surface);
   --surface-raised: #ffffff;
-  --border: rgba(57, 78, 109, 0.16);
-  --muted: #52647a;
-  --dim: #718198;
+  --border: var(--theme-border);
+  --muted: var(--theme-text-secondary);
+  --dim: var(--theme-text-muted);
+  --theme-bg: #f1f4f8;
+  --theme-sidebar: #f8fafc;
+  --theme-surface: #ffffff;
+  --theme-surface-subtle: #f7f9fc;
+  --theme-surface-inset: #edf1f6;
+  --theme-text: #17263b;
+  --theme-text-secondary: #52647a;
+  --theme-text-muted: #5f7086;
+  --theme-border: #d8e0ea;
+  --theme-accent: #087f95;
+  --theme-success: #17764f;
+  --theme-warning: #855708;
+  --theme-danger: #b43e38;
+  color: var(--theme-text);
+  background: var(--theme-bg);
+}
+
+html[data-color-scheme="light"] body {
+  background: radial-gradient(ellipse at 74% -5%, rgba(32, 90, 150, 0.06), transparent 34rem), var(--theme-bg);
+  color: var(--theme-text);
+}
+
+html[data-color-scheme="light"] .sidebar {
+  border-color: var(--theme-border);
+  background: var(--theme-sidebar);
+}
+
+html[data-color-scheme="light"] .app-shell :where(*) {
+  color: var(--theme-text);
+}
+
+html[data-color-scheme="light"] .app-shell :where(
+  .brand-name span,
+  .sidebar-label,
+  .sidebar-status div span,
+  .sidebar-footer,
+  .page-subtitle,
+  .eyebrow,
+  .live-indicator,
+  .updated-label,
+  .diagnostic-probe-note,
+  .diagnostic-description,
+  .diagnostic-input-label,
+  .diagnostic-result-label,
+  .diagnostic-stat span,
+  .resolved-address,
+  .diagnostic-result-message,
+  .metric-title,
+  .metric-bottom,
+  .data-note,
+  .interface-name > div span,
+  .interface-detail > span,
+  .interface-detail em,
+  .network-live,
+  .network-detail-title p,
+  .network-throughput-card > span,
+  .network-data-note,
+  .settings-choice small,
+  .settings-note,
+  .settings-status-list > div > span,
+  .settings-readonly > span:last-child,
+  .settings-footer > span,
+  .quick-action small,
+  .dashboard-footer,
+  .coming-soon p,
+  .speed-test-copy,
+  .speed-endpoint-label,
+  .speed-contract ul,
+  .speed-elapsed,
+  .speed-config-hint,
+  .speed-progress-detail,
+  .bdix-options > label,
+  .bdix-add-form label,
+  .bdix-server-entry label,
+  .bdix-timestamp,
+  .bdix-addresses,
+  .bdix-addresses small,
+  .bdix-probe strong,
+  .bdix-probe small,
+  .bdix-caveat,
+  .quality-rating-label,
+  .quality-rating p,
+  .quality-controls > label,
+  .quality-alert-settings > label,
+  .quality-alert-settings p,
+  .quality-no-samples,
+  .quality-chart-axis,
+  .quality-history-row time,
+  .quality-history-row small,
+  .quality-caveat,
+  .download-page > .page-header p,
+  .download-queue-count,
+  .download-history-count,
+  .download-form > label,
+  .download-settings label,
+  .download-details,
+  .download-entry-actions > span,
+  .video-page > .page-header p,
+  .video-setup-note,
+  .video-caveat,
+  .video-setup-steps,
+  .video-resource-url,
+  .video-resource-meta,
+  .video-resource-message,
+  .download-file-name span,
+  .download-empty-state,
+  .download-feedback.is-cancelled
+) {
+  color: var(--theme-text-secondary);
+}
+
+html[data-color-scheme="light"] .app-shell :where(
+  .panel,
+  .metric-card,
+  .connection-banner,
+  .sidebar-status,
+  .diagnostic-message,
+  .diagnostic-result,
+  .probe-result,
+  .network-interface,
+  .interface-message,
+  .interface-error,
+  .network-adapter-list,
+  .network-adapter-detail,
+  .network-adapter-item,
+  .network-throughput-card,
+  .settings-choice,
+  .settings-field,
+  .settings-status-list > div,
+  .speed-contract,
+  .speed-data-warning,
+  .speed-progress,
+  .bdix-result,
+  .bdix-probe,
+  .bdix-server-entry,
+  .bdix-empty,
+  .bdix-verification,
+  .tray-first-use-notice,
+  .quality-status,
+  .quality-rating,
+  .quality-alert-settings,
+  .quality-chart-empty,
+  .quality-history-row,
+  .download-feedback,
+  .download-resource,
+  .video-connection,
+  .video-resource,
+  .download-entry,
+  .download-status,
+  .coming-badge
+) {
+  border-color: var(--theme-border);
+  background-color: var(--theme-surface);
+  background-image: none;
+}
+
+html[data-color-scheme="light"] .app-shell :where(
+  .metric-card,
+  .network-interface,
+  .network-adapter-item,
+  .network-throughput-card,
+  .settings-choice,
+  .settings-field,
+  .settings-status-list > div,
+  .speed-contract,
+  .speed-progress,
+  .bdix-server-entry,
+  .quality-rating,
+  .quality-alert-settings,
+  .quality-chart-empty,
+  .video-resource,
+  .download-entry,
+  .diagnostic-message,
+  .diagnostic-result,
+  .interface-message,
+  .interface-error
+) {
+  background-color: var(--theme-surface-subtle);
+}
+
+html[data-color-scheme="light"] .connection-banner {
+  border-color: #c9dfe8;
+  background: linear-gradient(105deg, #f4fbfd, #eaf4f8);
+}
+
+html[data-color-scheme="light"] .nav-item {
+  color: var(--theme-text-secondary);
+}
+
+html[data-color-scheme="light"] .nav-item:hover {
+  background: #e9eff5;
+  color: var(--theme-text);
+}
+
+html[data-color-scheme="light"] .nav-item.active {
+  border-color: #c7e1e6;
+  background: #e5f3f5;
+  color: var(--theme-accent);
+}
+
+html[data-color-scheme="light"] .app-shell .quick-action {
+  border-color: var(--theme-border);
+  background: transparent;
+  color: var(--theme-text-secondary);
+}
+
+html[data-color-scheme="light"] .app-shell .quick-action:hover {
+  background: #f3f7fa;
+}
+
+html[data-color-scheme="light"] .active-indicator,
+html[data-color-scheme="light"] .speed-test-meta .live-indicator span {
+  background: var(--theme-accent);
+}
+
+html[data-color-scheme="light"] .brand,
+html[data-color-scheme="light"] .brand-name,
+html[data-color-scheme="light"] .page-header h1,
+html[data-color-scheme="light"] .section-title-row h2,
+html[data-color-scheme="light"] .panel h2,
+html[data-color-scheme="light"] .coming-soon h1,
+html[data-color-scheme="light"] .speed-test-heading h2 {
+  color: var(--theme-text);
+}
+
+html[data-color-scheme="light"] .brand-version,
+html[data-color-scheme="light"] .connection-symbol,
+html[data-color-scheme="light"] .empty-icon,
+html[data-color-scheme="light"] .network-count,
+html[data-color-scheme="light"] .network-adapter-icon,
+html[data-color-scheme="light"] .quick-action-icon,
+html[data-color-scheme="light"] .coming-icon,
+html[data-color-scheme="light"] .speed-test-icon,
+html[data-color-scheme="light"] .download-file-icon,
+html[data-color-scheme="light"] .download-empty-state svg {
+  border-color: #cddfe5;
+  background-color: #eaf4f7;
+  color: var(--theme-accent);
+}
+
+html[data-color-scheme="light"] .metric-value,
+html[data-color-scheme="light"] .network-detail-title h2,
+html[data-color-scheme="light"] .network-adapter-label strong,
+html[data-color-scheme="light"] .settings-choice strong,
+html[data-color-scheme="light"] .interface-name > div strong,
+html[data-color-scheme="light"] .interface-detail strong,
+html[data-color-scheme="light"] .network-total-traffic strong,
+html[data-color-scheme="light"] .network-throughput-card strong,
+html[data-color-scheme="light"] .diagnostic-result-header strong,
+html[data-color-scheme="light"] .diagnostic-stat strong,
+html[data-color-scheme="light"] .speed-contract > strong,
+html[data-color-scheme="light"] .speed-progress-header strong,
+html[data-color-scheme="light"] .speed-elapsed strong,
+html[data-color-scheme="light"] .bdix-result-heading > div > strong,
+html[data-color-scheme="light"] .bdix-addresses strong,
+html[data-color-scheme="light"] .quality-rating strong,
+html[data-color-scheme="light"] .download-file-name strong,
+html[data-color-scheme="light"] .download-empty-state strong,
+html[data-color-scheme="light"] .video-resource-heading > strong,
+html[data-color-scheme="light"] .sidebar-status strong {
+  color: var(--theme-text);
+}
+
+html[data-color-scheme="light"] .settings-field select,
+html[data-color-scheme="light"] .settings-field input,
+html[data-color-scheme="light"] .diagnostic-controls input,
+html[data-color-scheme="light"] .speed-endpoint-input,
+html[data-color-scheme="light"] .bdix-target-input,
+html[data-color-scheme="light"] .bdix-options select,
+html[data-color-scheme="light"] .bdix-add-form input,
+html[data-color-scheme="light"] .bdix-server-entry input,
+html[data-color-scheme="light"] .bdix-server-entry textarea,
+html[data-color-scheme="light"] .quality-controls input,
+html[data-color-scheme="light"] .quality-controls select,
+html[data-color-scheme="light"] .quality-alert-settings select,
+html[data-color-scheme="light"] .download-form input,
+html[data-color-scheme="light"] .download-settings select {
+  border-color: #cbd5e1;
+  background: #ffffff;
+  color: var(--theme-text);
+  color-scheme: light;
+}
+
+html[data-color-scheme="light"] .app-shell input::placeholder,
+html[data-color-scheme="light"] .app-shell textarea::placeholder {
+  color: var(--theme-text-muted);
+  opacity: 1;
+}
+
+html[data-color-scheme="light"] .app-shell input[type="checkbox"],
+html[data-color-scheme="light"] .app-shell input[type="radio"] {
+  accent-color: var(--theme-accent);
+}
+
+html[data-color-scheme="light"] .app-shell button {
+  border-color: var(--theme-border);
+  background-color: var(--theme-surface-subtle);
+  color: var(--theme-text);
+}
+
+html[data-color-scheme="light"] .app-shell .test-connection-button,
+html[data-color-scheme="light"] .app-shell .speed-start-button,
+html[data-color-scheme="light"] .app-shell .quality-export-button {
+  border-color: #08788d;
+  background: #087f95;
+  color: #ffffff;
+}
+
+html[data-color-scheme="light"] .app-shell .test-connection-button:hover:not(:disabled),
+html[data-color-scheme="light"] .app-shell .speed-start-button:hover:not(:disabled),
+html[data-color-scheme="light"] .app-shell .quality-export-button:hover:not(:disabled) {
+  border-color: #056577;
+  background: #056f83;
+  color: #ffffff;
+}
+
+html[data-color-scheme="light"] .app-shell .secondary-button,
+html[data-color-scheme="light"] .app-shell .refresh-button,
+html[data-color-scheme="light"] .download-entry-actions button,
+html[data-color-scheme="light"] .tray-first-use-notice button,
+html[data-color-scheme="light"] .app-shell .bdix-verify-button {
+  border-color: #cbd5e1;
+  background: #f7f9fc;
+  color: #33465e;
+}
+
+html[data-color-scheme="light"] .app-shell .secondary-button:hover:not(:disabled),
+html[data-color-scheme="light"] .app-shell .refresh-button:hover:not(:disabled),
+html[data-color-scheme="light"] .download-entry-actions button:hover:not(:disabled),
+html[data-color-scheme="light"] .app-shell .bdix-verify-button:hover:not(:disabled) {
+  border-color: #9eb4c9;
+  background: #edf3f8;
   color: #17263b;
-  background: #edf2f8;
 }
 
-html[data-theme="light"] body {
-  background: radial-gradient(ellipse at 74% -5%, rgba(32, 90, 150, 0.08), transparent 34rem), #edf2f8;
+html[data-color-scheme="light"] .app-shell .speed-stop-button {
+  border-color: #e5b7b2;
+  background: #fff3f1;
+  color: var(--theme-danger);
 }
 
-html[data-theme="light"] .sidebar {
-  border-color: rgba(57, 78, 109, 0.16);
-  background: rgba(247, 250, 253, 0.97);
+html[data-color-scheme="light"] .app-shell .speed-stop-button:hover {
+  background: #ffe8e5;
 }
 
-html[data-theme="light"] .brand-name,
-html[data-theme="light"] .page-header h1,
-html[data-theme="light"] .settings-section .panel-heading h2 {
-  color: #17263b;
+html[data-color-scheme="light"] .app-shell :disabled,
+html[data-color-scheme="light"] .app-shell [aria-disabled="true"] {
+  opacity: 1;
+  cursor: not-allowed;
 }
 
-html[data-theme="light"] .nav-item {
-  color: #53647b;
+html[data-color-scheme="light"] .app-shell button:disabled {
+  border-color: #d6dde6;
+  background: #edf0f4;
+  color: var(--theme-text-secondary);
 }
 
-html[data-theme="light"] .nav-item:hover {
-  background: rgba(68, 105, 150, 0.08);
-  color: #213650;
+html[data-color-scheme="light"] .app-shell input:disabled,
+html[data-color-scheme="light"] .app-shell select:disabled,
+html[data-color-scheme="light"] .app-shell textarea:disabled {
+  border-color: #d6dde6;
+  background: var(--theme-surface-inset);
+  color: var(--theme-text-secondary);
+  opacity: 1;
 }
 
-html[data-theme="light"] .nav-item.active {
-  background: linear-gradient(90deg, rgba(42, 149, 174, 0.12), rgba(31, 83, 129, 0.07));
-  color: #147c91;
+html[data-color-scheme="light"] .connection-state,
+html[data-color-scheme="light"] .interface-status,
+html[data-color-scheme="light"] .probe-result,
+html[data-color-scheme="light"] .bdix-probe,
+html[data-color-scheme="light"] .bdix-verification,
+html[data-color-scheme="light"] .coming-badge,
+html[data-color-scheme="light"] .quality-status,
+html[data-color-scheme="light"] .quality-rating,
+html[data-color-scheme="light"] .quality-export-feedback,
+html[data-color-scheme="light"] .download-status,
+html[data-color-scheme="light"] .video-connection,
+html[data-color-scheme="light"] .video-resource-state,
+html[data-color-scheme="light"] .download-entry-error,
+html[data-color-scheme="light"] .link-local-warning,
+html[data-color-scheme="light"] .bdix-caveat,
+html[data-color-scheme="light"] .speed-data-warning,
+html[data-color-scheme="light"] .network-warning,
+html[data-color-scheme="light"] .diagnostic-message.is-error,
+html[data-color-scheme="light"] .interface-error,
+html[data-color-scheme="light"] .download-feedback.is-error,
+html[data-color-scheme="light"] .quality-status-error,
+html[data-color-scheme="light"] .quality-rating-poor,
+html[data-color-scheme="light"] .quality-rating-disconnected,
+html[data-color-scheme="light"] .video-resource-state.is-expired,
+html[data-color-scheme="light"] .video-resource-state.is-error,
+html[data-color-scheme="light"] .download-status.status-failed,
+html[data-color-scheme="light"] .download-status.status-cancelled {
+  background-color: var(--theme-surface-subtle);
 }
 
-html[data-theme="light"] .panel,
-html[data-theme="light"] .network-adapter-list,
-html[data-theme="light"] .network-adapter-detail {
-  border-color: rgba(57, 78, 109, 0.14);
-  background: rgba(255, 255, 255, 0.92);
+html[data-color-scheme="light"] .interface-status.is-up,
+html[data-color-scheme="light"] .settings-status-list strong.is-connected,
+html[data-color-scheme="light"] .diagnostic-result.is-success .diagnostic-result-header strong,
+html[data-color-scheme="light"] .bdix-result.is-success .bdix-result-heading > div > strong,
+html[data-color-scheme="light"] .probe-result.is-success,
+html[data-color-scheme="light"] .quality-status-running,
+html[data-color-scheme="light"] .quality-rating-excellent strong,
+html[data-color-scheme="light"] .quality-rating-good strong,
+html[data-color-scheme="light"] .quality-export-feedback.is-success,
+html[data-color-scheme="light"] .quality-history-row > span,
+html[data-color-scheme="light"] .download-feedback.is-success,
+html[data-color-scheme="light"] .download-status.status-downloading,
+html[data-color-scheme="light"] .download-status.status-completed,
+html[data-color-scheme="light"] .video-connection.is-connected,
+html[data-color-scheme="light"] .video-resource-state.is-queued,
+html[data-color-scheme="light"] .video-resource-state.is-completed,
+html[data-color-scheme="light"] .bdix-verification.is-verified {
+  color: var(--theme-success);
 }
 
-html[data-theme="light"] .metric-card {
-  border-color: rgba(57, 78, 109, 0.14);
-  background: linear-gradient(145deg, #fff, #f3f7fb);
+html[data-color-scheme="light"] .connection-state,
+html[data-color-scheme="light"] .interface-status,
+html[data-color-scheme="light"] .probe-result,
+html[data-color-scheme="light"] .bdix-probe,
+html[data-color-scheme="light"] .bdix-verification,
+html[data-color-scheme="light"] .coming-badge,
+html[data-color-scheme="light"] .quality-status,
+html[data-color-scheme="light"] .quality-rating,
+html[data-color-scheme="light"] .download-status,
+html[data-color-scheme="light"] .video-connection {
+  border-color: var(--theme-border);
 }
 
-html[data-theme="light"] .metric-value,
-html[data-theme="light"] .network-detail-title h2 {
-  color: #233750;
+html[data-color-scheme="light"] .connection-state.is-detected,
+html[data-color-scheme="light"] .interface-status.is-up,
+html[data-color-scheme="light"] .probe-result.is-success,
+html[data-color-scheme="light"] .bdix-probe.is-success,
+html[data-color-scheme="light"] .bdix-verification.is-verified,
+html[data-color-scheme="light"] .quality-status-running,
+html[data-color-scheme="light"] .quality-rating-excellent,
+html[data-color-scheme="light"] .quality-rating-good,
+html[data-color-scheme="light"] .download-status.status-downloading,
+html[data-color-scheme="light"] .download-status.status-completed,
+html[data-color-scheme="light"] .video-connection.is-connected {
+  border-color: #a9d8c2;
+  background-color: #edf8f2;
 }
 
-html[data-theme="light"] .metric-title,
-html[data-theme="light"] .page-subtitle,
-html[data-theme="light"] .settings-note,
-html[data-theme="light"] .network-data-note {
-  color: #5f7086;
+html[data-color-scheme="light"] .diagnostic-message.is-error,
+html[data-color-scheme="light"] .interface-error,
+html[data-color-scheme="light"] .download-feedback.is-error,
+html[data-color-scheme="light"] .quality-status-error,
+html[data-color-scheme="light"] .quality-rating-poor,
+html[data-color-scheme="light"] .quality-rating-disconnected,
+html[data-color-scheme="light"] .video-connection.is-disconnected,
+html[data-color-scheme="light"] .download-status.status-failed,
+html[data-color-scheme="light"] .download-status.status-cancelled,
+html[data-color-scheme="light"] .download-entry-error {
+  border-color: #edc2bd;
+  background-color: #fff2f0;
+  color: var(--theme-danger);
 }
 
-html[data-theme="light"] .network-adapter-item,
-html[data-theme="light"] .settings-choice,
-html[data-theme="light"] .settings-field,
-html[data-theme="light"] .settings-status-list > div,
-html[data-theme="light"] .network-throughput-card {
-  border-color: rgba(57, 78, 109, 0.13);
-  background: #f6f9fc;
-  color: #42556d;
+html[data-color-scheme="light"] .diagnostic-message.is-error strong,
+html[data-color-scheme="light"] .interface-error strong {
+  color: var(--theme-danger);
 }
 
-html[data-theme="light"] .network-adapter-label strong,
-html[data-theme="light"] .settings-choice strong,
-html[data-theme="light"] .interface-detail strong,
-html[data-theme="light"] .network-total-traffic strong,
-html[data-theme="light"] .network-throughput-card strong {
-  color: #263a53;
+html[data-color-scheme="light"] .bdix-verify-button.is-verified {
+  border-color: #e8d4a9;
+  background: #fff9eb;
+  color: var(--theme-warning);
 }
 
-html[data-theme="light"] .settings-field select,
-html[data-theme="light"] .settings-field input,
-html[data-theme="light"] .download-form input,
-html[data-theme="light"] .download-settings select {
-  border-color: rgba(57, 78, 109, 0.2);
-  background: #fff;
-  color: #24364e;
+html[data-color-scheme="light"] .diagnostic-result.is-timeout .diagnostic-result-header strong,
+html[data-color-scheme="light"] .diagnostic-result.is-dnsResolutionFailed .diagnostic-result-header strong,
+html[data-color-scheme="light"] .diagnostic-result.is-noIpv4Address .diagnostic-result-header strong,
+html[data-color-scheme="light"] .diagnostic-result.is-unreachable .diagnostic-result-header strong,
+html[data-color-scheme="light"] .bdix-result.is-timeout .bdix-result-heading > div > strong,
+html[data-color-scheme="light"] .bdix-result.is-partial .bdix-result-heading > div > strong,
+html[data-color-scheme="light"] .bdix-result.is-dnsResolutionFailed .bdix-result-heading > div > strong,
+html[data-color-scheme="light"] .bdix-result.is-noAddress .bdix-result-heading > div > strong,
+html[data-color-scheme="light"] .bdix-result.is-unreachable .bdix-result-heading > div > strong,
+html[data-color-scheme="light"] .quality-status-warning,
+html[data-color-scheme="light"] .quality-rating-fair strong,
+html[data-color-scheme="light"] .quality-rating-disconnected strong,
+html[data-color-scheme="light"] .quality-rating-poor strong,
+html[data-color-scheme="light"] .quality-history-row.is-timeout > span,
+html[data-color-scheme="light"] .quality-history-row.is-unreachable > span,
+html[data-color-scheme="light"] .quality-history-row.is-dnsResolutionFailed > span,
+html[data-color-scheme="light"] .video-resource-state.is-unsupported,
+html[data-color-scheme="light"] .speed-data-warning,
+html[data-color-scheme="light"] .network-warning,
+html[data-color-scheme="light"] .link-local-warning,
+html[data-color-scheme="light"] .bdix-caveat,
+html[data-color-scheme="light"] .settings-status-list strong.is-disconnected {
+  color: var(--theme-warning);
 }
 
-html[data-theme="light"] .settings-choice small,
-html[data-theme="light"] .network-adapter-label small,
-html[data-theme="light"] .settings-status-list > div > span {
-  color: #65768c;
+html[data-color-scheme="light"] .speed-data-warning,
+html[data-color-scheme="light"] .network-warning,
+html[data-color-scheme="light"] .bdix-probe,
+html[data-color-scheme="light"] .bdix-verification,
+html[data-color-scheme="light"] .coming-badge,
+html[data-color-scheme="light"] .quality-status-warning,
+html[data-color-scheme="light"] .quality-rating-fair,
+html[data-color-scheme="light"] .video-resource-state.is-unsupported {
+  border-color: #e8d4a9;
+  background-color: #fff9eb;
 }
 
-@media (prefers-color-scheme: light) {
-  html[data-theme="system"] {
-    --surface: #f5f8fc;
-    --surface-raised: #fff;
-    --border: rgba(57, 78, 109, 0.16);
-    --muted: #52647a;
-    --dim: #718198;
-    color-scheme: light;
-    color: #17263b;
-    background: #edf2f8;
-  }
+html[data-color-scheme="light"] .quality-chart svg line {
+  stroke: #d8e0ea;
+}
 
-  html[data-theme="system"] body {
-    background: radial-gradient(ellipse at 74% -5%, rgba(32, 90, 150, 0.08), transparent 34rem), #edf2f8;
-  }
+html[data-color-scheme="light"] .quality-chart svg text {
+  fill: var(--theme-text-secondary);
+}
 
-  html[data-theme="system"] .sidebar {
-    border-color: rgba(57, 78, 109, 0.16);
-    background: rgba(247, 250, 253, 0.97);
-  }
+html[data-color-scheme="light"] .quality-chart-point {
+  stroke: #ffffff;
+}
 
-  html[data-theme="system"] .brand-name,
-  html[data-theme="system"] .page-header h1,
-  html[data-theme="system"] .settings-section .panel-heading h2,
-  html[data-theme="system"] .metric-value,
-  html[data-theme="system"] .network-detail-title h2,
-  html[data-theme="system"] .network-adapter-label strong,
-  html[data-theme="system"] .settings-choice strong,
-  html[data-theme="system"] .interface-detail strong,
-  html[data-theme="system"] .network-total-traffic strong,
-  html[data-theme="system"] .network-throughput-card strong {
-    color: #233750;
-  }
+html[data-color-scheme="light"] .quality-chart-failure {
+  stroke: #ffffff;
+}
 
-  html[data-theme="system"] .panel,
-  html[data-theme="system"] .network-adapter-list,
-  html[data-theme="system"] .network-adapter-detail {
-    border-color: rgba(57, 78, 109, 0.14);
-    background: rgba(255, 255, 255, 0.92);
-  }
-
-  html[data-theme="system"] .metric-card {
-    border-color: rgba(57, 78, 109, 0.14);
-    background: linear-gradient(145deg, #fff, #f3f7fb);
-  }
-
-  html[data-theme="system"] .nav-item {
-    color: #53647b;
-  }
-
-  html[data-theme="system"] .nav-item.active {
-    background: linear-gradient(90deg, rgba(42, 149, 174, 0.12), rgba(31, 83, 129, 0.07));
-    color: #147c91;
-  }
-
-  html[data-theme="system"] .network-adapter-item,
-  html[data-theme="system"] .settings-choice,
-  html[data-theme="system"] .settings-field,
-  html[data-theme="system"] .settings-status-list > div,
-  html[data-theme="system"] .network-throughput-card {
-    border-color: rgba(57, 78, 109, 0.13);
-    background: #f6f9fc;
-    color: #42556d;
-  }
-
-  html[data-theme="system"] .settings-field select,
-  html[data-theme="system"] .settings-field input,
-  html[data-theme="system"] .download-form input,
-  html[data-theme="system"] .download-settings select {
-    border-color: rgba(57, 78, 109, 0.2);
-    background: #fff;
-    color: #24364e;
-  }
-
-  html[data-theme="system"] .page-subtitle,
-  html[data-theme="system"] .settings-note,
-  html[data-theme="system"] .network-data-note,
-  html[data-theme="system"] .settings-choice small,
-  html[data-theme="system"] .network-adapter-label small,
-  html[data-theme="system"] .settings-status-list > div > span {
-    color: #5f7086;
-  }
+html[data-color-scheme="light"] .quality-history-row,
+html[data-color-scheme="light"] .diagnostic-stats,
+html[data-color-scheme="light"] .network-detail-heading,
+html[data-color-scheme="light"] .quick-action {
+  border-color: var(--theme-border);
 }

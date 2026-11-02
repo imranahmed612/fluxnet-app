@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save } from "@tauri-apps/plugin-dialog";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import { createBrowserHandoffRunner } from "./browserHandoff.mjs";
 import fluxnetSymbol from "./assets/fluxnet-symbol-128.png";
 import "./App.css";
@@ -203,6 +206,7 @@ type AppSettings = {
   networkAlertsEnabled: boolean;
   networkAlertFailureThreshold: number;
   networkAlertCooldownSeconds: number;
+  autoCheckUpdates: boolean;
 };
 
 const DEFAULT_APP_SETTINGS: AppSettings = {
@@ -216,7 +220,32 @@ const DEFAULT_APP_SETTINGS: AppSettings = {
   networkAlertsEnabled: false,
   networkAlertFailureThreshold: 3,
   networkAlertCooldownSeconds: 300,
+  autoCheckUpdates: false,
 };
+
+type UpdateStatus =
+  | "unavailable"
+  | "idle"
+  | "checking"
+  | "up-to-date"
+  | "available"
+  | "downloading"
+  | "downloaded"
+  | "installing"
+  | "restart-required"
+  | "failed";
+
+function formatUpdateBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(1)} ${units[unitIndex]}`;
+}
 
 type IconProps = {
   name: IconName;
@@ -838,18 +867,62 @@ function SettingsPage({
   settingsLoaded,
   loadError,
   onNavigate,
+  updaterConfigured,
+  installedVersion,
+  updateStatus,
+  updateError,
+  availableUpdate,
+  updateDownloaded,
+  downloadedBytes,
+  updateContentLength,
+  onCheckForUpdates,
+  onDownloadUpdate,
+  onInstallUpdate,
+  onRestartApplication,
 }: {
   settings: AppSettings;
   onSettingsChange: (settings: AppSettings) => void;
   settingsLoaded: boolean;
   loadError: string | null;
   onNavigate: (page: string) => void;
+  updaterConfigured: boolean | null;
+  installedVersion: string | null;
+  updateStatus: UpdateStatus;
+  updateError: string | null;
+  availableUpdate: Update | null;
+  updateDownloaded: boolean;
+  downloadedBytes: number;
+  updateContentLength: number | null;
+  onCheckForUpdates: () => void;
+  onDownloadUpdate: () => void;
+  onInstallUpdate: () => void;
+  onRestartApplication: () => void;
 }) {
   const [downloadSettings, setDownloadSettings] = useState<DownloadSettings | null>(null);
   const [browserStatus, setBrowserStatus] = useState<BrowserBridgeStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<{ kind: "success" | "error"; message: string } | null>(null);
+  const updateStatusMessage = (() => {
+    if (!isTauri()) return "Updates are available only in the FluxNet desktop application.";
+    if (updaterConfigured === null) return "Checking updater configuration…";
+    if (!updaterConfigured) return "Not configured. A signed HTTPS release endpoint and public key are required.";
+    switch (updateStatus) {
+      case "unavailable": return "Update checks are unavailable.";
+      case "idle": return "Not checked yet.";
+      case "checking": return "Checking for updates…";
+      case "up-to-date": return "FluxNet is already up to date.";
+      case "available": return `Update available: ${availableUpdate?.version ?? "new version"}.`;
+      case "downloading": return "Downloading update…";
+      case "downloaded": return "Update downloaded. Ready to install.";
+      case "installing": return "Installing update…";
+      case "restart-required": return "Update installed. Restart FluxNet to finish.";
+      case "failed": return "Update failed.";
+    }
+  })();
+  const downloadPercent = updateContentLength && updateContentLength > 0
+    ? Math.min(100, Math.round(downloadedBytes / updateContentLength * 100))
+    : null;
 
   const refreshBrowserStatus = useCallback(async () => {
     try {
@@ -964,7 +1037,7 @@ function SettingsPage({
   }, [onSettingsChange]);
 
   const resetToDefaults = () => {
-    if (!window.confirm("Reset all supported FluxNet preferences to their defaults? This changes startup behavior, download limits and notifications, network monitoring preferences, and the download folder. Download history and other user data will be kept.")) return;
+    if (!window.confirm("Reset all supported FluxNet preferences to their defaults? This changes startup behavior, automatic update checks, download limits and notifications, network monitoring preferences, and the download folder. Download history and other user data will be kept.")) return;
     const defaults = { ...DEFAULT_APP_SETTINGS };
     const downloadDefaults: DownloadSettings = {
       maxConcurrent: 2,
@@ -981,7 +1054,7 @@ function SettingsPage({
         <div>
           <div className="eyebrow">FLUXNET PREFERENCES</div>
           <h1>Settings</h1>
-          <p className="page-subtitle">Configure desktop behavior, downloads, browser integration, and network alerts.</p>
+          <p className="page-subtitle">Configure desktop behavior, updates, downloads, browser integration, and network alerts.</p>
         </div>
         <button
           className="test-connection-button"
@@ -1016,6 +1089,99 @@ function SettingsPage({
             </select>
           </label>
         </div>
+      </section>
+
+      <section className="panel settings-section">
+        <div className="panel-heading"><div><div className="eyebrow">APPLICATION</div><h2>Updates</h2></div></div>
+        <div className="settings-grid">
+          <div className="settings-field">
+            <span>Current installed version</span>
+            <strong className="update-version-value">{installedVersion ? `v${installedVersion}` : "Unavailable"}</strong>
+          </div>
+          <label className="settings-choice">
+            <span>
+              <strong>Check for updates at startup</strong>
+              <small>Checks once when FluxNet starts. Updates are never installed automatically.</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={settings.autoCheckUpdates}
+              disabled={!settingsLoaded || saving}
+              onChange={(event) => onSettingsChange({ ...settings, autoCheckUpdates: event.currentTarget.checked })}
+            />
+          </label>
+        </div>
+        <div className="settings-status-list update-status-list">
+          <div>
+            <span>Update status</span>
+            <strong className={updateStatus === "failed" || updaterConfigured !== true ? "is-disconnected" : "is-connected"} role="status">
+              {updateStatusMessage}
+            </strong>
+          </div>
+          {availableUpdate && (
+            <div>
+              <span>New version</span>
+              <strong>{availableUpdate.version}</strong>
+            </div>
+          )}
+        </div>
+        {availableUpdate && (
+          <div className="update-release-notes">
+            <strong>Release notes</strong>
+            <p>{availableUpdate.body?.trim() || "No release notes were provided."}</p>
+          </div>
+        )}
+        {updateStatus === "downloading" && (
+          <div className="update-download-progress">
+            <div className="update-progress-label">
+              <span>Downloaded {formatUpdateBytes(downloadedBytes)}</span>
+              <span>{updateContentLength ? `${formatUpdateBytes(updateContentLength)} total` : "Preparing transfer"}</span>
+            </div>
+            <div
+              className={`update-progress-track${downloadPercent === null ? " is-indeterminate" : ""}`}
+              role="progressbar"
+              aria-label="Update download progress"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={downloadPercent ?? undefined}
+            >
+              <span style={downloadPercent === null ? undefined : { width: `${downloadPercent}%` }} />
+            </div>
+          </div>
+        )}
+        {updateError && <div className="interface-error update-error" role="alert">{updateError}</div>}
+        <div className="settings-browser-actions update-actions">
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={updaterConfigured !== true || ["checking", "downloading", "downloaded", "installing", "restart-required"].includes(updateStatus)}
+            onClick={onCheckForUpdates}
+          >
+            {updateStatus === "checking" ? "Checking…" : "Check for Updates"}
+          </button>
+          {availableUpdate && !["downloading", "installing", "restart-required"].includes(updateStatus) && (
+            <button
+              className="test-connection-button"
+              type="button"
+              disabled={updaterConfigured !== true}
+              onClick={updateDownloaded ? onInstallUpdate : onDownloadUpdate}
+            >
+              {updateDownloaded
+                ? "Install & Restart"
+                : updateStatus === "failed"
+                  ? "Retry Download & Install"
+                  : "Download & Install"}
+            </button>
+          )}
+          {updateStatus === "restart-required" && (
+            <button className="test-connection-button" type="button" onClick={onRestartApplication}>
+              Restart FluxNet
+            </button>
+          )}
+        </div>
+        <p className="settings-note">
+          Updates are verified by Tauri’s signature check. Update checks stay disabled until a real public key and HTTPS release endpoint are configured; automatic checking is off by default.
+        </p>
       </section>
 
       <section className="panel settings-section">
@@ -3117,6 +3283,14 @@ function App() {
   const [appSettings, setAppSettings] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
   const [appSettingsLoaded, setAppSettingsLoaded] = useState(false);
   const [settingsBootstrapError, setSettingsBootstrapError] = useState<string | null>(null);
+  const [installedVersion, setInstalledVersion] = useState<string | null>(null);
+  const [updaterConfigured, setUpdaterConfigured] = useState<boolean | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("unavailable");
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
+  const [updateDownloaded, setUpdateDownloaded] = useState(false);
+  const [downloadedBytes, setDownloadedBytes] = useState(0);
+  const [updateContentLength, setUpdateContentLength] = useState<number | null>(null);
   const [showTrayNotice, setShowTrayNotice] = useState(
     () => localStorage.getItem("fluxnet.tray-notice-dismissed") !== "true",
   );
@@ -3149,6 +3323,10 @@ function App() {
   const speedTestStartedAt = useRef<number | null>(null);
   const interfaceRefreshInFlight = useRef(false);
   const runBrowserHandoff = useRef(createBrowserHandoffRunner());
+  const updateResource = useRef<Update | null>(null);
+  const updateOperationInFlight = useRef(false);
+  const updateDownloadBytes = useRef(0);
+  const autoUpdateCheckAttempted = useRef(false);
 
   useEffect(() => {
     let disposed = false;
@@ -3169,7 +3347,152 @@ function App() {
   }, []);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = appSettings.theme;
+    let disposed = false;
+    if (!isTauri()) {
+      setUpdaterConfigured(false);
+      setUpdateStatus("unavailable");
+      setUpdateError("Updates can only be checked from the FluxNet desktop application.");
+      return () => { disposed = true; };
+    }
+
+    void getVersion()
+      .then((version) => {
+        if (!disposed) setInstalledVersion(version);
+      })
+      .catch((error: unknown) => {
+        if (!disposed) {
+          setUpdateError(`Could not read the installed FluxNet version: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      });
+    void invoke<boolean>("is_updater_configured")
+      .then((configured) => {
+        if (disposed) return;
+        setUpdaterConfigured(configured);
+        setUpdateStatus(configured ? "idle" : "unavailable");
+      })
+      .catch((error: unknown) => {
+        if (disposed) return;
+        setUpdaterConfigured(false);
+        setUpdateStatus("failed");
+        setUpdateError(`Could not read the updater configuration: ${error instanceof Error ? error.message : String(error)}`);
+      });
+
+    return () => { disposed = true; };
+  }, []);
+
+  const checkForUpdates = useCallback(async () => {
+    if (!isTauri() || updaterConfigured !== true || updateOperationInFlight.current) return;
+    updateOperationInFlight.current = true;
+    setUpdateStatus("checking");
+    setUpdateError(null);
+    try {
+      const update = await check({ timeout: 30_000 });
+      const previousUpdate = updateResource.current;
+      if (previousUpdate) {
+        try {
+          await previousUpdate.close();
+        } catch (closeError) {
+          console.error("Could not release the previous updater response:", closeError);
+        }
+      }
+      updateResource.current = update;
+      setAvailableUpdate(update);
+      setUpdateDownloaded(false);
+      setDownloadedBytes(0);
+      setUpdateContentLength(null);
+      setUpdateStatus(update ? "available" : "up-to-date");
+    } catch (error) {
+      setUpdateStatus("failed");
+      setUpdateError(`Could not check for updates: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      updateOperationInFlight.current = false;
+    }
+  }, [updaterConfigured]);
+
+  useEffect(() => {
+    if (!appSettingsLoaded || updaterConfigured === null || autoUpdateCheckAttempted.current) return;
+    autoUpdateCheckAttempted.current = true;
+    if (appSettings.autoCheckUpdates && updaterConfigured) void checkForUpdates();
+  }, [appSettings.autoCheckUpdates, appSettingsLoaded, checkForUpdates, updaterConfigured]);
+
+  const downloadUpdate = useCallback(async () => {
+    const update = updateResource.current;
+    if (!update || updateOperationInFlight.current) return;
+    if (!window.confirm(
+      `Download FluxNet ${update.version}? FluxNet will ask again before installation. Installing will close the application and may interrupt its active downloads.`,
+    )) return;
+
+    updateOperationInFlight.current = true;
+    updateDownloadBytes.current = 0;
+    setDownloadedBytes(0);
+    setUpdateContentLength(null);
+    setUpdateError(null);
+    setUpdateStatus("downloading");
+    try {
+      await update.download((event) => {
+        if (event.event === "Started") {
+          setUpdateContentLength(event.data.contentLength ?? null);
+        } else if (event.event === "Progress") {
+          updateDownloadBytes.current += event.data.chunkLength;
+          setDownloadedBytes(updateDownloadBytes.current);
+        }
+      }, { timeout: 60_000 });
+      setUpdateDownloaded(true);
+      setUpdateStatus("downloaded");
+    } catch (error) {
+      setUpdateStatus("failed");
+      setUpdateError(`Could not download the update: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      updateOperationInFlight.current = false;
+    }
+  }, []);
+
+  const installUpdate = useCallback(async () => {
+    const update = updateResource.current;
+    if (!update || !updateDownloaded || updateOperationInFlight.current) return;
+    updateOperationInFlight.current = true;
+    setUpdateError(null);
+    try {
+      const downloads = await invoke<DownloadEntry[]>("get_downloads");
+      const activeCount = downloads.filter((entry) => ["queued", "downloading", "paused"].includes(entry.status)).length;
+      const transferWarning = activeCount
+        ? `${activeCount} queued, downloading, or paused FluxNet download${activeCount === 1 ? "" : "s"} may be interrupted.`
+        : "FluxNet will close while the update installs.";
+      if (!window.confirm(`Install FluxNet ${update.version} and restart the application? ${transferWarning}`)) return;
+      setUpdateStatus("installing");
+      await update.install({ restartAfterInstall: true });
+      setUpdateStatus("restart-required");
+    } catch (error) {
+      setUpdateStatus("failed");
+      setUpdateError(`Could not install the update: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      updateOperationInFlight.current = false;
+    }
+  }, [updateDownloaded]);
+
+  const restartApplication = useCallback(async () => {
+    if (!window.confirm("Restart FluxNet now?")) return;
+    try {
+      await relaunch();
+    } catch (error) {
+      setUpdateStatus("failed");
+      setUpdateError(`The update was installed, but FluxNet could not restart: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
+    const applyTheme = () => {
+      root.dataset.theme = appSettings.theme;
+      root.dataset.colorScheme = appSettings.theme === "system"
+        ? (systemTheme.matches ? "light" : "dark")
+        : appSettings.theme;
+    };
+
+    applyTheme();
+    systemTheme.addEventListener("change", applyTheme);
+    return () => systemTheme.removeEventListener("change", applyTheme);
   }, [appSettings.theme]);
 
   useEffect(() => {
@@ -3526,6 +3849,18 @@ function App() {
               settingsLoaded={appSettingsLoaded}
               loadError={settingsBootstrapError}
               onNavigate={setActivePage}
+              updaterConfigured={updaterConfigured}
+              installedVersion={installedVersion}
+              updateStatus={updateStatus}
+              updateError={updateError}
+              availableUpdate={availableUpdate}
+              updateDownloaded={updateDownloaded}
+              downloadedBytes={downloadedBytes}
+              updateContentLength={updateContentLength}
+              onCheckForUpdates={() => void checkForUpdates()}
+              onDownloadUpdate={() => void downloadUpdate()}
+              onInstallUpdate={() => void installUpdate()}
+              onRestartApplication={() => void restartApplication()}
             />
           ) : (
             <ComingSoon page={activePage} />

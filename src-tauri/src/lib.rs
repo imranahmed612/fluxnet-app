@@ -3,6 +3,7 @@ mod browser_bridge;
 mod download_manager;
 mod network;
 mod speed_test;
+mod updater;
 
 use std::sync::{
     Arc,
@@ -74,6 +75,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(speed_test::SpeedTestControl::default())
         .manage(network::BdixAnalysisControl::default())
         .manage(network::QualityMonitorControl::default())
@@ -229,6 +232,7 @@ pub fn run() {
             app_settings::get_app_settings,
             app_settings::validate_app_settings,
             app_settings::save_app_settings,
+            updater::is_updater_configured,
             network::get_network_interfaces,
             network::test_connectivity,
             network::analyze_bdix_target,

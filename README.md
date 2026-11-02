@@ -65,6 +65,21 @@ The **Settings** page stores desktop preferences in the per-user FluxNet configu
 
 Network monitoring interval, ping timeout, and alert threshold/cooldown are validated and applied to Windows ICMP monitoring. Packet loss is always derived from probe results. Native Messaging installation status is checked from the Chrome/Edge per-user registration and manifest; extension connection requires the extension to initiate a message, so reconnect from its popup. Automatic video/download detection, overlays, extension filters, and extension notification behavior remain owned by Chrome/Edge extension storage and must be changed in the extension popup; FluxNet does not claim to control them from desktop Settings. Browser-side download prompts do not pause or cancel the browser's own transfer.
 
+### In-app updates
+
+The **Updates** section displays the installed version, supports manual checks, and can optionally check once at startup (off by default). FluxNet never installs an update automatically. Update bundles are downloaded and installed through Tauri's updater plugin, which verifies the artifact signature; release metadata is required to bind the advertised version to the signed version. Before installing, FluxNet asks for confirmation and warns about queued, downloading, or paused FluxNet transfers that may be interrupted. Windows updates use the existing NSIS format.
+
+Update checks are intentionally unavailable in this source configuration: `src-tauri/tauri.conf.json` has no public verification key or release endpoint. Configure `plugins.updater.pubkey` with the public key from Tauri's signer and `plugins.updater.endpoints` with the real HTTPS endpoint hosting signed update metadata before publishing a release. The application rejects empty or non-HTTPS endpoints, missing keys, downgrade-enabled settings, and configurations that disable signed-version or TLS verification. The frontend cannot provide or override update URLs.
+
+Generate and store the signing key outside the repository, for example:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.tauri" | Out-Null
+npm.cmd run tauri signer generate -- -w "$env:USERPROFILE\.tauri\fluxnet.key"
+```
+
+Keep the private key and its password in a protected local location or a release-system secret store. For release builds, provide the private-key path/content through `TAURI_SIGNING_PRIVATE_KEY` and, when applicable, the password through `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`; do not put either in source control or a `.env` file. Put only the generated public key in the Tauri updater configuration. `bundle.createUpdaterArtifacts` is enabled to prepare signed updater artifacts, but real update distribution cannot work until a public key, a real signed release, and its HTTPS metadata endpoint are configured. The Chrome extension remains distributed separately through Chrome/Edge.
+
 ## Download Manager
 
 The **Download Manager** accepts HTTP and HTTPS URLs and asks for a destination with the native save-file dialog. Files stream to a sibling `.fluxnet-part` file and are renamed into place only after a successful complete transfer. TLS certificate verification remains enabled and uses the Windows native certificate roots; the HTTP client also honors the Windows system proxy settings. Redirects are limited to 10 hops, and requests have a 15-second connect timeout, a 30-second read timeout, and a one-hour total timeout. Existing destination files are not overwritten. FluxNet does not open or execute downloaded files.

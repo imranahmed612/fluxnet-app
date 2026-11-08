@@ -86,13 +86,19 @@ function renderResources(resources) {
     if (resource.mimeType) details.push(resource.mimeType);
     if (resource.observedBytes !== null && resource.observedBytes !== undefined) details.push(`Observed ${resource.observedBytes} B`);
     if (resource.width && resource.height) details.push(`${resource.width} × ${resource.height}`);
-    details.push(resource.downloadable ? "Direct file candidate" : "Manifest only; not downloadable");
+    details.push(resource.mediaType === "hls" && resource.downloadable
+      ? "Finite HLS fMP4 playlist"
+      : resource.downloadable ? "Direct file candidate"
+      : resource.mediaType === "unsupported-video" ? "Playable video; format not supported for download"
+        : "Manifest only; not downloadable");
     meta.textContent = details.join(" · ");
     card.append(heading, url, meta);
 
     const send = document.createElement("button");
     send.className = "send";
-    send.textContent = resource.downloadable ? "Send to FluxNet" : "Report unsupported manifest";
+    send.textContent = resource.downloadable ? "Send to FluxNet"
+      : resource.mediaType === "unsupported-video" ? "Report unsupported video"
+        : "Report unsupported manifest";
     send.addEventListener("click", async () => {
       const message = {
         url: resource.url,
@@ -106,6 +112,8 @@ function renderResources(resources) {
         mimeType: resource.mimeType ?? null,
         filename: resource.filename ?? null,
         totalBytes: resource.totalBytes ?? null,
+        downloadable: resource.downloadable === true,
+        hlsPlaylist: resource.hlsPlaylist ?? null,
       };
       const valid = resource.downloadable
         ? validateMediaMessage(message)
@@ -160,6 +168,7 @@ byId("scan").addEventListener("click", async () => {
               observedBytes: null,
               width: element.videoWidth || null,
               height: element.videoHeight || null,
+              playableVideo: url === element.currentSrc && element.videoWidth > 0 && element.videoHeight > 0,
               mimeType: [...element.querySelectorAll("source")].find((source) => source.src === url)?.type
                 || element.getAttribute("type") || "",
             });
@@ -174,9 +183,9 @@ byId("scan").addEventListener("click", async () => {
     });
     const { detectedResources = [] } = await chrome.storage.local.get("detectedResources");
     const scanned = (result?.result?.resources ?? [])
-      .filter((resource) => classifyMediaUrl(resource.url, resource.mimeType))
+      .filter((resource) => classifyMediaUrl(resource.url, resource.mimeType, resource.playableVideo))
       .map((resource) => {
-        const classified = classifyMediaUrl(resource.url, resource.mimeType);
+        const classified = classifyMediaUrl(resource.url, resource.mimeType, resource.playableVideo);
         return { ...resource, ...classified };
       });
     const merged = deduplicateResources([...scanned, ...detectedResources]);

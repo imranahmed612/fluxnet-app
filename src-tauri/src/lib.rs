@@ -33,6 +33,19 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+#[tauri::command]
+fn prepare_browser_download_dialog(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.unminimize().map_err(|error| {
+        format!("Could not restore FluxNet for the browser download dialog: {error}")
+    })?;
+    window.show().map_err(|error| {
+        format!("Could not show FluxNet for the browser download dialog: {error}")
+    })?;
+    window.set_focus().map_err(|error| {
+        format!("Could not focus FluxNet for the browser download dialog: {error}")
+    })
+}
+
 fn request_exit(app: &tauri::AppHandle, exit_started: &AtomicBool) {
     if exit_started.swap(true, Ordering::AcqRel) {
         return;
@@ -250,6 +263,7 @@ pub fn run() {
             download_manager::get_downloads,
             download_manager::get_download_settings,
             download_manager::get_download_filename,
+            prepare_browser_download_dialog,
             download_manager::configure_download_limits,
             download_manager::configure_download_notifications,
             download_manager::configure_download_notification_preferences,

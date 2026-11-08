@@ -5,7 +5,10 @@ import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save } from "@tauri-apps/plugin-dialog";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { createBrowserHandoffRunner } from "./browserHandoff.mjs";
+import {
+  createBrowserHandoffRunner,
+  openUserInitiatedBrowserDownloadDialog,
+} from "./browserHandoff.mjs";
 import fluxnetSymbol from "./assets/fluxnet-symbol-128.png";
 import "./App.css";
 
@@ -906,7 +909,7 @@ function SettingsPage({
   const updateStatusMessage = (() => {
     if (!isTauri()) return "Updates are available only in the FluxNet desktop application.";
     if (updaterConfigured === null) return "Checking updater configuration…";
-    if (!updaterConfigured) return "Not configured. A signed HTTPS release endpoint and public key are required.";
+    if (!updaterConfigured) return "Updater configuration is incomplete; a publicly reachable signed release endpoint is required.";
     switch (updateStatus) {
       case "unavailable": return "Update checks are unavailable.";
       case "idle": return "Not checked yet.";
@@ -1180,7 +1183,7 @@ function SettingsPage({
           )}
         </div>
         <p className="settings-note">
-          Updates are verified by Tauri’s signature check. Update checks stay disabled until a real public key and HTTPS release endpoint are configured; automatic checking is off by default.
+          Updates are verified by Tauri’s signature check. The configured public verification key is retained, but update checks stay disabled until a signed release and its HTTPS metadata endpoint are publicly available; automatic checking is off by default.
         </p>
       </section>
 
@@ -2684,22 +2687,63 @@ type BrowserMediaResource = {
   observedBytes: number | null;
   width: number | null;
   height: number | null;
+  hlsPlaylist?: HlsPlaylist | null;
   receivedAtMs: number;
   queueState: "detected" | "unsupported" | "queued" | "completed" | "expired" | "error";
   message: string | null;
 };
 
+type HlsByteRange = {
+  length: number;
+  offset: number;
+};
+
+type HlsResource = {
+  url: string;
+  byteRange?: HlsByteRange | null;
+};
+
+type HlsPlaylist = {
+  version: 1;
+  container: "fmp4";
+  manifestSizeBytes: number;
+  init: HlsResource;
+  segments: HlsResource[];
+  expectedBytes: number | null;
+};
+
 type BrowserMediaPayload = Omit<BrowserMediaResource, "queueState" | "message">;
+
+function browserMediaIdentity(resource: Pick<BrowserMediaPayload, "url" | "mediaType">): string {
+  try {
+    const url = new URL(resource.url);
+    url.hash = "";
+    const hostname = url.hostname.toLowerCase();
+    if (hostname === "cdninstagram.com" || hostname.endsWith(".cdninstagram.com")
+      || hostname === "fbcdn.net" || hostname.endsWith(".fbcdn.net")) {
+      url.search = "";
+    }
+    return `${resource.mediaType}\n${url.href}`;
+  } catch {
+    return `${resource.mediaType}\n${resource.url}`;
+  }
+}
 
 function mapBrowserMediaResource(
   payload: BrowserMediaPayload,
   downloads: DownloadEntry[],
 ): BrowserMediaResource {
-  const unsupported = payload.mediaType === "hls" || payload.mediaType === "dash";
+  const unsupported = payload.mediaType === "dash"
+    || (payload.mediaType === "hls" && !payload.hlsPlaylist)
+    || payload.mediaType === "unsupported-video";
   const initial: BrowserMediaResource = {
     ...payload,
     queueState: unsupported ? "unsupported" : "detected",
-    message: unsupported ? "Manifest detected; segment merging is unavailable, so FluxNet cannot create a complete video file." : null,
+    message: payload.mediaType === "hls" && payload.hlsPlaylist
+      ? "Finite HLS fMP4 playlist validated. FluxNet will download the declared initialization and segments."
+      : payload.mediaType === "unsupported-video"
+      ? "The browser is playing this video, but FluxNet cannot safely download its format."
+      : unsupported ? "Manifest detected; segment merging is unavailable, so FluxNet cannot create a complete video file." : null,
   };
   if (unsupported) return initial;
   const entry = downloads.find((download) => download.url === payload.url);
@@ -2761,7 +2805,21 @@ function VideoDetectionPage({ defaultDownloadDirectory }: { defaultDownloadDirec
       (event) => {
         const resource = event.payload;
         setResources((current) => {
-          if (current.some((item) => item.url === resource.url)) return current;
+          const identity = browserMediaIdentity(resource);
+          const existing = current.find((item) => browserMediaIdentity(item) === identity);
+          if (existing) {
+            if (resource.receivedAtMs < existing.receivedAtMs) return current;
+            const refreshed = mapBrowserMediaResource(resource, []);
+            const preserveQueueState = existing.url === resource.url
+              || existing.queueState === "queued"
+              || existing.queueState === "completed"
+              || existing.queueState === "unsupported";
+            return current.map((item) => item === existing
+              ? preserveQueueState
+                ? { ...refreshed, queueState: existing.queueState, message: existing.message }
+                : refreshed
+              : item);
+          }
           return [mapBrowserMediaResource(resource, []), ...current].slice(0, 100);
         });
         reportFeedback(resource.filename
@@ -2778,9 +2836,9 @@ function VideoDetectionPage({ defaultDownloadDirectory }: { defaultDownloadDirec
         ]).then(([mediaResources, downloads]) => {
           if (disposed) return;
           setResources((current) => {
-            const existing = new Set(current.map((resource) => resource.url));
+            const existing = new Set(current.map(browserMediaIdentity));
             const restored = mediaResources
-              .filter((resource) => !existing.has(resource.url))
+              .filter((resource) => !existing.has(browserMediaIdentity(resource)))
               .map((resource) => mapBrowserMediaResource(resource, downloads));
             return [...current, ...restored].slice(0, 100);
           });
@@ -2814,7 +2872,13 @@ function VideoDetectionPage({ defaultDownloadDirectory }: { defaultDownloadDirec
   const queueResource = useCallback(async (resource: BrowserMediaResource) => {
     setPendingUrl(resource.url);
     try {
-      const filename = await invoke<string>("get_download_filename", { url: resource.url });
+      const filename = await invoke<string>("get_download_filename", {
+        url: resource.url,
+        pageTitle: resource.pageTitle,
+        pageDomain: resource.pageDomain,
+        mediaType: resource.mediaType,
+        directory: defaultDownloadDirectory,
+      });
       const defaultPath = defaultDownloadDirectory
         ? `${defaultDownloadDirectory.replace(/[\\/]$/, "")}\\${filename}`
         : filename;
@@ -2823,7 +2887,11 @@ function VideoDetectionPage({ defaultDownloadDirectory }: { defaultDownloadDirec
         reportFeedback("Canceled; no file was downloaded.", "cancelled");
         return;
       }
-      await invoke<DownloadEntry>("start_download", { url: resource.url, destination });
+      await invoke<DownloadEntry>("start_download", {
+        url: resource.url,
+        destination,
+        hlsPlaylist: resource.hlsPlaylist ?? null,
+      });
       setResources((current) => current.map((item) => item.url === resource.url
         ? { ...item, queueState: "queued", message: "Added to the Download Manager." }
         : item));
@@ -2914,7 +2982,7 @@ function VideoDetectionPage({ defaultDownloadDirectory }: { defaultDownloadDirec
                 <div className="video-resource-heading">
                   <strong>{resource.pageTitle || resource.pageDomain || "Browser media"}</strong>
                   <span className={`video-resource-state is-${resource.queueState}`}>
-                    {resource.queueState === "queued" ? "Queued" : resource.queueState === "completed" ? "Completed" : resource.queueState === "unsupported" ? "Unsupported manifest" : resource.queueState === "expired" ? "Expired / access required" : resource.queueState === "error" ? "Error" : "Detected"}
+                    {resource.queueState === "queued" ? "Queued" : resource.queueState === "completed" ? "Completed" : resource.queueState === "unsupported" ? (resource.mediaType === "unsupported-video" ? "Unsupported video format" : "Unsupported manifest") : resource.queueState === "expired" ? "Expired / access required" : resource.queueState === "error" ? "Error" : "Detected"}
                   </span>
                 </div>
                 <code className="video-resource-url">{displayDownloadUrl(resource.url)}</code>
@@ -2941,7 +3009,7 @@ function VideoDetectionPage({ defaultDownloadDirectory }: { defaultDownloadDirec
           </div>
         )}
       </section>
-      <p className="video-caveat">HLS (.m3u8) and DASH (.mpd) manifests are shown as unsupported by the extension, not as complete files. No cookies, passwords, authorization headers, browser history, DRM, or login restrictions are bypassed. A listed resource can expire or require authentication; FluxNet downloads without browser credentials.</p>
+      <p className="video-caveat">Finite, complete, unencrypted HLS fMP4 playlists are supported only when they declare initialization data and an ordered segment list. DASH manifests remain unsupported for download. No cookies, passwords, authorization headers, browser history, DRM, or login restrictions are bypassed. A listed resource can expire or require authentication; FluxNet downloads without browser credentials.</p>
     </div>
   );
 }
@@ -3021,7 +3089,10 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
     event.preventDefault();
     setFeedback(null);
     try {
-      const filename = await invoke<string>("get_download_filename", { url: url.trim() });
+      const filename = await invoke<string>("get_download_filename", {
+        url: url.trim(),
+        directory: defaultDownloadDirectory,
+      });
       const defaultPath = defaultDownloadDirectory
         ? `${defaultDownloadDirectory.replace(/[\\/]$/, "")}\\${filename}`
         : filename;
@@ -3030,7 +3101,11 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
         setFeedback({ kind: "cancelled", message: "Download canceled; no destination was selected." });
         return;
       }
-      await invoke<DownloadEntry>("start_download", { url: url.trim(), destination });
+      await invoke<DownloadEntry>("start_download", {
+        url: url.trim(),
+        destination,
+        hlsPlaylist: null,
+      });
       setUrl("");
       setFeedback({ kind: "success", message: "Download added to the queue." });
     } catch (startError) {
@@ -3245,6 +3320,9 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
                     <span>{entry.status === "downloading" ? `${(entry.speedBytesPerSecond / 1_000_000).toFixed(2)} MB/s` : "—"}</span>
                     <span>Elapsed {formatDuration(entry.elapsedMs / 1000)}</span>
                     <span>Remaining {formatDuration(entry.remainingSeconds)}</span>
+                    {entry.status === "completed" && entry.filename.toLowerCase().endsWith(".mp4") && (
+                      <span>MP4 container structure validated; codec decoding is not verified.</span>
+                    )}
                   </div>
                   {entry.error && <div className="download-entry-error" role="alert">{entry.error}</div>}
                   <div className="download-entry-actions">
@@ -3528,17 +3606,30 @@ function App() {
             setActivePage("Download Manager");
             return true;
           }
-          const suggestedFilename = resource.filename
-            || await invoke<string>("get_download_filename", { url: resource.url });
+          const suggestedFilename = await invoke<string>("get_download_filename", {
+            url: resource.url,
+            pageTitle: resource.pageTitle,
+            pageDomain: resource.pageDomain,
+            mediaType: resource.mediaType,
+            preferredFilename: resource.filename,
+            directory: appSettings.defaultDownloadDirectory,
+          });
           const defaultPath = appSettings.defaultDownloadDirectory
             ? `${appSettings.defaultDownloadDirectory.replace(/[\\/]$/, "")}\\${suggestedFilename}`
             : suggestedFilename;
-          const destination = await save({
-            title: "Save browser download with FluxNet",
-            defaultPath,
-          });
+          const destination = await openUserInitiatedBrowserDownloadDialog(
+            () => invoke<void>("prepare_browser_download_dialog"),
+            () => save({
+              title: "Save browser download with FluxNet",
+              defaultPath,
+            }),
+          );
           if (!destination) return false;
-          await invoke<DownloadEntry>("start_download", { url: resource.url, destination });
+          await invoke<DownloadEntry>("start_download", {
+            url: resource.url,
+            destination,
+            hlsPlaylist: resource.hlsPlaylist ?? null,
+          });
           setActivePage("Download Manager");
           return true;
         } catch (handoffError) {

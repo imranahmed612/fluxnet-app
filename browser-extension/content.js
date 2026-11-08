@@ -1,17 +1,94 @@
 const DIRECT_VIDEO_TYPES = new Set(["mp4", "webm"]);
 const STREAM_TYPES = new Map([["m3u8", "hls"], ["mpd", "dash"]]);
+const NON_VIDEO_EXTENSIONS = new Set([
+  "aac", "aiff", "amr", "apk", "ac3", "csv", "dmg", "doc", "docx", "exe",
+  "flac", "gif", "gz", "iso", "jpeg", "jpg", "m4a", "m4b", "mid", "midi", "mp2",
+  "mp3", "msi", "opus", "pdf", "png", "ppt", "pptx", "rar", "7z", "tar",
+  "txt", "wav", "webp", "wma", "xls", "xlsx", "zip",
+]);
 let settings = { automaticVideoDetection: true, automaticDownloadDetection: true, videoOverlay: true, excludedDomains: [] };
 const overlays = new Map();
 const trackedVideos = new Set();
 const watchedVideos = new WeakSet();
+const resizeObservedVideos = new WeakSet();
+const confirmedVideoResources = new Map();
 const sentCandidateUrls = new Set();
 const candidateRegistrations = new Map();
 const registrationFailures = new Map();
-const { videoSourceLabel, canDownloadVideoSource } = globalThis.FluxNetVideoSources;
+const downloadGestureTracker = globalThis.FluxNetDownloadGesture.createDownloadGestureTracker();
 let refreshQueued = false;
 let positionQueued = false;
+const videoResizeObserver = new ResizeObserver(() => schedulePositionOverlays());
 
-function classifyMediaUrl(rawUrl, mimeType = "") {
+function playerCandidates() {
+  return [...trackedVideos].map((video) => {
+    const rect = video.getBoundingClientRect();
+    const style = getComputedStyle(video);
+    return {
+      video,
+      urls: [...new Set([video.currentSrc, video.src,
+        ...[...video.querySelectorAll("source")].map((source) => source.src)].filter(Boolean))],
+      visible: video.isConnected && video.videoWidth > 0 && video.videoHeight > 0
+        && video.getClientRects().length > 0 && style.display !== "none" && style.visibility !== "hidden"
+          && style.opacity !== "0"
+        && rect.width >= 80 && rect.height >= 50 && rect.bottom > 0 && rect.top < innerHeight
+        && rect.right > 0 && rect.left < innerWidth,
+      width: video.videoWidth,
+      height: video.videoHeight,
+      playing: !video.paused && !video.ended,
+    };
+  });
+}
+
+function attachConfirmedVideoResources() {
+  const players = playerCandidates();
+  for (const resource of confirmedVideoResources.values()) {
+    if (resource.attachedVideo) continue;
+    const player = players.find((candidate) => candidate.visible && candidate.urls.includes(resource.url))?.video;
+    if (player && addPlayerOverlay(player, resource.url, resource.mimeType || "", {
+      width: player.videoWidth,
+      height: player.videoHeight,
+      manifestVariants: resource.manifestVariants,
+      manifestAudioTracks: resource.manifestAudioTracks,
+      hlsPlaylist: resource.hlsPlaylist,
+      availableSources: resource.downloadable && resource.hlsPlaylist ? [{
+        url: resource.url,
+        mediaType: "hls",
+        width: player.videoWidth,
+        height: player.videoHeight,
+        registered: true,
+      }] : undefined,
+      manifestStatus: resource.manifestStatus,
+    })) {
+      resource.attachedVideo = player;
+    }
+  }
+  const pending = [...confirmedVideoResources.values()]
+    .filter((resource) => !resource.attachedVideo && Date.now() - resource.receivedAt <= 15_000)
+    .sort((left, right) => right.receivedAt - left.receivedAt)[0];
+  if (pending) {
+    const player = globalThis.FluxNetVideoMedia.selectVideoOverlayPlayer(players, pending.url);
+    if (player && addPlayerOverlay(player, pending.url, pending.mimeType || "", {
+      width: player.videoWidth,
+      height: player.videoHeight,
+      manifestVariants: pending.manifestVariants,
+      manifestAudioTracks: pending.manifestAudioTracks,
+      hlsPlaylist: pending.hlsPlaylist,
+      availableSources: pending.downloadable && pending.hlsPlaylist ? [{
+        url: pending.url,
+        mediaType: "hls",
+        width: player.videoWidth,
+        height: player.videoHeight,
+        registered: true,
+      }] : undefined,
+      manifestStatus: pending.manifestStatus,
+    })) {
+      pending.attachedVideo = player;
+    }
+  }
+}
+
+function classifyMediaUrl(rawUrl, mimeType = "", playableVideo = false) {
   let url;
   try {
     url = new URL(rawUrl);
@@ -21,9 +98,19 @@ function classifyMediaUrl(rawUrl, mimeType = "") {
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return null;
   const extension = url.pathname.toLowerCase().split(".").pop();
   if (STREAM_TYPES.has(extension)) return { url: url.href, mediaType: STREAM_TYPES.get(extension), downloadable: false };
+  if (NON_VIDEO_EXTENSIONS.has(extension)) return null;
+  const normalizedMime = String(mimeType).split(";")[0].trim().toLowerCase();
+  if (normalizedMime.startsWith("image/") || normalizedMime.startsWith("audio/")
+    || ["application/pdf", "application/zip", "application/x-zip-compressed", "application/x-msdownload",
+      "application/x-executable", "text/html", "text/plain"].includes(normalizedMime)) return null;
   if (DIRECT_VIDEO_TYPES.has(extension)) return { url: url.href, mediaType: extension, downloadable: true };
-  const mimeVideoType = /^video\/(mp4|webm)(?:;|$)/i.exec(mimeType)?.[1]?.toLowerCase();
+  const mimeVideoType = /^(?:video\/)(mp4|webm)$/.exec(normalizedMime)?.[1];
   if (mimeVideoType) return { url: url.href, mediaType: mimeVideoType, downloadable: true };
+  if (playableVideo && !NON_VIDEO_EXTENSIONS.has(extension)
+    && (!normalizedMime || normalizedMime === "application/octet-stream" || normalizedMime === "binary/octet-stream"
+      || normalizedMime.startsWith("video/"))) {
+    return { url: url.href, mediaType: "unsupported-video", downloadable: false };
+  }
   return null;
 }
 
@@ -45,7 +132,7 @@ function isExcludedPage() {
 
 function sendCandidate(url, metadata = {}) {
   if (!settings.automaticVideoDetection || isExcludedPage()) return Promise.resolve(false);
-  const classified = classifyMediaUrl(url, metadata.mimeType || "");
+  const classified = classifyMediaUrl(url, metadata.mimeType || "", metadata.playableVideo === true);
   if (!classified) return Promise.resolve(false);
   if (sentCandidateUrls.has(classified.url)) return Promise.resolve(true);
   const pending = candidateRegistrations.get(classified.url);
@@ -60,6 +147,7 @@ function sendCandidate(url, metadata = {}) {
     width: metadata.width || null,
     height: metadata.height || null,
     fromPlayer: metadata.fromPlayer === true,
+    playableVideo: metadata.playableVideo === true,
   };
   const registration = Promise.resolve()
     .then(() => chrome.runtime.sendMessage({ type: "fluxnet:media", resource }))
@@ -137,6 +225,10 @@ function updateQualityStatus(overlay) {
       : "This video source must be confirmed by FluxNet before download.";
     return;
   }
+  if (source?.mediaType === "hls") {
+    overlay.status.textContent = "Finite unencrypted HLS fMP4 selected. FluxNet downloads its declared initialization and media segments.";
+    return;
+  }
   if (!source?.height) {
     overlay.status.textContent = "Resolution is unavailable; only the original source can be downloaded. No conversion.";
   } else if (source.height === 1080) {
@@ -153,8 +245,10 @@ function updateSelector(overlay) {
   quality.replaceChildren();
   format.replaceChildren();
   const classified = classifyMediaUrl(overlay.url, overlay.mimeType);
+  const downloadable = classified?.downloadable
+    || (classified?.mediaType === "hls" && Boolean(overlay.hlsPlaylist));
 
-  if (classified?.downloadable) {
+  if (downloadable) {
     const sources = overlay.availableSources.length
       ? overlay.availableSources
       : [{ url: overlay.url, mediaType: classified.mediaType, width: overlay.width, height: overlay.height }];
@@ -176,7 +270,7 @@ function updateSelector(overlay) {
     for (const [index, source] of uniqueSources.entries()) {
       const option = document.createElement("option");
       option.value = source.url;
-      option.textContent = videoSourceLabel(source, index, uniqueSources.length);
+      option.textContent = globalThis.FluxNetVideoSources.videoSourceLabel(source, index, uniqueSources.length);
       quality.append(option);
     }
     const selectedSource = uniqueSources.find((source) => source.url === requestedUrl)
@@ -191,10 +285,10 @@ function updateSelector(overlay) {
     };
     quality.onchange = () => {
       const selected = uniqueSources.find((source) => source.url === quality.value);
-      download.disabled = !canDownloadVideoSource(selected, overlay.downloadStarted);
+      download.disabled = !globalThis.FluxNetVideoSources.canDownloadVideoSource(selected, overlay.downloadStarted);
       updateQualityStatus(overlay);
     };
-    download.disabled = !canDownloadVideoSource(selected, overlay.downloadStarted);
+    download.disabled = !globalThis.FluxNetVideoSources.canDownloadVideoSource(selected, overlay.downloadStarted);
     if (!overlay.message) updateQualityStatus(overlay);
     return;
   }
@@ -229,7 +323,11 @@ function updateSelector(overlay) {
 
 function positionOverlays() {
   for (const video of trackedVideos) {
-    if (!video.isConnected) trackedVideos.delete(video);
+    if (!video.isConnected) {
+      trackedVideos.delete(video);
+      videoResizeObserver.unobserve(video);
+      resizeObservedVideos.delete(video);
+    }
   }
   for (const [video, overlay] of overlays) {
     if (!video.isConnected || !settings.videoOverlay) {
@@ -243,8 +341,17 @@ function positionOverlays() {
       continue;
     }
     overlay.host.hidden = false;
-    const left = Math.min(innerWidth - 100, Math.max(8, rect.right - 96));
-    const top = Math.min(innerHeight - 42, Math.max(8, rect.top + 8));
+    const width = overlay.host.getBoundingClientRect().width || 100;
+    const height = overlay.host.getBoundingClientRect().height || 34;
+    const rightPosition = rect.right + 8;
+    const leftPosition = rect.left - width - 8;
+    const availableLeft = Math.max(8, innerWidth - width - 8);
+    const left = rightPosition + width <= innerWidth - 8
+      ? rightPosition
+      : leftPosition >= 8 ? leftPosition : Math.min(availableLeft, Math.max(8, rect.left + 8));
+    const top = rect.top + height <= innerHeight - 8
+      ? Math.max(8, rect.top)
+      : Math.max(8, Math.min(innerHeight - height - 8, rect.bottom - height));
     overlay.host.style.left = `${left}px`;
     overlay.host.style.top = `${top}px`;
   }
@@ -260,9 +367,9 @@ function schedulePositionOverlays() {
 }
 
 function addPlayerOverlay(video, url, mimeType = "", metadata = {}) {
-  if (!settings.videoOverlay || !video?.isConnected) return;
+  if (!settings.videoOverlay || !video?.isConnected || video.videoWidth <= 0 || video.videoHeight <= 0) return false;
   const classified = classifyMediaUrl(url, mimeType);
-  if (!classified) return;
+  if (!classified) return false;
   let overlay = overlays.get(video);
   if (!overlay) {
     const host = document.createElement("div");
@@ -306,6 +413,7 @@ function addPlayerOverlay(video, url, mimeType = "", metadata = {}) {
       width: metadata.width || video.videoWidth,
       height: metadata.height || video.videoHeight,
       manifestVariants: [],
+      hlsPlaylist: null,
       availableSources: [],
       message: "",
       downloadStarted: false,
@@ -325,7 +433,7 @@ function addPlayerOverlay(video, url, mimeType = "", metadata = {}) {
       event.stopPropagation();
       if (download.disabled) return;
       const selected = overlay.availableSources.find((item) => item.url === overlay.quality.value);
-      if (!canDownloadVideoSource(selected, overlay.downloadStarted)) return;
+      if (!globalThis.FluxNetVideoSources.canDownloadVideoSource(selected, overlay.downloadStarted)) return;
       download.disabled = true;
       overlay.message = "Starting FluxNet handoff…";
       status.textContent = overlay.message;
@@ -339,7 +447,7 @@ function addPlayerOverlay(video, url, mimeType = "", metadata = {}) {
         overlay.downloadStarted = false;
         overlay.message = "Handoff sent to FluxNet. If you cancel the save dialog, click to retry.";
         status.textContent = overlay.message;
-        download.disabled = !canDownloadVideoSource(selected, overlay.downloadStarted);
+        download.disabled = !globalThis.FluxNetVideoSources.canDownloadVideoSource(selected, overlay.downloadStarted);
       } catch (error) {
         overlay.message = `FluxNet unavailable: ${error.message}. No download was started.`;
         status.textContent = overlay.message;
@@ -358,6 +466,7 @@ function addPlayerOverlay(video, url, mimeType = "", metadata = {}) {
     overlay.message = "";
     overlay.downloadStarted = false;
     overlay.availableSources = [];
+    overlay.hlsPlaylist = null;
   }
   overlay.url = classified.url;
   overlay.mimeType = mimeType;
@@ -365,18 +474,25 @@ function addPlayerOverlay(video, url, mimeType = "", metadata = {}) {
   overlay.width = metadata.width || (isCurrentSource ? video.videoWidth : null);
   overlay.height = metadata.height || (isCurrentSource ? video.videoHeight : null);
   overlay.manifestVariants = Array.isArray(metadata.manifestVariants) ? metadata.manifestVariants : overlay.manifestVariants;
+  overlay.hlsPlaylist = metadata.hlsPlaylist || overlay.hlsPlaylist;
   if (Array.isArray(metadata.availableSources) && metadata.availableSources.length) {
-    overlay.availableSources = metadata.availableSources.map((source) => ({
+    const mergedSources = new Map(overlay.availableSources.map((source) => [source.url, source]));
+    metadata.availableSources.forEach((source) => mergedSources.set(source.url, {
       ...source,
       ...registrationState(source.url),
+      ...(source.mediaType === "hls" ? { registered: true, pending: false } : {}),
     }));
-  } else if (classified.downloadable && !overlay.availableSources.length) {
+    overlay.availableSources = [...mergedSources.values()];
+  } else if ((classified.downloadable || (classified.mediaType === "hls" && overlay.hlsPlaylist))
+    && !overlay.availableSources.length) {
     overlay.availableSources = [{
       url: classified.url,
-      mediaType: classified.mediaType,
+      mediaType: classified.mediaType === "hls" ? "hls" : classified.mediaType,
       width: overlay.width,
       height: overlay.height,
-      ...registrationState(classified.url),
+      ...(classified.mediaType === "hls"
+        ? { registered: true }
+        : registrationState(classified.url)),
     }];
   }
   if (metadata.manifestStatus) overlay.message = metadata.manifestStatus;
@@ -384,48 +500,66 @@ function addPlayerOverlay(video, url, mimeType = "", metadata = {}) {
   else if (metadata.manifestVariants?.length) overlay.message = "";
   updateSelector(overlay);
   schedulePositionOverlays();
+  return true;
 }
 
 function inspectVideo(video) {
   if (!(video instanceof HTMLVideoElement) || !video.isConnected) return;
   trackedVideos.add(video);
+  if (!resizeObservedVideos.has(video)) {
+    resizeObservedVideos.add(video);
+    videoResizeObserver.observe(video);
+  }
   if (!watchedVideos.has(video)) {
     watchedVideos.add(video);
-    video.addEventListener("loadedmetadata", () => inspectVideo(video));
+    for (const eventName of ["loadedmetadata", "loadeddata", "playing", "resize"]) {
+      video.addEventListener(eventName, () => {
+        inspectVideo(video);
+        schedulePositionOverlays();
+      });
+    }
   }
   const sources = [...video.querySelectorAll("source")];
   const candidates = [...new Set([video.currentSrc, video.src, ...sources.map((source) => source.src)].filter(Boolean))];
   for (const url of candidates) {
     const source = sources.find((element) => element.src === url);
     const mimeType = source?.type || video.getAttribute("type") || "";
+    const playableVideo = url === video.currentSrc && video.videoWidth > 0 && video.videoHeight > 0;
     void sendCandidate(url, {
       mimeType,
       width: url === video.currentSrc ? video.videoWidth : null,
       height: url === video.currentSrc ? video.videoHeight : null,
       fromPlayer: true,
+      playableVideo,
     });
   }
   const selectedUrl = candidates.find((url) => {
     const source = sources.find((element) => element.src === url);
-    const classified = classifyMediaUrl(url, source?.type || video.getAttribute("type") || "");
+    const classified = classifyMediaUrl(url, source?.type || video.getAttribute("type") || "",
+      url === video.currentSrc && video.videoWidth > 0 && video.videoHeight > 0);
     return classified?.downloadable && classified.mediaType === "mp4";
   }) || candidates.find((url) => {
     const source = sources.find((element) => element.src === url);
-    return classifyMediaUrl(url, source?.type || video.getAttribute("type") || "")?.downloadable;
+    return classifyMediaUrl(url, source?.type || video.getAttribute("type") || "",
+      url === video.currentSrc && video.videoWidth > 0 && video.videoHeight > 0)?.downloadable;
   }) || candidates.find((url) => {
     const source = sources.find((element) => element.src === url);
-    return classifyMediaUrl(url, source?.type || video.getAttribute("type") || "");
+    return classifyMediaUrl(url, source?.type || video.getAttribute("type") || "",
+      url === video.currentSrc && video.videoWidth > 0 && video.videoHeight > 0);
   });
+  attachConfirmedVideoResources();
   if (!selectedUrl) return;
   const selectedSource = sources.find((source) => source.src === selectedUrl);
   const selectedMimeType = selectedSource?.type || video.getAttribute("type") || "";
-  const selected = classifyMediaUrl(selectedUrl, selectedMimeType);
+  const selected = classifyMediaUrl(selectedUrl, selectedMimeType,
+    selectedUrl === video.currentSrc && video.videoWidth > 0 && video.videoHeight > 0);
   if (selected) {
     const availableSources = candidates
       .map((url) => {
         const source = sources.find((element) => element.src === url);
         const mimeType = source?.type || video.getAttribute("type") || "";
-        const classified = classifyMediaUrl(url, mimeType);
+        const classified = classifyMediaUrl(url, mimeType,
+          url === video.currentSrc && video.videoWidth > 0 && video.videoHeight > 0);
         if (!classified?.downloadable) return null;
         return {
           url: classified.url,
@@ -513,10 +647,21 @@ if ("PerformanceObserver" in window) {
 }
 
 document.addEventListener("click", (event) => {
+  if (event.button === 0 && event.target instanceof Element) {
+    const clickedVideo = event.composedPath().find((node) => node instanceof HTMLVideoElement)
+      || event.target.closest("video");
+    if (clickedVideo) {
+      inspectVideo(clickedVideo);
+      requestAnimationFrame(() => inspectVideo(clickedVideo));
+    }
+  }
   if (!settings.automaticDownloadDetection || event.button !== 0 || event.defaultPrevented
     || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || !(event.target instanceof Element)) return;
+  if (event.isTrusted) downloadGestureTracker.noteTrustedClick();
   const anchor = event.target.closest("a[href]");
   if (!anchor) return;
+  const gestureKind = downloadGestureTracker.authorizeDownloadClick(event.isTrusted);
+  if (!gestureKind) return;
   let url;
   try {
     url = new URL(anchor.href);
@@ -526,6 +671,7 @@ document.addEventListener("click", (event) => {
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return;
   void chrome.runtime.sendMessage({
     type: "fluxnet:user-download-click",
+    gestureKind,
     url: url.href,
     filename: anchor.download || null,
     allowNewTab: Boolean(anchor.target && !["_self", "_top"].includes(anchor.target.toLowerCase())),
@@ -543,24 +689,14 @@ chrome.runtime.onMessage.addListener((message) => {
       registrationFailures.delete(confirmed.url);
       updateOverlaySourceRegistration(confirmed.url, true);
     }
-    let matchedPlayer = false;
-    trackedVideos.forEach((video) => {
-      if (video.currentSrc === message.url || video.src === message.url
-        || [...video.querySelectorAll("source")].some((source) => source.src === message.url)) {
-        matchedPlayer = true;
-        const existing = overlays.get(video);
-        if (existing?.availableSources.length) return;
-        addPlayerOverlay(video, message.url, message.mimeType || "", message);
+    if (confirmed?.downloadable || message.mediaType === "hls" || message.mediaType === "dash") {
+      confirmedVideoResources.delete(message.url);
+      confirmedVideoResources.set(message.url, { ...message, receivedAt: Date.now() });
+      if (confirmedVideoResources.size > 100) {
+        confirmedVideoResources.delete(confirmedVideoResources.keys().next().value);
       }
-    });
-    if (!matchedPlayer && (message.mediaType === "hls" || message.mediaType === "dash")) {
-      const visiblePlayers = [...trackedVideos].filter((video) => {
-        const rect = video.getBoundingClientRect();
-        return rect.width >= 80 && rect.height >= 50 && rect.bottom > 0 && rect.top < innerHeight;
-      });
-      if (visiblePlayers.length === 1) {
-        addPlayerOverlay(visiblePlayers[0], message.url, message.mimeType || "", message);
-      }
+      document.querySelectorAll("video").forEach(inspectVideo);
+      attachConfirmedVideoResources();
     }
   }
   if (message?.type === "fluxnet:settings") {
@@ -575,6 +711,9 @@ window.addEventListener("popstate", scheduleScan);
 window.addEventListener("hashchange", scheduleScan);
 window.addEventListener("resize", schedulePositionOverlays, { passive: true });
 window.addEventListener("scroll", schedulePositionOverlays, { passive: true, capture: true });
+window.addEventListener("fullscreenchange", schedulePositionOverlays);
+window.visualViewport?.addEventListener("resize", schedulePositionOverlays, { passive: true });
+window.visualViewport?.addEventListener("scroll", schedulePositionOverlays, { passive: true });
 
 void chrome.storage.local.get("settings").then(({ settings: saved }) => {
   settings = normalizeSettings(saved);

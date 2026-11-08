@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:extension": "node browser-extension/build.mjs",
     "test:browser-handoff": "node --test tests/browserHandoff.test.mjs",
-    "test:extension": "node --test browser-extension/tests/media.test.mjs",
+    "test:extension": "node --test browser-extension/tests/media.test.mjs browser-extension/tests/extension-build.test.mjs",
     "preview": "vite preview",
     "tauri:build": "cargo build --manifest-path src-tauri/Cargo.toml --release --bin fluxnet_native_host && npm run tauri build",
     "tauri": "tauri"

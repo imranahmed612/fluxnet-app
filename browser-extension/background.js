@@ -1,8 +1,11 @@
 import {
   DEFAULT_SETTINGS,
+  appendProcessedDownloadId,
+  browserMediaIdentity,
   classifyMediaUrl,
   createDownloadResource,
   createNativeMessage,
+  createVideoDownloadFilename,
   deduplicateResources,
   downloadPromptDecision,
   downloadResourceIdentity,
@@ -16,6 +19,7 @@ import {
   takeUserDownloadIntent,
   validateDownloadMessage,
   validateMediaMessage,
+  validateUnsupportedMessage,
 } from "./media.js";
 
 const RESOURCE_LIMIT = 100;
@@ -27,6 +31,7 @@ const processingMedia = new Map();
 const processingDownloadKeys = new Set();
 let promptCreationQueue = Promise.resolve();
 let userDownloadIntentQueue = Promise.resolve();
+let downloadIdClaimQueue = Promise.resolve();
 
 function enqueueDownloadIntent(operation) {
   const task = userDownloadIntentQueue.then(operation);
@@ -103,8 +108,12 @@ async function rememberResource(resource) {
   const next = deduplicateResources([resource, ...detectedResources]).slice(0, RESOURCE_LIMIT);
   await chrome.storage.local.set({ detectedResources: next });
   await updateBadge(next.length);
-  const previous = detectedResources.find((item) => item.url === resource.url);
-  return !previous || previous.tabId !== resource.tabId;
+  const identity = browserMediaIdentity(resource);
+  const previous = detectedResources.find((item) => browserMediaIdentity(item) === identity);
+  return !previous
+    || previous.tabId !== resource.tabId
+    || (resource.downloadable === true && previous.downloadable !== true)
+    || (resource.hlsPlaylist && !previous.hlsPlaylist);
 }
 
 async function fetchManifestDetails(resource) {
@@ -165,6 +174,8 @@ async function createPrompt(prompt) {
 async function createPromptOnce(prompt) {
   const current = await chrome.storage.session.get("pendingPrompts");
   const prompts = current.pendingPrompts ?? {};
+  if (prompts[prompt.id]
+    || (prompt.kind === "download" && hasPendingDownloadPrompt(prompts, prompt.resource))) return false;
   if (Object.keys(prompts).length >= MAX_PENDING_PROMPTS) return false;
   prompts[prompt.id] = prompt;
   await chrome.storage.session.set({ pendingPrompts: prompts });
@@ -190,7 +201,7 @@ async function detectMedia(candidate, sender) {
   if (!Number.isInteger(sender.tab?.id) || sender.tab.id < 0) return false;
   const settings = await getSettings();
   if (!settings.automaticVideoDetection) return false;
-  const classified = classifyMediaUrl(candidate.url, candidate.mimeType);
+  const classified = classifyMediaUrl(candidate.url, candidate.mimeType, candidate.playableVideo === true);
   if (!classified) return false;
   const mediaKey = `${sender.tab.id}:${classified.url}`;
   const activeProcessing = processingMedia.get(mediaKey);
@@ -233,20 +244,26 @@ async function processMediaCandidate(candidate, sender, classified, processing, 
     detectedAt: Date.now(),
     fromPlayer: candidate.fromPlayer === true,
   };
-  if (!classified.downloadable) {
+  if (classified.mediaType === "hls" || classified.mediaType === "dash") {
     try {
       const manifest = await fetchManifestDetails(resource);
       resource.manifestVariants = manifest.variants;
       resource.manifestAudioTracks = manifest.audioTracks;
+      resource.hlsPlaylist = manifest.playlist || null;
+      resource.downloadable = classified.mediaType === "hls" && Boolean(manifest.playlist);
       const audioSummary = manifest.audioTracks.slice(0, 5)
         .map((track) => String(track.name).slice(0, 80))
         .join(", ");
-      resource.manifestStatus = manifest.variants.length
+      resource.manifestStatus = manifest.playlist
+        ? "Finite, unencrypted HLS fMP4 playlist confirmed."
+        : manifest.variants.length
         ? `Manifest parsed: ${manifest.variants.length} variant(s). ${manifest.audioTracks.length ? `Audio: ${audioSummary}${manifest.audioTracks.length > 5 ? ", and more" : ""}. ` : ""}Segment merging is unavailable.`
         : "Manifest parsed, but no video variants were reported.";
     } catch (error) {
       resource.manifestVariants = [];
       resource.manifestAudioTracks = [];
+      resource.hlsPlaylist = null;
+      resource.downloadable = false;
       resource.manifestStatus = `Manifest unavailable: ${error.message}`;
       console.debug("FluxNet could not inspect the video manifest:", error);
     }
@@ -256,9 +273,17 @@ async function processMediaCandidate(candidate, sender, classified, processing, 
     resource.width = Number.isInteger(processing.playerCandidate.width) ? processing.playerCandidate.width : resource.width;
     resource.height = Number.isInteger(processing.playerCandidate.height) ? processing.playerCandidate.height : resource.height;
   }
-  if (!classified.downloadable && !resource.fromPlayer
+  if (classified.mediaType === "hls" && !resource.fromPlayer) {
+    resource.downloadable = false;
+    resource.hlsPlaylist = null;
+    resource.manifestStatus = "The HLS playlist is not associated with a detected video player.";
+  }
+  if (!classified.downloadable && !resource.downloadable && !resource.fromPlayer
     && !resource.manifestVariants.some((variant) => variant.video === true)) return false;
-  if (classified.downloadable && !validateMediaMessage(resource)) {
+  if (resource.downloadable && !validateMediaMessage(resource)) {
+    throw new Error("The detected video source did not pass validation.");
+  }
+  if (classified.mediaType === "unsupported-video" && !validateUnsupportedMessage(resource)) {
     throw new Error("The detected video source did not pass validation.");
   }
   const isNew = await rememberResource(resource);
@@ -275,6 +300,8 @@ async function processMediaCandidate(candidate, sender, classified, processing, 
       mimeType: resource.mimeType,
       manifestVariants: resource.manifestVariants || [],
       manifestAudioTracks: resource.manifestAudioTracks || [],
+      downloadable: resource.downloadable === true,
+      hlsPlaylist: resource.hlsPlaylist || null,
       manifestStatus: resource.manifestStatus || "",
     }).catch((error) => console.debug("FluxNet could not attach the video overlay:", error));
   }
@@ -289,6 +316,7 @@ async function digestResourceKey(item) {
 }
 
 async function recordUserDownloadClick(message, sender) {
+  if (message.gestureKind !== "trusted" && message.gestureKind !== "correlated") return;
   if (!Number.isInteger(sender.tab?.id) || sender.tab.id < 0) return;
   const settings = await getSettings();
   if (!settings.automaticDownloadDetection) return;
@@ -309,6 +337,7 @@ async function recordUserDownloadClick(message, sender) {
   recent.push({
     url: resource.url,
     filename: resource.filename,
+    gestureKind: message.gestureKind,
     pageTitle: String(sender.tab.title || resource.filename).slice(0, 512),
     pageDomain: resource.pageDomain,
     tabId: sender.tab.id,
@@ -328,7 +357,22 @@ async function consumeUserDownloadClick(item) {
   });
 }
 
+function claimDownloadId(downloadId) {
+  const task = downloadIdClaimQueue.then(async () => {
+    const { processedDownloadIds = [] } = await chrome.storage.session.get("processedDownloadIds");
+    const nextIds = appendProcessedDownloadId(processedDownloadIds, downloadId);
+    if (!nextIds) return false;
+    await chrome.storage.session.set({ processedDownloadIds: nextIds });
+    return true;
+  });
+  downloadIdClaimQueue = task.catch((error) => {
+    console.error("Could not claim Chrome download event ID:", error);
+  });
+  return task;
+}
+
 async function detectBrowserDownload(item) {
+  if (!await claimDownloadId(item.id)) return;
   const settings = await getSettings();
   if (!settings.automaticDownloadDetection) return;
   const intent = await consumeUserDownloadClick(item);
@@ -403,29 +447,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         || !validateMediaMessage(resource)) {
         throw new Error("The selected video format is no longer available.");
       }
-      let url;
-      try {
-        url = new URL(resource.url);
-      } catch {
-        throw new Error("The selected video URL is invalid.");
-      }
-      let filename = decodeURIComponent(url.pathname.split("/").pop() || "");
-      filename = filename.split(/[\\/]/).pop() || `video.${resource.mediaType}`;
-      if (!filename.toLowerCase().endsWith(`.${resource.mediaType}`)) {
-        filename = `video.${resource.mediaType}`;
-      }
       const download = {
         url: resource.url,
         mediaType: resource.mediaType,
+        downloadable: resource.downloadable === true,
         pageTitle: resource.pageTitle,
         pageDomain: resource.pageDomain,
         tabId: sender.tab.id,
-        filename: filename.slice(0, 512),
+        filename: createVideoDownloadFilename(resource),
         mimeType: resource.mimeType || null,
         totalBytes: null,
         observedBytes: resource.observedBytes ?? null,
         width: resource.width ?? null,
         height: resource.height ?? null,
+        hlsPlaylist: resource.hlsPlaylist ?? null,
       };
       if (!validateDownloadMessage(download)) throw new Error("The selected video did not pass download validation.");
       await sendNativeMessage(createNativeMessage("sendDownload", download));
@@ -437,6 +472,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "fluxnet:user-download-click") {
+    if (message.gestureKind !== "trusted" && message.gestureKind !== "correlated") {
+      sendResponse({ ok: false, error: "A recent trusted browser click is required." });
+      return false;
+    }
     void enqueueDownloadIntent(() => recordUserDownloadClick(message, sender))
       .then(() => sendResponse({ ok: true }))
       .catch((error) => {

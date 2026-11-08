@@ -14,3 +14,8 @@ export function createBrowserHandoffRunner() {
     }
   };
 }
+
+export async function openUserInitiatedBrowserDownloadDialog(activateWindow, openDialog) {
+  await activateWindow();
+  return openDialog();
+}

@@ -9,6 +9,9 @@ use tauri::{AppHandle, Emitter, Manager};
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_URL_LENGTH: usize = 8 * 1024;
 const MAX_TEXT_LENGTH: usize = 512;
+pub(crate) const MAX_HLS_MANIFEST_BYTES: u64 = 1_048_576;
+pub(crate) const MAX_HLS_SEGMENTS: usize = 64;
+pub(crate) const MAX_HLS_EXPECTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CONNECTION_FRESHNESS_MS: u64 = 150_000;
 const TRUSTED_EXTENSION_ID: &str = "clgiddogjgpjllmjgpffopnmighkmhae";
 const TRUSTED_EXTENSION_ORIGIN: &str = "chrome-extension://clgiddogjgpjllmjgpffopnmighkmhae/";
@@ -21,6 +24,33 @@ pub struct BrowserBridgeStatus {
     pub last_handshake_at_ms: Option<u64>,
     pub native_host_status: String,
     pub registered_browsers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HlsByteRange {
+    pub length: u64,
+    pub offset: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HlsResource {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_range: Option<HlsByteRange>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HlsPlaylist {
+    pub version: u8,
+    pub container: String,
+    pub manifest_size_bytes: u64,
+    pub init: HlsResource,
+    pub segments: Vec<HlsResource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -41,6 +71,8 @@ pub struct BrowserMediaResource {
     pub observed_bytes: Option<u64>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hls_playlist: Option<HlsPlaylist>,
     #[serde(default)]
     pub received_at_ms: u64,
 }
@@ -286,7 +318,10 @@ impl BrowserBridge {
             .resources
             .lock()
             .map_err(|_| "Browser media history state lock was poisoned.".to_owned())?;
-        if resources.iter().any(|entry| entry.url == resource.url) {
+        if let Some(existing) = resources.iter_mut().find(|entry| {
+            Self::browser_media_identity(entry) == Self::browser_media_identity(&resource)
+        }) {
+            *existing = resource;
             return Ok(());
         }
         resources.push(resource);
@@ -294,6 +329,20 @@ impl BrowserBridge {
             resources.remove(0);
         }
         Ok(())
+    }
+
+    fn browser_media_identity(resource: &BrowserMediaResource) -> Option<String> {
+        let mut url = reqwest::Url::parse(&resource.url).ok()?;
+        let hostname = url.host_str()?.to_ascii_lowercase();
+        if hostname == "cdninstagram.com"
+            || hostname.ends_with(".cdninstagram.com")
+            || hostname == "fbcdn.net"
+            || hostname.ends_with(".fbcdn.net")
+        {
+            url.set_query(None);
+        }
+        url.set_fragment(None);
+        Some(format!("{}\n{}", resource.media_type, url))
     }
 
     fn resources(&self) -> Result<Vec<BrowserMediaResource>, String> {
@@ -448,6 +497,101 @@ fn current_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn validate_hls_resource(resource: &mut HlsResource) -> Result<(), String> {
+    if resource.url.len() > MAX_URL_LENGTH {
+        return Err("An HLS segment URL is too long.".into());
+    }
+    let url = reqwest::Url::parse(&resource.url).map_err(|_| "An HLS segment URL is invalid.")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "HLS initialization and segment URLs must be credential-free HTTP or HTTPS URLs without fragments."
+                .into(),
+        );
+    }
+    if let Some(range) = &resource.byte_range {
+        if range.length == 0 || range.offset.checked_add(range.length).is_none() {
+            return Err("An HLS byte range has an invalid length or offset.".into());
+        }
+    }
+    resource.url = url.to_string();
+    Ok(())
+}
+
+pub(crate) fn validate_hls_playlist(
+    mut playlist: HlsPlaylist,
+    manifest_url: &reqwest::Url,
+) -> Result<HlsPlaylist, String> {
+    if playlist.version != 1 || playlist.container != "fmp4" {
+        return Err("The HLS playlist model or media container is unsupported.".into());
+    }
+    if playlist.manifest_size_bytes == 0 || playlist.manifest_size_bytes > MAX_HLS_MANIFEST_BYTES {
+        return Err(
+            "The HLS media playlist is empty or exceeds the 1 MiB inspection limit.".into(),
+        );
+    }
+    if playlist.segments.is_empty() || playlist.segments.len() > MAX_HLS_SEGMENTS {
+        return Err(format!(
+            "The HLS playlist must contain between 1 and {MAX_HLS_SEGMENTS} media segments."
+        ));
+    }
+    let manifest_path = manifest_url.path().to_ascii_lowercase();
+    if !manifest_path.ends_with(".m3u8") {
+        return Err("An HLS media playlist must be identified by a .m3u8 URL.".into());
+    }
+    validate_hls_resource(&mut playlist.init)?;
+    if reqwest::Url::parse(&playlist.init.url)
+        .map_err(|_| "The HLS initialization URL is invalid.")?
+        .path()
+        .to_ascii_lowercase()
+        .ends_with(".m3u8")
+    {
+        return Err("An HLS playlist cannot be used as its own initialization segment.".into());
+    }
+    for segment in &mut playlist.segments {
+        validate_hls_resource(segment)?;
+        let segment_url =
+            reqwest::Url::parse(&segment.url).map_err(|_| "An HLS segment URL is invalid.")?;
+        if segment_url.path().to_ascii_lowercase().ends_with(".m3u8") {
+            return Err("Nested HLS playlists cannot be used as media segments.".into());
+        }
+    }
+    let all_ranges_known = playlist
+        .segments
+        .iter()
+        .all(|segment| segment.byte_range.is_some())
+        && playlist.init.byte_range.is_some();
+    let expected_bytes = if all_ranges_known {
+        let total = playlist
+            .segments
+            .iter()
+            .filter_map(|segment| segment.byte_range.as_ref())
+            .try_fold(
+                playlist
+                    .init
+                    .byte_range
+                    .as_ref()
+                    .map_or(0, |range| range.length),
+                |sum, range| sum.checked_add(range.length),
+            )
+            .ok_or_else(|| "The HLS expected byte count overflowed.".to_owned())?;
+        if total > MAX_HLS_EXPECTED_BYTES {
+            return Err("The HLS playlist exceeds the 2 GiB download limit.".into());
+        }
+        Some(total)
+    } else {
+        None
+    };
+    if playlist.expected_bytes != expected_bytes {
+        return Err("The HLS expected byte count does not match its declared byte ranges.".into());
+    }
+    Ok(playlist)
+}
+
 fn validate_resource(resource: BrowserMediaResource) -> Result<BrowserMediaResource, String> {
     if resource.url.len() > MAX_URL_LENGTH {
         return Err("The media URL is too long.".into());
@@ -461,8 +605,26 @@ fn validate_resource(resource: BrowserMediaResource) -> Result<BrowserMediaResou
         return Err("Only credential-free HTTP or HTTPS media URLs are accepted.".into());
     }
     let path = url.path().to_ascii_lowercase();
-    if path.ends_with(".m3u8") || path.ends_with(".mpd") {
-        return Err("HLS and DASH manifests are not supported as direct downloads.".into());
+    if path.ends_with(".mpd") {
+        return Err("DASH manifests are not supported as direct downloads.".into());
+    }
+    if resource.media_type == "hls" {
+        if !path.ends_with(".m3u8") {
+            return Err("An HLS media playlist must use a .m3u8 URL.".into());
+        }
+        let playlist = resource
+            .hls_playlist
+            .ok_or_else(|| "This HLS playlist is not safe to download.".to_owned())?;
+        return validate_resource_metadata(
+            BrowserMediaResource {
+                hls_playlist: Some(validate_hls_playlist(playlist, &url)?),
+                ..resource
+            },
+            url,
+        );
+    }
+    if resource.hls_playlist.is_some() {
+        return Err("An HLS playlist model cannot be used with this media type.".into());
     }
     let supported_video_type = matches!(resource.media_type.as_str(), "mp4" | "webm");
     if !supported_video_type {
@@ -519,6 +681,22 @@ fn validate_download_resource(
             .is_some_and(|value| value.len() > MAX_TEXT_LENGTH)
     {
         return Err("The browser download metadata is too long.".into());
+    }
+    if resource.media_type == "hls" {
+        let playlist = resource
+            .hls_playlist
+            .clone()
+            .ok_or_else(|| "This HLS playlist is not safe to download.".to_owned())?;
+        return validate_resource_metadata(
+            BrowserMediaResource {
+                hls_playlist: Some(validate_hls_playlist(playlist, &url)?),
+                ..resource
+            },
+            url,
+        );
+    }
+    if resource.hls_playlist.is_some() {
+        return Err("An HLS playlist model cannot be used with this media type.".into());
     }
     validate_resource_metadata(resource, url)
 }
@@ -663,10 +841,38 @@ fn validate_unsupported_resource(
         return Err("Only credential-free HTTP or HTTPS media URLs are accepted.".into());
     }
     let path = url.path().to_ascii_lowercase();
-    if !((path.ends_with(".m3u8") && resource.media_type == "hls")
-        || (path.ends_with(".mpd") && resource.media_type == "dash"))
-    {
-        return Err("Only recognized HLS or DASH manifests can be reported as unsupported.".into());
+    let is_manifest = (path.ends_with(".m3u8") && resource.media_type == "hls")
+        || (path.ends_with(".mpd") && resource.media_type == "dash");
+    let is_confirmed_unsupported_video = resource.media_type == "unsupported-video"
+        && resource.width.is_some_and(|width| width > 0)
+        && resource.height.is_some_and(|height| height > 0)
+        && !path.ends_with(".m3u8")
+        && !path.ends_with(".mpd")
+        && ![
+            ".aac", ".aiff", ".amr", ".apk", ".ac3", ".csv", ".dmg", ".doc", ".docx", ".exe",
+            ".flac", ".gif", ".gz", ".iso", ".jpeg", ".jpg", ".m4a", ".m4b", ".mid", ".midi",
+            ".mp2", ".mp3", ".msi", ".opus", ".pdf", ".png", ".ppt", ".pptx", ".rar", ".7z",
+            ".tar", ".txt", ".wav", ".webp", ".wma", ".xls", ".xlsx", ".zip",
+        ]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+        && resource.mime_type.as_deref().is_none_or(|mime_type| {
+            let mime = mime_type
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            mime.is_empty()
+                || mime.starts_with("video/")
+                || mime == "application/octet-stream"
+                || mime == "binary/octet-stream"
+        });
+    if !is_manifest && !is_confirmed_unsupported_video {
+        return Err(
+            "Only recognized manifests or confirmed unsupported video sources can be reported."
+                .into(),
+        );
     }
     if resource.page_title.len() > MAX_TEXT_LENGTH || resource.page_domain.len() > MAX_TEXT_LENGTH {
         return Err("The source page information is too long.".into());
@@ -808,7 +1014,25 @@ mod tests {
             observed_bytes: None,
             width: None,
             height: None,
+            hls_playlist: None,
             received_at_ms: 0,
+        }
+    }
+
+    fn hls_playlist() -> HlsPlaylist {
+        HlsPlaylist {
+            version: 1,
+            container: "fmp4".into(),
+            manifest_size_bytes: 128,
+            init: HlsResource {
+                url: "https://cdn.example/init.mp4".into(),
+                byte_range: None,
+            },
+            segments: vec![HlsResource {
+                url: "https://cdn.example/segment-1.m4s".into(),
+                byte_range: None,
+            }],
+            expected_bytes: None,
         }
     }
 
@@ -835,14 +1059,81 @@ mod tests {
     }
 
     #[test]
+    fn validates_finite_hls_fmp4_handoff_models_and_preserves_source_urls() {
+        let mut candidate = resource("https://cdn.example/playlist.m3u8?token=short-lived", "hls");
+        candidate.hls_playlist = Some(hls_playlist());
+        let validated = validate_resource(candidate.clone()).unwrap();
+        assert_eq!(
+            validated.url,
+            "https://cdn.example/playlist.m3u8?token=short-lived"
+        );
+        assert!(validated.hls_playlist.is_some());
+
+        candidate.hls_playlist.as_mut().unwrap().init.url =
+            "https://user:password@cdn.example/init.mp4".into();
+        assert!(validate_resource(candidate).is_err());
+    }
+
+    #[test]
+    fn validates_hls_ranges_counts_and_expected_bytes() {
+        let manifest = reqwest::Url::parse("https://cdn.example/playlist.m3u8").unwrap();
+        let mut playlist = hls_playlist();
+        playlist.init.byte_range = Some(HlsByteRange {
+            length: 10,
+            offset: 0,
+        });
+        playlist.segments[0].byte_range = Some(HlsByteRange {
+            length: 20,
+            offset: 10,
+        });
+        playlist.expected_bytes = Some(30);
+        assert!(validate_hls_playlist(playlist.clone(), &manifest).is_ok());
+
+        playlist.expected_bytes = Some(31);
+        assert!(validate_hls_playlist(playlist.clone(), &manifest).is_err());
+
+        playlist.expected_bytes = Some(30);
+        let segment = playlist.segments[0].clone();
+        playlist.segments.resize(MAX_HLS_SEGMENTS + 1, segment);
+        assert!(validate_hls_playlist(playlist, &manifest).is_err());
+    }
+
+    #[test]
+    fn rejects_hls_credentials_fragments_and_overflowing_byte_ranges() {
+        let manifest = reqwest::Url::parse("https://cdn.example/playlist.m3u8").unwrap();
+        let mut playlist = hls_playlist();
+
+        playlist.init.url = "https://user:password@cdn.example/init.mp4".into();
+        assert!(validate_hls_playlist(playlist.clone(), &manifest).is_err());
+
+        playlist.init.url = "https://cdn.example/init.mp4#fragment".into();
+        assert!(validate_hls_playlist(playlist.clone(), &manifest).is_err());
+
+        playlist.init.url = "https://cdn.example/init.mp4".into();
+        playlist.init.byte_range = Some(HlsByteRange {
+            length: 1,
+            offset: u64::MAX,
+        });
+        assert!(validate_hls_playlist(playlist, &manifest).is_err());
+    }
+
+    #[test]
     fn validated_media_uses_the_existing_download_filename_path() {
-        let valid = validate_resource(resource(
+        let mut candidate = resource(
             "https://cdn.example/path/clip.webm?token=short-lived",
             "webm",
-        ))
+        );
+        candidate.page_title = "Clip title".into();
+        let valid = validate_resource(candidate).unwrap();
+        let filename = crate::download_manager::suggested_filename_with_metadata(
+            &valid.url,
+            Some(&valid.page_title),
+            Some(&valid.page_domain),
+            Some(&valid.media_type),
+            valid.filename.as_deref(),
+        )
         .unwrap();
-        let filename = crate::download_manager::get_download_filename(valid.url).unwrap();
-        assert_eq!(filename, "clip.webm");
+        assert_eq!(filename, "Clip title.webm");
     }
 
     #[test]
@@ -880,6 +1171,32 @@ mod tests {
     }
 
     #[test]
+    fn browser_video_handoff_filename_prefers_page_title_over_cdn_filename() {
+        let mut download = resource(
+            "https://scontent.cdninstagram.com/long-hash-generated-name.mp4?token=private#clip",
+            "mp4",
+        );
+        download.page_title = "My Instagram video".into();
+        download.page_domain = "www.instagram.com".into();
+        download.filename = Some(format!("{}.mp4", "a".repeat(240)));
+        let validated = validate_download_resource(download).unwrap();
+        let filename = crate::download_manager::suggested_filename_with_metadata(
+            &validated.url,
+            Some(&validated.page_title),
+            Some(&validated.page_domain),
+            Some(&validated.media_type),
+            validated.filename.as_deref(),
+        )
+        .unwrap();
+
+        assert_eq!(filename, "My Instagram video.mp4");
+        assert_eq!(
+            validated.url,
+            "https://scontent.cdninstagram.com/long-hash-generated-name.mp4?token=private#clip"
+        );
+    }
+
+    #[test]
     fn accepts_manifests_only_as_unsupported_resources() {
         assert!(
             validate_unsupported_resource(resource("https://cdn.example/list.m3u8", "hls")).is_ok()
@@ -888,6 +1205,36 @@ mod tests {
         assert!(
             validate_unsupported_resource(resource("https://cdn.example/list.mpd", "mp4")).is_err()
         );
+    }
+
+    #[test]
+    fn accepts_only_confirmed_http_video_as_unsupported_media() {
+        let mut video = resource("https://cdn.example/stream?id=1", "unsupported-video");
+        video.mime_type = Some("application/octet-stream".into());
+        video.width = Some(1280);
+        video.height = Some(720);
+        assert!(validate_unsupported_resource(video.clone()).is_ok());
+
+        video.url = "blob:https://cdn.example/stream-id".into();
+        assert!(validate_unsupported_resource(video.clone()).is_err());
+
+        video.url = "https://cdn.example/audio.mp3".into();
+        assert!(validate_unsupported_resource(video.clone()).is_err());
+
+        video.url = "https://cdn.example/image.jpg".into();
+        assert!(validate_unsupported_resource(video.clone()).is_err());
+
+        video.url = "https://cdn.example/media?id=1".into();
+        video.mime_type = Some("application/pdf".into());
+        assert!(validate_unsupported_resource(video.clone()).is_err());
+
+        video.mime_type = Some("application/octet-stream".into());
+        video.url = "https://cdn.example/manifest.mpd".into();
+        assert!(validate_unsupported_resource(video.clone()).is_err());
+
+        video.url = "https://cdn.example/stream?id=1".into();
+        video.width = None;
+        assert!(validate_unsupported_resource(video).is_err());
     }
 
     #[test]
@@ -920,6 +1267,35 @@ mod tests {
         let resources = bridge.resources().unwrap();
         assert_eq!(resources.len(), 100);
         assert_eq!(resources[0].url, "https://cdn.example/1.mp4");
+    }
+
+    #[test]
+    fn deduplicates_instagram_media_with_rotating_signatures_and_keeps_latest_url() {
+        let bridge = BrowserBridge::default();
+        bridge
+            .add_resource(resource(
+                "https://scontent.cdninstagram.com/v/t51/clip.mp4?_nc_sid=old",
+                "mp4",
+            ))
+            .unwrap();
+        bridge
+            .add_resource(resource(
+                "https://scontent.cdninstagram.com/v/t51/clip.mp4?_nc_sid=new",
+                "mp4",
+            ))
+            .unwrap();
+        bridge
+            .add_resource(resource(
+                "https://scontent.cdninstagram.com/v/t51/other.mp4?_nc_sid=new",
+                "mp4",
+            ))
+            .unwrap();
+        let resources = bridge.resources().unwrap();
+        assert_eq!(resources.len(), 2);
+        assert_eq!(
+            resources[0].url,
+            "https://scontent.cdninstagram.com/v/t51/clip.mp4?_nc_sid=new"
+        );
     }
 
     #[cfg(windows)]

@@ -1,6 +1,35 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createBrowserHandoffRunner } from "../src/browserHandoff.mjs";
+import {
+  createBrowserHandoffRunner,
+  openUserInitiatedBrowserDownloadDialog,
+} from "../src/browserHandoff.mjs";
+
+test("activates FluxNet before opening a user-initiated browser download dialog", async () => {
+  const steps = [];
+  const destination = await openUserInitiatedBrowserDownloadDialog(
+    async () => { steps.push("activate"); },
+    async () => {
+      steps.push("dialog");
+      return null;
+    },
+  );
+
+  assert.deepEqual(steps, ["activate", "dialog"]);
+  assert.equal(destination, null);
+});
+
+test("does not open a browser download dialog if window activation fails", async () => {
+  let dialogOpened = false;
+  await assert.rejects(openUserInitiatedBrowserDownloadDialog(
+    async () => { throw new Error("focus failed"); },
+    async () => {
+      dialogOpened = true;
+      return "C:\\Downloads\\video.mp4";
+    },
+  ), /focus failed/);
+  assert.equal(dialogOpened, false);
+});
 
 test("a cancelled save dialog releases the URL for retry", async () => {
   const runHandoff = createBrowserHandoffRunner();

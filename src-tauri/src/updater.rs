@@ -68,6 +68,10 @@ mod tests {
         missing_key["pubkey"] = json!("");
         assert!(!configuration_is_ready(Some(&missing_key)));
 
+        let mut missing_endpoint = ready_config();
+        missing_endpoint["endpoints"] = json!([]);
+        assert!(!configuration_is_ready(Some(&missing_endpoint)));
+
         let mut insecure_endpoint = ready_config();
         insecure_endpoint["endpoints"] = json!(["http://updates.example.invalid/latest.json"]);
         assert!(!configuration_is_ready(Some(&insecure_endpoint)));

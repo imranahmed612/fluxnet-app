@@ -18,7 +18,28 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "base-uri": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "font-src": "'self' data:",
+        "form-action": "'self'",
+        "img-src": "'self' asset: http://asset.localhost blob: data:",
+        "object-src": "'none'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'"
+      },
+      "devCsp": {
+        "default-src": "'self'",
+        "base-uri": "'self'",
+        "connect-src": "ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420",
+        "font-src": "'self' data:",
+        "form-action": "'self'",
+        "img-src": "'self' asset: http://asset.localhost blob: data:",
+        "object-src": "'none'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'"
+      }
     }
   },
   "bundle": {
@@ -46,9 +67,7 @@
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY3QThDNTQ4NEJFMjQyMjQKUldRa1F1SkxTTVdvOTREV2ZCWlFIZ2Q4ZjJmb3BQL0Y3VEZPbTdiTGRvdE5hOW80eEhsRmhmZVoK",
-      "endpoints": [
-        "https://github.com/imranahmed612/fluxnet-app/releases/latest/download/latest.json"
-      ],
+      "endpoints": [],
       "requireSignedVersion": true,
       "allowDowngrades": false
     }

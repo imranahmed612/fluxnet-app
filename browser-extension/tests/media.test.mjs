@@ -16,6 +16,7 @@ import {
   hasPendingDownloadPrompt,
   isEligibleDownload,
   isExcludedDomain,
+  isPartialMediaResponse,
   normalizeSettings,
   parseDashManifest,
   parseHlsManifest,
@@ -253,6 +254,81 @@ test("classifies supported direct media and unsupported manifests", () => {
   assert.equal(classifyMediaUrl("https://cdn.example/a.mp4", "image/jpeg"), null);
   assert.equal(classifyMediaUrl("https://cdn.example/a.mp4", "application/pdf"), null);
   assert.equal(classifyMediaUrl("https://cdn.example/a.mp4", "audio/mpeg"), null);
+});
+
+test("rejects Instagram CDN byte-range MP4 responses as standalone downloads", () => {
+  assert.equal(
+    classifyMediaUrl("https://scontent.cdninstagram.com/v/t51/clip.mp4?bytestart=0&byteend=823"),
+    null,
+  );
+
+  assert.equal(
+    classifyMediaUrl("https://instagram.fdac5-1.fna.fbcdn.net/video.mp4?bytestart=3276076&byteend=6055858"),
+    null,
+  );
+
+  assert.equal(
+    classifyMediaUrl("https://scontent.cdninstagram.com/v/t51/clip.mp4?signature=abc").downloadable,
+    true,
+  );
+
+  assert.equal(
+    classifyMediaUrl("https://cdn.example/video.mp4?bytestart=0&byteend=823").downloadable,
+    true,
+  );
+});
+
+test("does not validate byte-range Reel or Story URLs for the MP4 download handoff", () => {
+  for (const url of [
+    "https://scontent.cdninstagram.com/v/t51/reel.mp4?bytestart=0&byteend=10399&token=private",
+    "https://instagram.fdac5-1.fna.fbcdn.net/v/t51/story.mp4?signature=private&bytestart=0&byteend=10399",
+  ]) {
+    assert.equal(validateMediaMessage({
+      url,
+      mediaType: "mp4",
+      downloadable: true,
+      pageTitle: "Instagram",
+      pageDomain: "www.instagram.com",
+    }), false);
+  }
+});
+
+test("identifies Instagram partial video responses without blocking other or complete responses", () => {
+  assert.equal(isPartialMediaResponse(
+    "https://scontent.cdninstagram.com/v/t51/reel.mp4?bytestart=0&byteend=10399&token=private",
+    200,
+    [],
+  ), true);
+  assert.equal(isPartialMediaResponse(
+    "https://instagram.fdac5-1.fna.fbcdn.net/v/t51/story.mp4?signature=private",
+    206,
+    [{ name: "Content-Type", value: "video/mp4" }],
+  ), true);
+  assert.equal(isPartialMediaResponse(
+    "https://scontent.cdninstagram.com/v/t51/reel.mp4?signature=private",
+    200,
+    [{ name: "cOnTeNt-RaNgE", value: "bytes 0-10399/847392" }],
+  ), true);
+  assert.equal(isPartialMediaResponse(
+    "https://scontent.cdninstagram.com/v/t51/complete.mp4?signature=private",
+    200,
+    [{ name: "Content-Type", value: "video/mp4" }, { name: "Content-Length", value: "847392" }],
+  ), false);
+  assert.equal(isPartialMediaResponse(
+    "https://scontent.cdninstagram.com/v/t51/complete.mp4?signature=private",
+    206,
+    [
+      { name: "Content-Type", value: "video/mp4" },
+      { name: "Content-Range", value: "bytes 0-847391/847392" },
+      { name: "Content-Length", value: "847392" },
+    ],
+  ), false);
+  assert.equal(isPartialMediaResponse(
+    "https://cdn.example/video.mp4",
+    206,
+    [{ name: "Content-Range", value: "bytes 0-10399/847392" }],
+  ), false);
+  assert.equal(isPartialMediaResponse("https://cdn.example/video.mp4", 200, []), false);
 });
 
 test("classifies extensionless and generic-MIME video only with decoded player evidence", () => {

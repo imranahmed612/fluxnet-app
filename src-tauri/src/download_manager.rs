@@ -58,6 +58,15 @@ impl DownloadStatus {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebsiteMediaInfo {
+    pub format_id: String,
+    pub container: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadEntry {
@@ -79,6 +88,8 @@ pub struct DownloadEntry {
     pub hls_playlist: Option<HlsPlaylist>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hls_completed_parts: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website_media: Option<WebsiteMediaInfo>,
     etag: Option<String>,
     last_modified: Option<String>,
     pub notifications_enabled: bool,
@@ -114,10 +125,258 @@ fn persisted_notification_preferences(
     }
 }
 
-struct DownloadTaskControl {
+pub(crate) struct DownloadTaskControl {
     cancelled: AtomicBool,
     pause_requested: AtomicBool,
     wake: Notify,
+}
+
+/// Runs the isolated yt-dlp download inside the DownloadManager's existing
+/// task slot and lifecycle.
+#[cfg(windows)]
+async fn run_ytdlp_download_worker(
+    app: Option<&tauri::AppHandle>,
+    state: &Arc<Mutex<DownloadState>>,
+    concurrency: &Arc<ConcurrencyLimiter>,
+    id: &str,
+    executable: PathBuf,
+    selected_format: crate::media::yt_dlp::SelectedFormat,
+    control: &Arc<DownloadTaskControl>,
+) -> Result<(), String> {
+    let Some(_slot) = concurrency.acquire(state, control).await? else {
+        remove_website_partial_if_present(state, id);
+        return finish_cancelled_optional(app, state, id);
+    };
+    if control.is_cancelled() {
+        remove_website_partial_if_present(state, id);
+        return finish_cancelled_optional(app, state, id);
+    }
+    let (url, destination, base_elapsed_ms, initial_downloaded_bytes) = {
+        let locked = state
+            .lock()
+            .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+        let entry = locked
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| "Download record was not found.".to_owned())?;
+        if entry.status == DownloadStatus::Cancelled || control.is_cancelled() {
+            let dest = PathBuf::from(&entry.destination);
+            drop(locked);
+            let _ = std::fs::remove_file(partial_path(&dest));
+            return finish_cancelled_optional(app, state, id);
+        }
+        if control.is_pause_requested() {
+            let dest = PathBuf::from(&entry.destination);
+            let retained_bytes = std::fs::metadata(partial_path(&dest))
+                .map(|m| m.len())
+                .unwrap_or(entry.downloaded_bytes);
+            drop(locked);
+            update_entry_optional(app, state, id, |entry| {
+                if entry.status == DownloadStatus::Queued
+                    || entry.status == DownloadStatus::Downloading
+                {
+                    if entry.status == DownloadStatus::Queued {
+                        transition(entry, DownloadStatus::Downloading)?;
+                    }
+                    transition(entry, DownloadStatus::Paused)?;
+                    entry.downloaded_bytes = retained_bytes;
+                    entry.speed_bytes_per_second = 0.0;
+                    entry.remaining_seconds = None;
+                }
+                Ok(())
+            })?;
+            return Ok(());
+        }
+        if entry.status != DownloadStatus::Queued && entry.status != DownloadStatus::Paused {
+            return Err("The media task is not queued.".into());
+        }
+        (
+            entry.url.clone(),
+            PathBuf::from(&entry.destination),
+            entry.elapsed_ms,
+            entry.downloaded_bytes,
+        )
+    };
+    update_entry_optional(app, state, id, |entry| {
+        if entry.status == DownloadStatus::Cancelled || control.is_cancelled() {
+            return Ok(());
+        }
+        if entry.status == DownloadStatus::Queued || entry.status == DownloadStatus::Paused {
+            transition(entry, DownloadStatus::Downloading)?;
+        }
+        Ok(())
+    })?;
+    if control.is_cancelled() {
+        let _ = std::fs::remove_file(partial_path(&destination));
+        return finish_cancelled_optional(app, state, id);
+    }
+
+    let started = Instant::now();
+    let app_for_progress = app.cloned();
+    let state_for_progress = Arc::clone(state);
+    let id_for_progress = id.to_owned();
+    let control_for_progress = Arc::clone(control);
+    let process_control = Arc::clone(control);
+    let destination_for_worker = destination.clone();
+    let progress =
+        std::sync::Arc::new(move |value: crate::media::yt_dlp::VideoDownloadProgress| {
+            if control_for_progress.is_cancelled() || control_for_progress.is_pause_requested() {
+                return;
+            }
+            let elapsed_ms = base_elapsed_ms
+                .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            let _ = update_entry_optional(
+                app_for_progress.as_ref(),
+                &state_for_progress,
+                &id_for_progress,
+                |entry| {
+                    if entry.status != DownloadStatus::Downloading {
+                        return Ok(());
+                    }
+                    entry.downloaded_bytes = value.downloaded_bytes;
+                    entry.total_bytes = value.total_bytes;
+                    entry.speed_bytes_per_second = value.speed_bytes_per_second.unwrap_or(0.0);
+                    entry.elapsed_ms = elapsed_ms;
+                    entry.remaining_seconds = value.eta_seconds;
+                    Ok(())
+                },
+            );
+        });
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::media::yt_dlp::download_selected_video(
+            &executable,
+            &url,
+            &destination_for_worker,
+            &selected_format,
+            &process_control,
+            progress,
+        )
+    })
+    .await
+    .map_err(|_| "The video download worker could not finish.".to_owned())?;
+
+    let elapsed_ms =
+        base_elapsed_ms.saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    match result {
+        Ok(download) => {
+            if control.is_cancelled() {
+                let _ = std::fs::remove_file(&download.destination);
+                let _ = std::fs::remove_file(partial_path(&destination));
+                finish_cancelled_optional(app, state, id)?;
+                return Ok(());
+            }
+            let completed = update_entry_optional(app, state, id, |entry| {
+                if control.is_cancelled() || entry.status == DownloadStatus::Cancelled {
+                    return Err("The media task was cancelled.".into());
+                }
+                transition(entry, DownloadStatus::Completed)?;
+                entry.downloaded_bytes = download.bytes;
+                entry.total_bytes = Some(download.bytes);
+                entry.speed_bytes_per_second = 0.0;
+                entry.elapsed_ms = elapsed_ms;
+                entry.remaining_seconds = Some(0.0);
+                entry.error = None;
+                Ok(())
+            });
+            match completed {
+                Ok(entry) => {
+                    if entry.notify_on_complete {
+                        send_download_notification_optional(app, &entry, true);
+                    }
+                    Ok(())
+                }
+                Err(_error) if control.is_cancelled() => {
+                    let _ = std::fs::remove_file(download.destination);
+                    let _ = std::fs::remove_file(partial_path(&destination));
+                    finish_cancelled_optional(app, state, id)?;
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(_error) if control.is_cancelled() => {
+            let _ = std::fs::remove_file(partial_path(&destination));
+            finish_cancelled_optional(app, state, id)
+        }
+        Err(crate::media::yt_dlp::VideoDownloadError::Paused { downloaded_bytes }) => {
+            let retained_bytes = if downloaded_bytes > 0 {
+                downloaded_bytes
+            } else {
+                initial_downloaded_bytes
+            };
+            match update_entry_optional(app, state, id, |entry| {
+                if control.is_cancelled() || entry.status == DownloadStatus::Cancelled {
+                    return Err("The media task was cancelled.".into());
+                }
+                transition(entry, DownloadStatus::Paused)?;
+                entry.downloaded_bytes = retained_bytes;
+                entry.elapsed_ms = elapsed_ms;
+                entry.speed_bytes_per_second = 0.0;
+                entry.remaining_seconds = None;
+                entry.error = None;
+                Ok(())
+            }) {
+                Ok(_) => Ok(()),
+                Err(_error) if control.is_cancelled() => {
+                    let _ = std::fs::remove_file(partial_path(&destination));
+                    finish_cancelled_optional(app, state, id)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(crate::media::yt_dlp::VideoDownloadError::Cancelled) => {
+            let _ = std::fs::remove_file(partial_path(&destination));
+            finish_cancelled_optional(app, state, id)
+        }
+        Err(error) => fail_entry_optional(app, state, id, error.to_string()).await,
+    }
+}
+
+#[cfg(windows)]
+fn remove_website_partial_if_present(state: &Mutex<DownloadState>, id: &str) {
+    let destination = state.lock().ok().and_then(|locked| {
+        locked
+            .entries
+            .iter()
+            .find(|entry| entry.id == id && entry.website_media.is_some())
+            .map(|entry| PathBuf::from(&entry.destination))
+    });
+    if let Some(destination) = destination {
+        let _ = std::fs::remove_file(partial_path(&destination));
+    }
+}
+
+#[cfg(windows)]
+fn spawn_website_worker(
+    app: Option<tauri::AppHandle>,
+    state: Arc<Mutex<DownloadState>>,
+    concurrency: Arc<ConcurrencyLimiter>,
+    worker_count: Arc<AtomicUsize>,
+    id: String,
+    executable: PathBuf,
+    selected_format: crate::media::yt_dlp::SelectedFormat,
+    control: Arc<DownloadTaskControl>,
+) {
+    worker_count.fetch_add(1, Ordering::AcqRel);
+    tauri::async_runtime::spawn(async move {
+        let _worker_guard = WorkerGuard(worker_count);
+        if let Err(error) = run_ytdlp_download_worker(
+            app.as_ref(),
+            &state,
+            &concurrency,
+            &id,
+            executable,
+            selected_format,
+            &control,
+        )
+        .await
+        {
+            if let Err(update_error) = fail_entry_optional(app.as_ref(), &state, &id, error).await {
+                eprintln!("Could not record website download failure: {update_error}");
+            }
+        }
+    });
 }
 
 impl Default for DownloadTaskControl {
@@ -130,9 +389,34 @@ impl Default for DownloadTaskControl {
     }
 }
 
+impl DownloadTaskControl {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn request_cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+
+    pub(crate) fn is_pause_requested(&self) -> bool {
+        self.pause_requested.load(Ordering::Acquire)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn request_pause(&self) {
+        self.pause_requested.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+}
+
 struct DownloadState {
     entries: Vec<DownloadEntry>,
     controls: HashMap<String, Arc<DownloadTaskControl>>,
+    #[cfg(windows)]
+    website_executables: HashMap<String, PathBuf>,
+    #[cfg(windows)]
+    verified_ytdlp_executable: Option<(PathBuf, Option<SystemTime>)>,
     max_concurrent: usize,
     bandwidth_limit_bytes_per_second: Option<u64>,
     history_path: Option<PathBuf>,
@@ -146,6 +430,10 @@ impl Default for DownloadState {
         Self {
             entries: Vec::new(),
             controls: HashMap::new(),
+            #[cfg(windows)]
+            website_executables: HashMap::new(),
+            #[cfg(windows)]
+            verified_ytdlp_executable: None,
             max_concurrent: 2,
             bandwidth_limit_bytes_per_second: None,
             history_path: None,
@@ -244,6 +532,522 @@ pub struct DownloadManager {
 }
 
 impl DownloadManager {
+    pub(crate) fn pause_download(&self, id: &str) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+        let entry = state
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| "Download record was not found.".to_owned())?;
+        if entry.status != DownloadStatus::Downloading {
+            return Err("Only a running download can be paused.".into());
+        }
+        let control = state
+            .controls
+            .get(id)
+            .ok_or_else(|| "The download worker is no longer available.".to_owned())?;
+        control.request_pause();
+        Ok(())
+    }
+
+    pub(crate) fn resume_download(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        id: &str,
+    ) -> Result<(), String> {
+        enum ResumeTarget {
+            Standard,
+            #[cfg(windows)]
+            Website {
+                executable: PathBuf,
+                selected_format: crate::media::yt_dlp::SelectedFormat,
+            },
+        }
+
+        let (entry, control, target) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+            let index = state
+                .entries
+                .iter()
+                .position(|entry| entry.id == id)
+                .ok_or_else(|| "Download record was not found.".to_owned())?;
+            let original = state.entries[index].clone();
+            if original.status != DownloadStatus::Paused {
+                return Err("Only a paused download can be resumed.".into());
+            }
+            if state.controls.contains_key(id) {
+                return Err("A download worker is already active for this item.".into());
+            }
+            let target = if let Some(website_media) = &original.website_media {
+                #[cfg(windows)]
+                {
+                    let executable = state
+                        .website_executables
+                        .get(id)
+                        .cloned()
+                        .filter(|path| path.is_file())
+                        .ok_or_else(|| {
+                            "The yt-dlp executable for this paused website download is no longer available; start a new download to retry.".to_owned()
+                        })?;
+                    let selected_format = crate::media::yt_dlp::selected_format_from_info(
+                        &website_media.format_id,
+                        &website_media.container,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let (validated_dest, _) =
+                        validate_resumable_download_destination(&original.destination)?;
+                    if validated_dest
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_none_or(|ext| !ext.eq_ignore_ascii_case(selected_format.extension))
+                    {
+                        return Err(
+                            "The paused website download destination extension no longer matches its format container."
+                                .into(),
+                        );
+                    }
+                    ResumeTarget::Website {
+                        executable,
+                        selected_format,
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = website_media;
+                    return Err("Website video downloads are supported on Windows only.".into());
+                }
+            } else {
+                ResumeTarget::Standard
+            };
+
+            let mut entry = original.clone();
+            transition(&mut entry, DownloadStatus::Queued)?;
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.error = None;
+            let control = Arc::new(DownloadTaskControl::default());
+            state.entries[index] = entry.clone();
+            let old_control = state.controls.insert(id.to_owned(), Arc::clone(&control));
+            if let Err(error) = persist_locked(&state) {
+                state.entries[index] = original;
+                if let Some(old_control) = old_control {
+                    state.controls.insert(id.to_owned(), old_control);
+                } else {
+                    state.controls.remove(id);
+                }
+                return Err(error);
+            }
+            (entry, control, target)
+        };
+
+        emit_entry_optional(app, entry);
+        match target {
+            ResumeTarget::Standard => {
+                let Some(app) = app.cloned() else {
+                    return Err(
+                        "An application handle is required to resume standard HTTP/HLS downloads."
+                            .into(),
+                    );
+                };
+                spawn_worker(
+                    app,
+                    Arc::clone(&self.state),
+                    Arc::clone(&self.concurrency),
+                    Arc::clone(&self.bandwidth),
+                    Arc::clone(&self.worker_count),
+                    id.to_owned(),
+                    control,
+                    false,
+                );
+            }
+            #[cfg(windows)]
+            ResumeTarget::Website {
+                executable,
+                selected_format,
+            } => {
+                spawn_website_worker(
+                    app.cloned(),
+                    Arc::clone(&self.state),
+                    Arc::clone(&self.concurrency),
+                    Arc::clone(&self.worker_count),
+                    id.to_owned(),
+                    executable,
+                    selected_format,
+                    control,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_download(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        id: &str,
+    ) -> Result<(), String> {
+        let (cancelled_entry, cleanup_website_partial) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+            let index = state
+                .entries
+                .iter()
+                .position(|entry| entry.id == id)
+                .ok_or_else(|| "Download record was not found.".to_owned())?;
+            if state.entries[index].status.is_terminal() {
+                return Err("This download is already finished.".into());
+            }
+            let control = state.controls.get(id).cloned();
+            if state.entries[index].status == DownloadStatus::Paused
+                || state.entries[index].status == DownloadStatus::Queued
+            {
+                let original = state.entries[index].clone();
+                let mut cancelled = original.clone();
+                transition(&mut cancelled, DownloadStatus::Cancelled)?;
+                cancelled.speed_bytes_per_second = 0.0;
+                cancelled.remaining_seconds = None;
+                state.entries[index] = cancelled.clone();
+                state.controls.remove(id);
+                #[cfg(windows)]
+                let removed_exe = state.website_executables.remove(id);
+                if let Err(error) = persist_locked(&state) {
+                    state.entries[index] = original;
+                    if let Some(control) = control {
+                        state.controls.insert(id.to_owned(), control);
+                    }
+                    #[cfg(windows)]
+                    if let Some(exe) = removed_exe {
+                        state.website_executables.insert(id.to_owned(), exe);
+                    }
+                    return Err(error);
+                }
+                if let Some(control) = control {
+                    control.request_cancel();
+                }
+                let cleanup_partial = cancelled
+                    .website_media
+                    .as_ref()
+                    .map(|_| PathBuf::from(&cancelled.destination));
+                (Some(cancelled), cleanup_partial)
+            } else {
+                let control =
+                    control.ok_or_else(|| "The download worker was not found.".to_owned())?;
+                // Set the signal while holding the same state lock used by the
+                // worker's Completed and Paused transitions. Cancellation always
+                // wins over both pause and completion races.
+                control.request_cancel();
+                (None, None)
+            }
+        };
+        if let Some(dest) = cleanup_website_partial {
+            let _ = std::fs::remove_file(partial_path(&dest));
+        }
+        if let Some(entry) = cancelled_entry {
+            emit_entry_optional(app, entry);
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) async fn run_ytdlp_download_worker(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        id: &str,
+        executable: PathBuf,
+        catalog: crate::media::yt_dlp::VideoDiscovery,
+        selection: crate::media::yt_dlp::FormatSelection,
+        control: &Arc<DownloadTaskControl>,
+    ) -> Result<(), String> {
+        let selected_format = crate::media::yt_dlp::select_muxed_format(&catalog, &selection)
+            .map_err(|error| error.to_string())?;
+        run_ytdlp_download_worker(
+            app,
+            &self.state,
+            &self.concurrency,
+            id,
+            executable,
+            selected_format,
+            control,
+        )
+        .await
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn resolve_verified_ytdlp_executable(
+        &self,
+        app: Option<&tauri::AppHandle>,
+    ) -> Result<PathBuf, String> {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+            if let Some((cached_path, cached_modified)) = &state.verified_ytdlp_executable {
+                if let Ok(meta) = std::fs::symlink_metadata(cached_path) {
+                    if meta.is_file()
+                        && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                        && meta.len() == crate::media::yt_dlp::VERIFIED_YTDLP_SIZE_BYTES
+                        && &meta.modified().ok() == cached_modified
+                    {
+                        return Ok(cached_path.clone());
+                    }
+                }
+            }
+        }
+
+        let verified = crate::media::yt_dlp::resolve_verified_executable(app)?;
+        let modified = std::fs::symlink_metadata(&verified)
+            .ok()
+            .and_then(|meta| meta.modified().ok());
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+        state.verified_ytdlp_executable = Some((verified.clone(), modified));
+        Ok(verified)
+    }
+
+    #[cfg(windows)]
+    pub(crate) async fn discover_website_media(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        url: String,
+    ) -> Result<crate::media::yt_dlp::VideoDiscovery, String> {
+        if url.len() > MAX_URL_LENGTH {
+            return Err("Download URL is too long.".into());
+        }
+        let normalized_url = crate::media::yt_dlp::validate_public_page_url(&url)
+            .map_err(|error| error.to_string())?;
+        let executable = self.resolve_verified_ytdlp_executable(app)?;
+        let base_dir = app
+            .and_then(|app| app.path().app_cache_dir().ok())
+            .filter(|dir| std::fs::create_dir_all(dir).is_ok())
+            .unwrap_or_else(std::env::temp_dir);
+        self.run_website_discovery(executable, base_dir, normalized_url)
+            .await
+    }
+
+    #[cfg(windows)]
+    async fn run_website_discovery(
+        &self,
+        executable: PathBuf,
+        base_dir: PathBuf,
+        normalized_url: String,
+    ) -> Result<crate::media::yt_dlp::VideoDiscovery, String> {
+        struct DiscoveryControlGuard {
+            state: Arc<Mutex<DownloadState>>,
+            id: String,
+        }
+
+        impl Drop for DiscoveryControlGuard {
+            fn drop(&mut self) {
+                if let Ok(mut state) = self.state.lock() {
+                    state.controls.remove(&self.id);
+                }
+            }
+        }
+
+        let control = Arc::new(DownloadTaskControl::default());
+        let control_id = format!("discovery-{}-{}", current_timestamp_ms(), rand_id());
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+            state
+                .controls
+                .insert(control_id.clone(), Arc::clone(&control));
+        }
+        self.worker_count.fetch_add(1, Ordering::AcqRel);
+        let _worker_guard = WorkerGuard(Arc::clone(&self.worker_count));
+        let _control_guard = DiscoveryControlGuard {
+            state: Arc::clone(&self.state),
+            id: control_id,
+        };
+
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::media::yt_dlp::discover_muxed_in_workspace(
+                &executable,
+                &base_dir,
+                &normalized_url,
+                &control,
+            )
+        })
+        .await
+        .map_err(|_| "The website media discovery worker could not finish.".to_owned())?
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn start_website_download_verified(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        url: String,
+        destination: String,
+        catalog: crate::media::yt_dlp::VideoDiscovery,
+        selection: crate::media::yt_dlp::FormatSelection,
+    ) -> Result<DownloadEntry, String> {
+        if url.len() > MAX_URL_LENGTH {
+            return Err("Download URL is too long.".into());
+        }
+        let normalized_url = crate::media::yt_dlp::validate_public_page_url(&url)
+            .map_err(|error| format!("Invalid public website URL: {error}"))?;
+        let _ = crate::media::yt_dlp::select_muxed_format(&catalog, &selection)
+            .map_err(|error| error.to_string())?;
+        let executable = self.resolve_verified_ytdlp_executable(app)?;
+        self.start_website_download(
+            app,
+            normalized_url,
+            destination,
+            executable,
+            catalog,
+            selection,
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn start_website_download(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        url: String,
+        destination: String,
+        executable: PathBuf,
+        catalog: crate::media::yt_dlp::VideoDiscovery,
+        selection: crate::media::yt_dlp::FormatSelection,
+    ) -> Result<DownloadEntry, String> {
+        if url.len() > MAX_URL_LENGTH {
+            return Err("Download URL is too long.".into());
+        }
+        if !executable.is_file() {
+            return Err("The yt-dlp executable path is invalid or does not exist.".into());
+        }
+        let normalized_url = crate::media::yt_dlp::validate_public_page_url(&url)
+            .map_err(|error| format!("Invalid public website URL: {error}"))?;
+        let selected_format = crate::media::yt_dlp::select_muxed_format(&catalog, &selection)
+            .map_err(|error| error.to_string())?;
+
+        let id = format!("{}-{}", current_timestamp_ms(), rand_id());
+        let now = current_timestamp_ms();
+
+        let (entry, control) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+            let destination = unique_destination(Path::new(&destination), &state.entries)?;
+            let (destination, filename) =
+                validate_download_destination(destination.to_string_lossy().as_ref())?;
+
+            let dest_ext = destination
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase);
+            if dest_ext.as_deref() != Some(selected_format.extension) {
+                return Err(format!(
+                    "The destination file extension (.{:?}) does not match the selected format container (.{}). FluxNet never renames WebM to MP4 or vice versa.",
+                    dest_ext.unwrap_or_default(),
+                    selected_format.extension
+                ));
+            }
+
+            let height = match &selection {
+                crate::media::yt_dlp::FormatSelection::Exact(id) => catalog
+                    .formats
+                    .iter()
+                    .find(|f| &f.format_id == id)
+                    .and_then(|f| f.height),
+                crate::media::yt_dlp::FormatSelection::BestAvailable => catalog
+                    .formats
+                    .iter()
+                    .filter(|f| {
+                        f.container
+                            .as_deref()
+                            .is_some_and(|c| c.eq_ignore_ascii_case(selected_format.extension))
+                            && f.video_codec.as_deref() != Some("none")
+                            && f.audio_codec.as_deref() != Some("none")
+                    })
+                    .filter_map(|f| f.height)
+                    .max(),
+            };
+
+            let control = Arc::new(DownloadTaskControl::default());
+            let entry = DownloadEntry {
+                id: id.clone(),
+                url: normalized_url.clone(),
+                destination: destination.to_string_lossy().to_string(),
+                filename,
+                status: DownloadStatus::Queued,
+                total_bytes: None,
+                downloaded_bytes: 0,
+                speed_bytes_per_second: 0.0,
+                elapsed_ms: 0,
+                remaining_seconds: None,
+                error: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+                attempts: 1,
+                hls_playlist: None,
+                hls_completed_parts: None,
+                website_media: Some(WebsiteMediaInfo {
+                    format_id: selected_format.selector.clone(),
+                    container: selected_format.extension.to_string(),
+                    height,
+                }),
+                etag: None,
+                last_modified: None,
+                notifications_enabled: state.notifications_enabled,
+                notify_on_complete: state.notify_on_complete,
+                notify_on_failure: state.notify_on_failure,
+            };
+            state.entries.push(entry.clone());
+            state.controls.insert(id.clone(), Arc::clone(&control));
+            state
+                .website_executables
+                .insert(id.clone(), executable.clone());
+            if let Err(error) = persist_locked(&state) {
+                state.entries.pop();
+                state.controls.remove(&id);
+                state.website_executables.remove(&id);
+                return Err(error);
+            }
+            (entry, control)
+        };
+
+        emit_entry_optional(app, entry.clone());
+        spawn_website_worker(
+            app.cloned(),
+            Arc::clone(&self.state),
+            Arc::clone(&self.concurrency),
+            Arc::clone(&self.worker_count),
+            id,
+            executable,
+            selected_format,
+            control,
+        );
+        Ok(entry)
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn start_website_download(
+        &self,
+        _app: Option<&tauri::AppHandle>,
+        _url: String,
+        _destination: String,
+        _executable: PathBuf,
+        _catalog: (),
+        _selection: (),
+    ) -> Result<DownloadEntry, String> {
+        Err("Website video downloads are supported on Windows only.".into())
+    }
+
     pub fn initialize(&self, app: &tauri::AppHandle) -> Result<(), String> {
         let directory = app.path().app_data_dir().map_err(|error| {
             filesystem_error("could not locate FluxNet's app-data directory", error)
@@ -614,6 +1418,49 @@ fn validated_download_url(url: &str) -> Result<reqwest::Url, String> {
     Ok(parsed)
 }
 
+fn validate_unranged_media_response(
+    status: StatusCode,
+    content_range: Option<&str>,
+    content_length: Option<u64>,
+) -> Result<(), String> {
+    if status == StatusCode::PARTIAL_CONTENT {
+        let complete_representation =
+            content_range
+                .and_then(parse_content_range)
+                .is_some_and(|(start, end, total)| {
+                    start == 0 && end.saturating_add(1) == total && content_length == Some(total)
+                });
+        if complete_representation {
+            return Ok(());
+        }
+        return Err(
+            "The server returned only a partial byte-range response. FluxNet cannot save it as a complete media file; choose a complete source instead."
+                .into(),
+        );
+    }
+    if content_range.is_some() {
+        return Err(
+            "The server returned only a partial byte-range response. FluxNet cannot save it as a complete media file; choose a complete source instead."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn is_instagram_byte_range_url(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    let instagram_cdn = host == "cdninstagram.com"
+        || host.ends_with(".cdninstagram.com")
+        || host == "fbcdn.net"
+        || host.ends_with(".fbcdn.net");
+    instagram_cdn
+        && url
+            .query_pairs()
+            .any(|(name, _)| name == "bytestart" || name == "byteend")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequestFailureKind {
     Dns,
@@ -949,6 +1796,295 @@ fn validate_mp4_file(path: &Path) -> Result<Mp4Validation, String> {
     validate_mp4_reader(&mut file, file_length)
 }
 
+pub(crate) fn validate_ytdlp_mp4(path: &Path) -> Result<(), String> {
+    match validate_mp4_file(path)? {
+        Mp4Validation::Standalone | Mp4Validation::FragmentedWithInitialization => {
+            let (has_video, has_audio) = mp4_track_kinds(path)?;
+            if has_video && has_audio {
+                Ok(())
+            } else {
+                Err("The downloaded MP4 does not contain both audio and video tracks.".into())
+            }
+        }
+        Mp4Validation::FragmentedMissingInitialization => {
+            Err("The downloaded fragmented MP4 is missing its initialization data.".into())
+        }
+        Mp4Validation::Invalid(_) => Err("The downloaded MP4 is incomplete or invalid.".into()),
+    }
+}
+
+pub(crate) fn validate_ytdlp_media(path: &Path) -> Result<(), String> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mp4") => validate_ytdlp_mp4(path),
+        Some("webm") => validate_ytdlp_webm(path),
+        _ => Err("The downloaded media container is unsupported.".into()),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EbmlElement {
+    id: u64,
+    payload_start: u64,
+    end: u64,
+}
+
+const EBML_HEADER_ID: u64 = 0x1A45_DFA3;
+const EBML_SEGMENT_ID: u64 = 0x1853_8067;
+const EBML_DOC_TYPE_ID: u64 = 0x4282;
+const EBML_INFO_ID: u64 = 0x1549_A966;
+const EBML_TRACKS_ID: u64 = 0x1654_AE6B;
+const EBML_TRACK_ENTRY_ID: u64 = 0xAE;
+const EBML_TRACK_TYPE_ID: u64 = 0x83;
+const EBML_CLUSTER_ID: u64 = 0x1F43_B675;
+const EBML_SIMPLE_BLOCK_ID: u64 = 0xA3;
+const EBML_BLOCK_GROUP_ID: u64 = 0xA0;
+const EBML_BLOCK_ID: u64 = 0xA1;
+const MAX_EBML_ELEMENTS: usize = 100_000;
+
+fn validate_ytdlp_webm(path: &Path) -> Result<(), String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| filesystem_error("could not inspect the downloaded WebM", error))?;
+    let length = file
+        .metadata()
+        .map_err(|error| filesystem_error("could not inspect the downloaded WebM", error))?
+        .len();
+    if length < 16 {
+        return Err("The downloaded WebM is too small to contain a media segment.".into());
+    }
+    let header = read_ebml_element(&mut file, 0, length)?;
+    if header.id != EBML_HEADER_ID {
+        return Err("The downloaded file is not an EBML/WebM container.".into());
+    }
+    let header_children = read_ebml_children(&mut file, header.payload_start, header.end)?;
+    let is_webm = header_children.iter().any(|element| {
+        if element.id != EBML_DOC_TYPE_ID || element.end - element.payload_start > 16 {
+            return false;
+        }
+        let size = (element.end - element.payload_start) as usize;
+        let mut bytes = vec![0; size];
+        file.seek(SeekFrom::Start(element.payload_start))
+            .and_then(|_| file.read_exact(&mut bytes))
+            .is_ok()
+            && bytes == b"webm"
+    });
+    if !is_webm {
+        return Err("The downloaded EBML file does not declare the WebM document type.".into());
+    }
+
+    let mut position = header.end;
+    let mut segment = None;
+    while position < length {
+        let element = read_ebml_element(&mut file, position, length)?;
+        if element.id == EBML_SEGMENT_ID {
+            segment = Some(element);
+            break;
+        }
+        position = element.end;
+    }
+    let segment = segment.ok_or_else(|| "The downloaded WebM has no segment.".to_owned())?;
+    let segment_children = read_ebml_children(&mut file, segment.payload_start, segment.end)?;
+    if !segment_children
+        .iter()
+        .any(|element| element.id == EBML_INFO_ID)
+    {
+        return Err("The downloaded WebM has no segment information.".into());
+    }
+    let tracks = segment_children
+        .iter()
+        .copied()
+        .find(|element| element.id == EBML_TRACKS_ID)
+        .ok_or_else(|| "The downloaded WebM has no track metadata.".to_owned())?;
+    let track_entries = read_ebml_children(&mut file, tracks.payload_start, tracks.end)?;
+    let mut has_video = false;
+    let mut has_audio = false;
+    for track in track_entries
+        .into_iter()
+        .filter(|element| element.id == EBML_TRACK_ENTRY_ID)
+    {
+        for field in read_ebml_children(&mut file, track.payload_start, track.end)?
+            .into_iter()
+            .filter(|element| element.id == EBML_TRACK_TYPE_ID)
+        {
+            let byte_count = field.end.saturating_sub(field.payload_start);
+            if byte_count == 0 || byte_count > 8 {
+                return Err("The downloaded WebM contains an invalid track type.".into());
+            }
+            let mut bytes = vec![0; byte_count as usize];
+            file.seek(SeekFrom::Start(field.payload_start))
+                .and_then(|_| file.read_exact(&mut bytes))
+                .map_err(|error| filesystem_error("could not inspect WebM tracks", error))?;
+            let kind = bytes
+                .iter()
+                .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
+            has_video |= kind == 1;
+            has_audio |= kind == 2;
+        }
+    }
+    if !has_video || !has_audio {
+        return Err("The downloaded WebM does not contain both audio and video tracks.".into());
+    }
+
+    let mut has_media_block = false;
+    for cluster in segment_children
+        .iter()
+        .copied()
+        .filter(|element| element.id == EBML_CLUSTER_ID)
+    {
+        for child in read_ebml_children(&mut file, cluster.payload_start, cluster.end)? {
+            if child.id == EBML_SIMPLE_BLOCK_ID && child.end - child.payload_start > 4 {
+                has_media_block = true;
+            }
+            if child.id == EBML_BLOCK_GROUP_ID {
+                has_media_block |= read_ebml_children(&mut file, child.payload_start, child.end)?
+                    .iter()
+                    .any(|block| block.id == EBML_BLOCK_ID && block.end - block.payload_start > 4);
+            }
+        }
+    }
+    if !has_media_block {
+        return Err("The downloaded WebM has no nonempty audio/video block.".into());
+    }
+    Ok(())
+}
+
+fn read_ebml_vint<R: Read + Seek>(
+    file: &mut R,
+    position: u64,
+    parent_end: u64,
+    id: bool,
+) -> Result<(u64, usize, bool), String> {
+    if position >= parent_end {
+        return Err("The downloaded WebM contains a truncated element.".into());
+    }
+    let mut first = [0u8; 1];
+    file.seek(SeekFrom::Start(position))
+        .and_then(|_| file.read_exact(&mut first))
+        .map_err(|error| filesystem_error("could not inspect WebM elements", error))?;
+    if first[0] == 0 {
+        return Err("The downloaded WebM contains an invalid variable-length integer.".into());
+    }
+    let length = first[0].leading_zeros() as usize + 1;
+    let maximum = if id { 4 } else { 8 };
+    if length > maximum || position.saturating_add(length as u64) > parent_end {
+        return Err("The downloaded WebM contains an invalid element header.".into());
+    }
+    let mut bytes = vec![0; length];
+    file.seek(SeekFrom::Start(position))
+        .and_then(|_| file.read_exact(&mut bytes))
+        .map_err(|error| filesystem_error("could not inspect WebM elements", error))?;
+    let mut value = u64::from(bytes[0]);
+    if !id {
+        let marker_mask = if length == 8 { 0 } else { 0xFFu8 >> length };
+        value &= u64::from(marker_mask);
+    }
+    for byte in bytes.iter().skip(1) {
+        value = (value << 8) | u64::from(*byte);
+    }
+    let unknown = !id && value == ((1u64 << (7 * length)) - 1);
+    Ok((value, length, unknown))
+}
+
+fn read_ebml_element<R: Read + Seek>(
+    file: &mut R,
+    position: u64,
+    parent_end: u64,
+) -> Result<EbmlElement, String> {
+    let (id, id_length, _) = read_ebml_vint(file, position, parent_end, true)?;
+    let (size, size_length, unknown) =
+        read_ebml_vint(file, position + id_length as u64, parent_end, false)?;
+    let payload_start = position + (id_length + size_length) as u64;
+    let end = if unknown {
+        parent_end
+    } else {
+        payload_start
+            .checked_add(size)
+            .filter(|end| *end <= parent_end)
+            .ok_or_else(|| {
+                "The downloaded WebM contains an element past the file end.".to_owned()
+            })?
+    };
+    Ok(EbmlElement {
+        id,
+        payload_start,
+        end,
+    })
+}
+
+fn read_ebml_children<R: Read + Seek>(
+    file: &mut R,
+    start: u64,
+    end: u64,
+) -> Result<Vec<EbmlElement>, String> {
+    let mut children = Vec::new();
+    let mut position = start;
+    while position < end {
+        if children.len() >= MAX_EBML_ELEMENTS {
+            return Err("The downloaded WebM contains too many elements.".into());
+        }
+        let element = read_ebml_element(file, position, end)?;
+        if element.end <= position {
+            return Err("The downloaded WebM contains an invalid element size.".into());
+        }
+        position = element.end;
+        children.push(element);
+    }
+    Ok(children)
+}
+
+fn mp4_track_kinds(path: &Path) -> Result<(bool, bool), String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| filesystem_error("could not inspect downloaded MP4 tracks", error))?;
+    let length = file
+        .metadata()
+        .map_err(|error| filesystem_error("could not inspect downloaded MP4 tracks", error))?
+        .len();
+    let top = read_mp4_atoms(&mut file, 0, length)?;
+    let moov = top
+        .iter()
+        .copied()
+        .find(|atom| &atom.kind == b"moov")
+        .ok_or_else(|| "The downloaded MP4 has no movie metadata.".to_owned())?;
+    let children = mp4_atom_children(&mut file, moov)?;
+    let mut has_video = false;
+    let mut has_audio = false;
+    for track in children
+        .iter()
+        .copied()
+        .filter(|atom| &atom.kind == b"trak")
+    {
+        let track_children = mp4_atom_children(&mut file, track)?;
+        let media = track_children
+            .iter()
+            .copied()
+            .find(|atom| &atom.kind == b"mdia")
+            .ok_or_else(|| "The downloaded MP4 track has no media metadata.".to_owned())?;
+        let media_children = mp4_atom_children(&mut file, media)?;
+        let handler = media_children
+            .iter()
+            .copied()
+            .find(|atom| &atom.kind == b"hdlr")
+            .ok_or_else(|| "The downloaded MP4 track has no handler metadata.".to_owned())?;
+        if handler.end - handler.payload_start < 12 {
+            return Err("The downloaded MP4 track handler is truncated.".into());
+        }
+        let mut payload = [0u8; 12];
+        file.seek(SeekFrom::Start(handler.payload_start))
+            .and_then(|_| file.read_exact(&mut payload))
+            .map_err(|error| filesystem_error("could not inspect downloaded MP4 tracks", error))?;
+        match &payload[8..12] {
+            b"vide" => has_video = true,
+            b"soun" => has_audio = true,
+            _ => {}
+        }
+    }
+    Ok((has_video, has_audio))
+}
+
 fn validate_mp4_reader<R: Read + Seek>(
     mut file: &mut R,
     file_length: u64,
@@ -1145,7 +2281,21 @@ fn build_http_client() -> Result<Client, String> {
         .map_err(|error| format!("HTTP client configuration error: {error}"))
 }
 
-fn validate_download_destination(path: &str) -> Result<(PathBuf, String), String> {
+pub(crate) fn validate_download_destination(path: &str) -> Result<(PathBuf, String), String> {
+    validate_download_destination_with_options(path, false)
+}
+
+#[cfg(windows)]
+pub(crate) fn validate_resumable_download_destination(
+    path: &str,
+) -> Result<(PathBuf, String), String> {
+    validate_download_destination_with_options(path, true)
+}
+
+fn validate_download_destination_with_options(
+    path: &str,
+    allow_existing_partial: bool,
+) -> Result<(PathBuf, String), String> {
     let destination = PathBuf::from(path);
     if !destination.is_absolute() {
         return Err(
@@ -1176,7 +2326,7 @@ fn validate_download_destination(path: &str) -> Result<(PathBuf, String), String
         );
     }
     let partial = partial_path(&destination);
-    if partial.exists() {
+    if !allow_existing_partial && partial.exists() {
         return Err("Filesystem error: a partial download already exists at this destination. Retry its history entry or choose another filename.".into());
     }
     let filename = filename.to_owned();
@@ -1299,14 +2449,20 @@ fn persist_locked(state: &DownloadState) -> Result<(), String> {
         .map_err(|error| filesystem_error("could not commit download history", error))
 }
 
-fn emit_entry(app: &tauri::AppHandle, entry: DownloadEntry) {
-    if let Err(error) = app.emit(DOWNLOAD_EVENT, entry) {
-        eprintln!("Could not publish Download Manager update: {error}");
+fn emit_entry_optional(app: Option<&tauri::AppHandle>, entry: DownloadEntry) {
+    if let Some(app) = app {
+        if let Err(error) = app.emit(DOWNLOAD_EVENT, entry) {
+            eprintln!("Could not publish Download Manager update: {error}");
+        }
     }
 }
 
-fn update_entry<F>(
-    app: &tauri::AppHandle,
+fn emit_entry(app: &tauri::AppHandle, entry: DownloadEntry) {
+    emit_entry_optional(Some(app), entry);
+}
+
+fn update_entry_optional<F>(
+    app: Option<&tauri::AppHandle>,
     state: &Mutex<DownloadState>,
     id: &str,
     update: F,
@@ -1331,13 +2487,29 @@ where
             state.entries[index] = original;
             return Err(error);
         }
-        if updated.status.is_terminal() {
+        if updated.status.is_terminal() || updated.status == DownloadStatus::Paused {
             state.controls.remove(id);
+        }
+        #[cfg(windows)]
+        if updated.status.is_terminal() {
+            state.website_executables.remove(id);
         }
         updated
     };
-    emit_entry(app, entry.clone());
+    emit_entry_optional(app, entry.clone());
     Ok(entry)
+}
+
+fn update_entry<F>(
+    app: &tauri::AppHandle,
+    state: &Mutex<DownloadState>,
+    id: &str,
+    update: F,
+) -> Result<DownloadEntry, String>
+where
+    F: FnOnce(&mut DownloadEntry) -> Result<(), String>,
+{
+    update_entry_optional(Some(app), state, id, update)
 }
 
 #[tauri::command]
@@ -1487,6 +2659,52 @@ pub fn configure_download_notification_preferences(
     Ok(())
 }
 
+#[cfg(windows)]
+#[tauri::command]
+pub async fn discover_website_media(
+    app: tauri::AppHandle,
+    manager: tauri::State<'_, DownloadManager>,
+    url: String,
+) -> Result<crate::media::yt_dlp::VideoDiscovery, String> {
+    manager.discover_website_media(Some(&app), url).await
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub async fn discover_website_media(
+    _app: tauri::AppHandle,
+    _manager: tauri::State<'_, DownloadManager>,
+    _url: String,
+) -> Result<crate::media::yt_dlp::VideoDiscovery, String> {
+    Err("Website video discovery is supported on Windows only.".into())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+pub fn start_website_download(
+    app: tauri::AppHandle,
+    manager: tauri::State<'_, DownloadManager>,
+    url: String,
+    destination: String,
+    catalog: crate::media::yt_dlp::VideoDiscovery,
+    selection: crate::media::yt_dlp::FormatSelection,
+) -> Result<DownloadEntry, String> {
+    manager.start_website_download_verified(Some(&app), url, destination, catalog, selection)
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+pub fn start_website_download(
+    _app: tauri::AppHandle,
+    _manager: tauri::State<'_, DownloadManager>,
+    _url: String,
+    _destination: String,
+    _catalog: crate::media::yt_dlp::VideoDiscovery,
+    _selection: crate::media::yt_dlp::FormatSelection,
+) -> Result<DownloadEntry, String> {
+    Err("Website video downloads are supported on Windows only.".into())
+}
+
 #[tauri::command]
 pub fn start_download(
     app: tauri::AppHandle,
@@ -1499,6 +2717,12 @@ pub fn start_download(
         return Err("Download URL is too long.".into());
     }
     let parsed_url = validated_download_url(&url)?;
+    if hls_playlist.is_none() && is_instagram_byte_range_url(&parsed_url) {
+        return Err(
+            "Instagram supplied a byte-range media URL, not a complete video source. FluxNet did not queue it."
+                .into(),
+        );
+    }
     let hls_playlist = hls_playlist
         .map(|playlist| validate_hls_playlist(playlist, &parsed_url))
         .transpose()?;
@@ -1536,6 +2760,7 @@ pub fn start_download(
             attempts: 1,
             hls_playlist: hls_playlist.clone(),
             hls_completed_parts: hls_playlist.as_ref().map(|_| 0),
+            website_media: None,
             etag: None,
             last_modified: None,
             notifications_enabled: state.notifications_enabled,
@@ -1774,6 +2999,16 @@ async fn download_worker(
         }
     };
     let status = response.status();
+    let content_range = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok());
+    let mut total_bytes = response.content_length();
+    if offset == 0 {
+        if let Err(message) = validate_unranged_media_response(status, content_range, total_bytes) {
+            return fail_entry(app, state, id, message).await;
+        }
+    }
     if !status.is_success() {
         return fail_entry(
             app,
@@ -1784,7 +3019,6 @@ async fn download_worker(
         .await;
     }
 
-    let mut total_bytes = response.content_length();
     let response_content_type = response
         .headers()
         .get(CONTENT_TYPE)
@@ -2638,13 +3872,24 @@ async fn download_hls_worker(
     Ok(())
 }
 
-fn partial_path(destination: &Path) -> PathBuf {
+pub(crate) fn partial_path(destination: &Path) -> PathBuf {
     let mut name = destination.file_name().unwrap_or_default().to_os_string();
     name.push(".fluxnet-part");
     destination.with_file_name(name)
 }
 
 fn send_download_notification(app: &tauri::AppHandle, entry: &DownloadEntry, completed: bool) {
+    send_download_notification_optional(Some(app), entry, completed);
+}
+
+fn send_download_notification_optional(
+    app: Option<&tauri::AppHandle>,
+    entry: &DownloadEntry,
+    completed: bool,
+) {
+    let Some(app) = app else {
+        return;
+    };
     let (title, body) = if completed {
         (
             "Download complete",
@@ -2671,17 +3916,27 @@ async fn fail_entry(
     id: &str,
     message: String,
 ) -> Result<(), String> {
-    let entry = update_entry(app, state, id, |entry| {
-        if !entry.status.is_terminal() {
-            transition(entry, DownloadStatus::Failed)?;
+    fail_entry_optional(Some(app), state, id, message).await
+}
+
+async fn fail_entry_optional(
+    app: Option<&tauri::AppHandle>,
+    state: &Mutex<DownloadState>,
+    id: &str,
+    message: String,
+) -> Result<(), String> {
+    let entry = update_entry_optional(app, state, id, |entry| {
+        if entry.status.is_terminal() {
+            return Ok(());
         }
+        transition(entry, DownloadStatus::Failed)?;
         entry.error = Some(message);
         entry.speed_bytes_per_second = 0.0;
         entry.remaining_seconds = None;
         Ok(())
     })?;
-    if entry.notify_on_failure {
-        send_download_notification(app, &entry, false);
+    if entry.status == DownloadStatus::Failed && entry.notify_on_failure {
+        send_download_notification_optional(app, &entry, false);
     }
     Ok(())
 }
@@ -2691,7 +3946,15 @@ fn finish_cancelled(
     state: &Mutex<DownloadState>,
     id: &str,
 ) -> Result<(), String> {
-    update_entry(app, state, id, |entry| {
+    finish_cancelled_optional(Some(app), state, id)
+}
+
+fn finish_cancelled_optional(
+    app: Option<&tauri::AppHandle>,
+    state: &Mutex<DownloadState>,
+    id: &str,
+) -> Result<(), String> {
+    update_entry_optional(app, state, id, |entry| {
         if !entry.status.is_terminal() {
             transition(entry, DownloadStatus::Cancelled)?;
         }
@@ -2707,25 +3970,7 @@ pub fn pause_download(
     manager: tauri::State<'_, DownloadManager>,
     id: String,
 ) -> Result<(), String> {
-    let state = manager
-        .state
-        .lock()
-        .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
-    let entry = state
-        .entries
-        .iter()
-        .find(|entry| entry.id == id)
-        .ok_or_else(|| "Download record was not found.".to_owned())?;
-    if entry.status != DownloadStatus::Downloading {
-        return Err("Only a running download can be paused.".into());
-    }
-    let control = state
-        .controls
-        .get(&id)
-        .ok_or_else(|| "The download worker is no longer available.".to_owned())?;
-    control.pause_requested.store(true, Ordering::Release);
-    control.wake.notify_one();
-    Ok(())
+    manager.pause_download(&id)
 }
 
 #[tauri::command]
@@ -2734,52 +3979,7 @@ pub fn resume_download(
     manager: tauri::State<'_, DownloadManager>,
     id: String,
 ) -> Result<(), String> {
-    let control = {
-        let mut state = manager
-            .state
-            .lock()
-            .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
-        let index = state
-            .entries
-            .iter()
-            .position(|entry| entry.id == id)
-            .ok_or_else(|| "Download record was not found.".to_owned())?;
-        let original = state.entries[index].clone();
-        let mut entry = original.clone();
-        if entry.status != DownloadStatus::Paused {
-            return Err("Only a paused download can be resumed.".into());
-        }
-        transition(&mut entry, DownloadStatus::Queued)?;
-        entry.attempts = entry.attempts.saturating_add(1);
-        let control = Arc::new(DownloadTaskControl::default());
-        state.entries[index] = entry;
-        let old_control = state.controls.insert(id.clone(), Arc::clone(&control));
-        if let Err(error) = persist_locked(&state) {
-            state.entries[index] = original;
-            if let Some(old_control) = old_control {
-                state.controls.insert(id.clone(), old_control);
-            } else {
-                state.controls.remove(&id);
-            }
-            return Err(error);
-        }
-        control
-    };
-    let state = Arc::clone(&manager.state);
-    let concurrency = Arc::clone(&manager.concurrency);
-    let bandwidth = Arc::clone(&manager.bandwidth);
-    let worker_count = Arc::clone(&manager.worker_count);
-    spawn_worker(
-        app,
-        state,
-        concurrency,
-        bandwidth,
-        worker_count,
-        id,
-        control,
-        false,
-    );
-    Ok(())
+    manager.resume_download(Some(&app), &id)
 }
 
 #[tauri::command]
@@ -2788,50 +3988,7 @@ pub fn cancel_download(
     manager: tauri::State<'_, DownloadManager>,
     id: String,
 ) -> Result<(), String> {
-    let (control, cancelled_entry) = {
-        let mut state = manager
-            .state
-            .lock()
-            .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
-        let index = state
-            .entries
-            .iter()
-            .position(|entry| entry.id == id)
-            .ok_or_else(|| "Download record was not found.".to_owned())?;
-        if state.entries[index].status.is_terminal() {
-            return Err("This download is already finished.".into());
-        }
-        let control = state
-            .controls
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| "The download worker was not found.".to_owned())?;
-        if state.entries[index].status == DownloadStatus::Paused {
-            let original = state.entries[index].clone();
-            let mut cancelled = original.clone();
-            transition(&mut cancelled, DownloadStatus::Cancelled)?;
-            cancelled.speed_bytes_per_second = 0.0;
-            cancelled.remaining_seconds = None;
-            state.entries[index] = cancelled.clone();
-            state.controls.remove(&id);
-            if let Err(error) = persist_locked(&state) {
-                state.entries[index] = original;
-                state.controls.insert(id, control);
-                return Err(error);
-            }
-            (None, Some(cancelled))
-        } else {
-            (Some(control), None)
-        }
-    };
-    if let Some(control) = control {
-        control.cancelled.store(true, Ordering::Release);
-        control.wake.notify_one();
-    }
-    if let Some(entry) = cancelled_entry {
-        emit_entry(&app, entry);
-    }
-    Ok(())
+    manager.cancel_download(Some(&app), &id)
 }
 
 #[tauri::command]
@@ -2853,6 +4010,9 @@ pub fn retry_download(
             .position(|entry| entry.id == id)
             .ok_or_else(|| "Download record was not found.".to_owned())?;
         let original = state.entries[index].clone();
+        if original.website_media.is_some() {
+            return Err("Website video downloads must be re-queued with a format selection; start a new download to retry.".into());
+        }
         let mut entry = original.clone();
         if !entry.status.can_retry() {
             return Err("Only failed or cancelled downloads can be retried.".into());
@@ -2948,26 +4108,234 @@ pub fn cancel_all_downloads(
         .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
     let controls = state.controls.values().cloned().collect::<Vec<_>>();
     for control in &controls {
-        control.cancelled.store(true, Ordering::Release);
-        control.wake.notify_one();
+        control.request_cancel();
     }
+    let mut website_partials_to_remove = Vec::new();
+    let mut cancelled_paused_ids = Vec::new();
     for entry in &mut state.entries {
         if entry.status == DownloadStatus::Paused {
             transition(entry, DownloadStatus::Cancelled)?;
+            cancelled_paused_ids.push(entry.id.clone());
+            if entry.website_media.is_some() {
+                website_partials_to_remove.push(PathBuf::from(&entry.destination));
+            }
         }
+    }
+    for id in &cancelled_paused_ids {
+        state.controls.remove(id);
+        #[cfg(windows)]
+        state.website_executables.remove(id);
     }
     if let Err(error) = persist_locked(&state) {
         eprintln!(
             "Could not checkpoint download history during shutdown; partial files will be validated on the next launch: {error}"
         );
     }
+    drop(state);
+    for destination in website_partials_to_remove {
+        let _ = std::fs::remove_file(partial_path(&destination));
+    }
     Ok((Arc::clone(&manager.worker_count), controls.len()))
 }
+
+#[cfg(all(test, windows))]
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+#[used]
+#[unsafe(link_section = ".drectve")]
+static _FLUXNET_TEST_COMCTL6_MANIFEST: [u8; 167] = *b" /manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"";
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[cfg(windows)]
+    #[test]
+    fn process_worker_uses_manager_slot_and_shutdown_cancels_whole_tree() {
+        use crate::process::{
+            ProcessOutcome, assert_process_terminated, process_fixture_spec_for_integration,
+            run_supervised,
+        };
+
+        let manager = DownloadManager::default();
+        let control = Arc::new(DownloadTaskControl::default());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.max_concurrent = 1;
+            state
+                .controls
+                .insert("process-test".into(), Arc::clone(&control));
+        }
+        let (spec, ready_path) = process_fixture_spec_for_integration();
+        let descendant_pid_path = ready_path.with_extension("grandchild.pid");
+        let queued_control = Arc::new(DownloadTaskControl::default());
+        let slot = tauri::async_runtime::block_on(async {
+            manager
+                .concurrency
+                .acquire(&manager.state, &control)
+                .await
+                .unwrap()
+                .expect("process worker should use the manager's only slot")
+        });
+        manager.worker_count.fetch_add(1, Ordering::AcqRel);
+        let worker_control = Arc::clone(&control);
+        let worker_count = Arc::clone(&manager.worker_count);
+        let worker = std::thread::spawn(move || {
+            let _worker_guard = WorkerGuard(worker_count);
+            let outcome = run_supervised(&spec, &worker_control);
+            drop(slot);
+            outcome
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready_path.exists(), "local child did not start");
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 1);
+        let waiting = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                manager.concurrency.acquire(&manager.state, &queued_control),
+            )
+            .await
+        });
+        assert!(
+            waiting.is_err(),
+            "a second task bypassed the existing slot limit"
+        );
+
+        let (workers, cancelled_count) = cancel_all_downloads(&manager).unwrap();
+        assert_eq!(cancelled_count, 1);
+        let outcome = worker
+            .join()
+            .unwrap()
+            .expect("supervisor should return cancellation");
+        assert!(matches!(outcome, ProcessOutcome::Cancelled { .. }));
+        assert_eq!(
+            workers.load(Ordering::Acquire),
+            0,
+            "shutdown must wait for process worker cleanup"
+        );
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 0);
+
+        let descendant = std::fs::read_to_string(&descendant_pid_path)
+            .expect("fixture should record descendant PID")
+            .parse::<u32>()
+            .unwrap();
+        assert_process_terminated(descendant);
+        let _ = std::fs::remove_file(&ready_path);
+        let _ = std::fs::remove_file(descendant_pid_path);
+        let _ = std::fs::remove_file(ready_path.with_extension("grandchild.ready"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paused_process_worker_terminates_tree_and_releases_download_slot() {
+        use crate::process::{
+            ProcessOutcome, assert_process_terminated, process_fixture_spec_for_integration,
+            run_supervised,
+        };
+
+        let manager = DownloadManager::default();
+        let control = Arc::new(DownloadTaskControl::default());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.max_concurrent = 1;
+        }
+        let (spec, ready_path) = process_fixture_spec_for_integration();
+        let descendant_pid_path = ready_path.with_extension("grandchild.pid");
+        let descendant_ready_path = ready_path.with_extension("grandchild.ready");
+        let queued_control = Arc::new(DownloadTaskControl::default());
+
+        let slot = tauri::async_runtime::block_on(async {
+            manager
+                .concurrency
+                .acquire(&manager.state, &control)
+                .await
+                .unwrap()
+                .expect("process worker should acquire the only slot")
+        });
+        let worker_control = Arc::clone(&control);
+        let worker = std::thread::spawn(move || {
+            let outcome = run_supervised(&spec, &worker_control);
+            drop(slot);
+            outcome
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (!ready_path.exists()
+            || !descendant_pid_path.exists()
+            || !descendant_ready_path.exists())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready_path.exists() && descendant_pid_path.exists() && descendant_ready_path.exists(),
+            "local child and descendant did not start"
+        );
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 1);
+
+        control.request_pause();
+        let outcome = worker
+            .join()
+            .unwrap()
+            .expect("supervisor should return pause");
+        assert!(matches!(outcome, ProcessOutcome::Paused { .. }));
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 0);
+
+        let acquired_by_waiting = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                manager.concurrency.acquire(&manager.state, &queued_control),
+            )
+            .await
+        })
+        .expect("waiting worker should acquire the released slot immediately")
+        .unwrap();
+        assert!(acquired_by_waiting.is_some());
+
+        let descendant = std::fs::read_to_string(&descendant_pid_path)
+            .expect("fixture should record descendant PID")
+            .parse::<u32>()
+            .unwrap();
+        assert_process_terminated(descendant);
+        let _ = std::fs::remove_file(&ready_path);
+        let _ = std::fs::remove_file(descendant_pid_path);
+        let _ = std::fs::remove_file(descendant_ready_path);
+    }
+
+    #[test]
+    fn cancelled_entry_cannot_transition_to_completed() {
+        let mut entry = DownloadEntry {
+            id: "cancelled-race".into(),
+            url: "https://example.test/video.mp4".into(),
+            destination: "video.mp4".into(),
+            filename: "video.mp4".into(),
+            status: DownloadStatus::Cancelled,
+            total_bytes: None,
+            downloaded_bytes: 0,
+            speed_bytes_per_second: 0.0,
+            elapsed_ms: 0,
+            remaining_seconds: None,
+            error: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            attempts: 1,
+            hls_playlist: None,
+            hls_completed_parts: None,
+            website_media: None,
+            etag: None,
+            last_modified: None,
+            notifications_enabled: false,
+            notify_on_complete: false,
+            notify_on_failure: false,
+        };
+        assert!(transition(&mut entry, DownloadStatus::Completed).is_err());
+        assert_eq!(entry.status, DownloadStatus::Cancelled);
+    }
 
     fn mp4_atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut atom = Vec::with_capacity(payload.len() + 8);
@@ -3016,6 +4384,96 @@ mod tests {
     fn validate_mp4_bytes(bytes: Vec<u8>) -> Mp4Validation {
         let length = bytes.len() as u64;
         validate_mp4_reader(&mut Cursor::new(bytes), length).unwrap()
+    }
+
+    #[test]
+    fn rejects_unranged_media_responses_that_are_http_partial_content() {
+        assert!(validate_unranged_media_response(StatusCode::OK, None, None).is_ok());
+        assert!(
+            validate_unranged_media_response(StatusCode::PARTIAL_CONTENT, None, Some(10400))
+                .is_err()
+        );
+        assert!(
+            validate_unranged_media_response(
+                StatusCode::PARTIAL_CONTENT,
+                Some("bytes 0-10399/847392"),
+                Some(10400),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_unranged_media_response(
+                StatusCode::PARTIAL_CONTENT,
+                Some("bytes 0-99/100"),
+                Some(100),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_unranged_media_response(
+                StatusCode::PARTIAL_CONTENT,
+                Some("bytes 0-99/100"),
+                Some(99),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_unranged_media_response(StatusCode::OK, Some("bytes 0-99/100"), Some(100),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_instagram_reel_and_story_byte_range_urls_before_queueing() {
+        for url in [
+            "https://scontent.cdninstagram.com/v/t51/reel.mp4?bytestart=0&byteend=10399&token=private",
+            "https://instagram.fdac5-1.fna.fbcdn.net/v/t51/story.mp4?signature=private&bytestart=0&byteend=10399",
+        ] {
+            let parsed = validated_download_url(url).unwrap();
+            assert!(is_instagram_byte_range_url(&parsed));
+        }
+        assert!(!is_instagram_byte_range_url(
+            &validated_download_url("https://cdn.example/video.mp4?bytestart=0&byteend=10399")
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn rejects_observed_10400_byte_instagram_reel_and_story_fragments() {
+        let mut fragment_header = mp4_atom(b"mfhd", &[0; 8]);
+        fragment_header.extend(mp4_atom(b"traf", &{
+            let mut track = mp4_atom(b"tfhd", &[0; 8]);
+            track.extend(mp4_atom(b"trun", &[0; 8]));
+            track
+        }));
+        let moof = mp4_atom(b"moof", &fragment_header);
+        let mdat_payload_len = 10_400 - moof.len() - 8;
+        let mut reels_fragment = moof.clone();
+        reels_fragment.extend(mp4_atom(b"mdat", &vec![0; mdat_payload_len]));
+        assert_eq!(reels_fragment.len(), 10_400);
+
+        for (name, url) in [
+            (
+                "Instagram_Reel.mp4.fluxnet-part",
+                "https://scontent.cdninstagram.com/v/t51/reel.mp4?signature=private",
+            ),
+            (
+                "Instagram_Story.mp4.fluxnet-part",
+                "https://instagram.fdac5-1.fna.fbcdn.net/v/t51/story.mp4?signature=private",
+            ),
+        ] {
+            let partial = write_temp_download_file(name, &reels_fragment);
+            let error = validate_mp4_completion(
+                &partial,
+                Path::new("Instagram_Video.mp4"),
+                url,
+                Some("video/mp4"),
+            )
+            .unwrap_err();
+            assert!(error.contains("fragmented MP4 without its required initialization segment"));
+            assert_eq!(std::fs::metadata(&partial).unwrap().len(), 10_400);
+            std::fs::remove_file(partial).unwrap();
+        }
     }
 
     #[test]
@@ -3697,6 +5155,823 @@ mod tests {
         assert_eq!(parse_content_range("bytes 100-100/100"), None);
         assert_eq!(parse_content_range("items 100-199/1000"), None);
         assert_eq!(parse_content_range("bytes */1000"), None);
+    }
+
+    fn sample_website_catalog() -> crate::media::yt_dlp::VideoDiscovery {
+        crate::media::yt_dlp::VideoDiscovery {
+            title: "Website Clip".into(),
+            duration_seconds: Some(15.0),
+            extractor: "ExampleSite".into(),
+            formats: vec![
+                crate::media::yt_dlp::DiscoveredFormat {
+                    format_id: "muxed-mp4".into(),
+                    resolution: Some("1280x720".into()),
+                    height: Some(720),
+                    fps: Some(30.0),
+                    video_codec: Some("avc1".into()),
+                    audio_codec: Some("mp4a".into()),
+                    container: Some("mp4".into()),
+                    file_size: Some(1024),
+                    has_video: true,
+                    has_audio: true,
+                    requires_separate_audio: false,
+                },
+                crate::media::yt_dlp::DiscoveredFormat {
+                    format_id: "split-1080".into(),
+                    resolution: Some("1920x1080".into()),
+                    height: Some(1080),
+                    fps: Some(60.0),
+                    video_codec: Some("avc1".into()),
+                    audio_codec: Some("none".into()),
+                    container: Some("mp4".into()),
+                    file_size: Some(2048),
+                    has_video: true,
+                    has_audio: false,
+                    requires_separate_audio: true,
+                },
+            ],
+            best_available: true,
+        }
+    }
+
+    fn valid_mp4_with_handlers(handlers: &[&[u8; 4]]) -> Vec<u8> {
+        let sample_table = {
+            let mut stbl = mp4_atom(b"stsd", &[0; 8]);
+            stbl.extend(mp4_atom(b"stts", &[0; 4]));
+            stbl.extend(mp4_atom(b"stsc", &[0; 4]));
+            stbl.extend(mp4_atom(b"stsz", &[0; 8]));
+            stbl.extend(mp4_atom(b"stco", &[0; 8]));
+            mp4_atom(b"stbl", &stbl)
+        };
+        let minf = mp4_atom(b"minf", &sample_table);
+        let track_with_handler = |handler_type: &[u8; 4]| {
+            let mut hdlr_payload = vec![0u8; 8];
+            hdlr_payload.extend_from_slice(handler_type);
+            let mut mdia = mp4_atom(b"mdhd", &[0; 8]);
+            mdia.extend(mp4_atom(b"hdlr", &hdlr_payload));
+            mdia.extend(&minf);
+            mp4_atom(b"trak", &mp4_atom(b"mdia", &mdia))
+        };
+        let mut moov = mp4_atom(b"mvhd", &[0; 8]);
+        for handler in handlers {
+            moov.extend(track_with_handler(handler));
+        }
+        let mut bytes = mp4_atom(b"ftyp", b"isom\0\0\0\0isom");
+        bytes.extend(mp4_atom(b"moov", &moov));
+        bytes.extend(mp4_atom(b"mdat", &[0; 16]));
+        bytes
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn website_download_validates_strict_muxed_mp4_tracks() {
+        let valid_path = write_temp_download_file(
+            "website-muxed.mp4",
+            &valid_mp4_with_handlers(&[b"vide", b"soun"]),
+        );
+        assert!(validate_ytdlp_mp4(&valid_path).is_ok());
+        assert!(validate_ytdlp_media(&valid_path).is_ok());
+        std::fs::remove_file(valid_path).unwrap();
+
+        let single_track_path =
+            write_temp_download_file("website-single.mp4", &valid_mp4_with_handlers(&[b"vide"]));
+        let err = validate_ytdlp_mp4(&single_track_path).unwrap_err();
+        assert!(err.contains("both audio and video tracks"));
+        std::fs::remove_file(single_track_path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn website_download_integrates_with_queue_concurrency_and_failure_lifecycle() {
+        let manager = DownloadManager::default();
+        let hold_control = Arc::new(DownloadTaskControl::default());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.max_concurrent = 1;
+        }
+        let held_slot = tauri::async_runtime::block_on(async {
+            manager
+                .concurrency
+                .acquire(&manager.state, &hold_control)
+                .await
+                .unwrap()
+                .expect("should hold the single concurrency slot")
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-website-queue-test-{}-{}",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("clip.mp4");
+        let exe = std::env::var_os("ComSpec")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+        let catalog = sample_website_catalog();
+
+        let mismatch = manager.start_website_download(
+            None,
+            "https://example.test/watch?v=1".into(),
+            dir.join("clip.webm").to_string_lossy().into_owned(),
+            exe.clone(),
+            catalog.clone(),
+            crate::media::yt_dlp::FormatSelection::BestAvailable,
+        );
+        assert!(mismatch.is_err());
+
+        let entry = manager
+            .start_website_download(
+                None,
+                "https://example.test/watch?v=1".into(),
+                dest.to_string_lossy().into_owned(),
+                exe,
+                catalog,
+                crate::media::yt_dlp::FormatSelection::BestAvailable,
+            )
+            .expect("website download should queue inside DownloadManager");
+
+        assert_eq!(entry.status, DownloadStatus::Queued);
+        assert_eq!(
+            entry.website_media,
+            Some(WebsiteMediaInfo {
+                format_id: "best[ext=mp4]".into(),
+                container: "mp4".into(),
+                height: Some(720),
+            })
+        );
+
+        std::thread::sleep(Duration::from_millis(40));
+        let snapshot = manager.snapshot().unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot[0].status,
+            DownloadStatus::Queued,
+            "website worker must wait for the DownloadManager concurrency slot"
+        );
+
+        drop(held_slot);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let current = manager.snapshot().unwrap();
+            if current[0].status.is_terminal() {
+                assert_eq!(current[0].status, DownloadStatus::Failed);
+                assert!(current[0].error.is_some());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "website worker did not transition to terminal state"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert_eq!(
+            manager.concurrency.active.load(Ordering::Acquire),
+            0,
+            "terminal website task must release its concurrency slot"
+        );
+        assert_eq!(
+            manager.worker_count.load(Ordering::Acquire),
+            0,
+            "terminal website task must decrement worker_count"
+        );
+        assert!(
+            !manager
+                .state
+                .lock()
+                .unwrap()
+                .controls
+                .contains_key(&entry.id),
+            "terminal website task must remove its control handle"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "failed website task must clean up temporary staging directories"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn website_download_cancelled_while_queued_never_becomes_completed_and_releases_slot() {
+        let manager = DownloadManager::default();
+        let hold_control = Arc::new(DownloadTaskControl::default());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.max_concurrent = 1;
+        }
+        let held_slot = tauri::async_runtime::block_on(async {
+            manager
+                .concurrency
+                .acquire(&manager.state, &hold_control)
+                .await
+                .unwrap()
+                .expect("should hold the single concurrency slot")
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-website-cancel-test-{}-{}",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("cancel.mp4");
+        let exe = std::env::var_os("ComSpec")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+        let catalog = sample_website_catalog();
+
+        let entry = manager
+            .start_website_download(
+                None,
+                "https://example.test/watch?v=cancel".into(),
+                dest.to_string_lossy().into_owned(),
+                exe,
+                catalog,
+                crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+            )
+            .unwrap();
+
+        let (workers, cancelled_count) = cancel_all_downloads(&manager).unwrap();
+        assert_eq!(cancelled_count, 1);
+        drop(held_slot);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while workers.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(workers.load(Ordering::Acquire), 0);
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 0);
+
+        let snapshot = manager.snapshot().unwrap();
+        assert_eq!(snapshot[0].id, entry.id);
+        assert_eq!(snapshot[0].status, DownloadStatus::Cancelled);
+        assert!(!dest.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn website_download_rejects_pause_resume_and_retry_and_supports_direct_cancellation() {
+        let manager = DownloadManager::default();
+        let hold_control = Arc::new(DownloadTaskControl::default());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.max_concurrent = 1;
+        }
+        let held_slot = tauri::async_runtime::block_on(async {
+            manager
+                .concurrency
+                .acquire(&manager.state, &hold_control)
+                .await
+                .unwrap()
+                .expect("should hold the single concurrency slot")
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-website-lifecycle-test-{}-{}",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("lifecycle.mp4");
+        let exe = std::env::var_os("ComSpec")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+        let catalog = sample_website_catalog();
+
+        let entry = manager
+            .start_website_download(
+                None,
+                "https://example.test/watch?v=lifecycle".into(),
+                dest.to_string_lossy().into_owned(),
+                exe.clone(),
+                catalog.clone(),
+                crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+            )
+            .unwrap();
+
+        let control = {
+            let state = manager.state.lock().unwrap();
+            let stored = state.entries.iter().find(|e| e.id == entry.id).unwrap();
+            assert!(stored.website_media.is_some());
+            Arc::clone(state.controls.get(&entry.id).unwrap())
+        };
+
+        control.request_cancel();
+        drop(held_slot);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while manager.worker_count.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(manager.worker_count.load(Ordering::Acquire), 0);
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 0);
+
+        let snapshot = manager.snapshot().unwrap();
+        assert_eq!(snapshot[0].status, DownloadStatus::Cancelled);
+
+        // Verify direct run_ytdlp_download_worker helper also respects pre-cancelled control
+        let second_entry = {
+            let mut state = manager.state.lock().unwrap();
+            let second_id = "website-direct-helper-cancel".to_owned();
+            let second_control = Arc::new(DownloadTaskControl::default());
+            second_control.request_cancel();
+            let e = DownloadEntry {
+                id: second_id.clone(),
+                url: "https://example.test/watch?v=helper".into(),
+                destination: dir.join("helper.mp4").to_string_lossy().into_owned(),
+                filename: "helper.mp4".into(),
+                status: DownloadStatus::Queued,
+                total_bytes: None,
+                downloaded_bytes: 0,
+                speed_bytes_per_second: 0.0,
+                elapsed_ms: 0,
+                remaining_seconds: None,
+                error: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                attempts: 1,
+                hls_playlist: None,
+                hls_completed_parts: None,
+                website_media: Some(WebsiteMediaInfo {
+                    format_id: "muxed-mp4".into(),
+                    container: "mp4".into(),
+                    height: Some(720),
+                }),
+                etag: None,
+                last_modified: None,
+                notifications_enabled: false,
+                notify_on_complete: false,
+                notify_on_failure: false,
+            };
+            state.entries.push(e.clone());
+            state
+                .controls
+                .insert(second_id, Arc::clone(&second_control));
+            (e, second_control)
+        };
+        tauri::async_runtime::block_on(async {
+            manager
+                .run_ytdlp_download_worker(
+                    None,
+                    &second_entry.0.id,
+                    exe,
+                    catalog,
+                    crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+                    &second_entry.1,
+                )
+                .await
+                .unwrap();
+        });
+        let snapshot = manager.snapshot().unwrap();
+        let helper_entry = snapshot.iter().find(|e| e.id == second_entry.0.id).unwrap();
+        assert_eq!(helper_entry.status, DownloadStatus::Cancelled);
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn website_download_supports_multiple_pause_resume_cycles_slot_release_and_elapsed_preservation()
+     {
+        let manager = DownloadManager::default();
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.max_concurrent = 1;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-website-pause-resume-cycles-{}-{}",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("cycles.mp4");
+        let partial = partial_path(&dest);
+        let exe = std::env::current_exe().unwrap();
+        let catalog = sample_website_catalog();
+
+        let entry = manager
+            .start_website_download(
+                None,
+                "https://example.test/fixture-pause-resume".into(),
+                dest.to_string_lossy().into_owned(),
+                exe,
+                catalog,
+                crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+            )
+            .unwrap();
+
+        // Wait for first progress report (downloaded_bytes == 32, status == Downloading)
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = manager.snapshot().unwrap();
+            if snap[0].status == DownloadStatus::Downloading && snap[0].downloaded_bytes == 32 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "did not reach first 32-byte downloading checkpoint"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        // Cycle 1: Downloading -> Paused
+        manager.pause_download(&entry.id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let first_elapsed = loop {
+            let snap = manager.snapshot().unwrap();
+            if snap[0].status == DownloadStatus::Paused
+                && manager.worker_count.load(Ordering::Acquire) == 0
+            {
+                assert_eq!(snap[0].downloaded_bytes, 32);
+                assert_eq!(snap[0].speed_bytes_per_second, 0.0);
+                assert!(snap[0].remaining_seconds.is_none());
+                assert!(snap[0].elapsed_ms > 0);
+                break snap[0].elapsed_ms;
+            }
+            assert!(Instant::now() < deadline, "did not transition to Paused");
+            std::thread::sleep(Duration::from_millis(15));
+        };
+        assert_eq!(
+            manager.concurrency.active.load(Ordering::Acquire),
+            0,
+            "paused website download must release its concurrency slot"
+        );
+        assert!(partial.is_file());
+        assert_eq!(std::fs::metadata(&partial).unwrap().len(), 32);
+
+        // Hold the slot before resuming to verify Paused -> Queued transition waits for the slot
+        let hold_control = Arc::new(DownloadTaskControl::default());
+        let held_slot = tauri::async_runtime::block_on(async {
+            manager
+                .concurrency
+                .acquire(&manager.state, &hold_control)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+
+        manager.resume_download(None, &entry.id).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let snap = manager.snapshot().unwrap();
+        assert_eq!(snap[0].status, DownloadStatus::Queued);
+        assert_eq!(snap[0].attempts, 2);
+        assert_eq!(snap[0].downloaded_bytes, 32);
+        assert_eq!(snap[0].elapsed_ms, first_elapsed);
+
+        // Release slot so worker transitions Queued -> Downloading and reaches 64 bytes
+        drop(held_slot);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = manager.snapshot().unwrap();
+            if snap[0].status == DownloadStatus::Downloading && snap[0].downloaded_bytes == 64 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "did not reach second 64-byte downloading checkpoint"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        // Cycle 2: Downloading -> Paused
+        manager.pause_download(&entry.id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let second_elapsed = loop {
+            let snap = manager.snapshot().unwrap();
+            if snap[0].status == DownloadStatus::Paused
+                && manager.worker_count.load(Ordering::Acquire) == 0
+            {
+                assert_eq!(snap[0].downloaded_bytes, 64);
+                assert_eq!(snap[0].speed_bytes_per_second, 0.0);
+                assert!(snap[0].remaining_seconds.is_none());
+                assert!(
+                    snap[0].elapsed_ms > first_elapsed,
+                    "elapsed_ms must accumulate across pause/resume cycles"
+                );
+                break snap[0].elapsed_ms;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "did not transition to Paused on second cycle"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        };
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 0);
+        assert_eq!(std::fs::metadata(&partial).unwrap().len(), 64);
+
+        // Cycle 3: Paused -> Queued -> Downloading -> Completed
+        manager.resume_download(None, &entry.id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = manager.snapshot().unwrap();
+            if snap[0].status == DownloadStatus::Completed
+                && manager.worker_count.load(Ordering::Acquire) == 0
+            {
+                assert_eq!(snap[0].attempts, 3);
+                assert!(snap[0].elapsed_ms > second_elapsed);
+                assert!(snap[0].downloaded_bytes > 64);
+                assert_eq!(snap[0].total_bytes, Some(snap[0].downloaded_bytes));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "did not complete after second resume: {:?}",
+                snap[0]
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(dest.is_file());
+        assert!(!partial.exists());
+        validate_ytdlp_mp4(&dest).unwrap();
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn website_download_cancel_while_paused_and_pause_followed_by_cancel_clean_up_partial_files() {
+        let manager = DownloadManager::default();
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-website-pause-cancel-{}-{}",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let catalog = sample_website_catalog();
+
+        // 1. Cancel while Paused via cancel_download removes .fluxnet-part
+        let dest1 = dir.join("cancel-paused.mp4");
+        let part1 = partial_path(&dest1);
+        let entry1 = manager
+            .start_website_download(
+                None,
+                "https://example.test/fixture-pause-resume".into(),
+                dest1.to_string_lossy().into_owned(),
+                exe.clone(),
+                catalog.clone(),
+                crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while manager.snapshot().unwrap()[0].downloaded_bytes != 32 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        manager.pause_download(&entry1.id).unwrap();
+        while (manager.snapshot().unwrap()[0].status != DownloadStatus::Paused
+            || manager.worker_count.load(Ordering::Acquire) > 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(part1.is_file());
+
+        manager.cancel_download(None, &entry1.id).unwrap();
+        let snap = manager.snapshot().unwrap();
+        assert_eq!(snap[0].status, DownloadStatus::Cancelled);
+        assert!(
+            !part1.exists(),
+            "cancelling a paused website download must remove its .fluxnet-part file"
+        );
+
+        // 2. Pause followed immediately by cancel while still Downloading: cancellation wins and cleans up .fluxnet-part
+        let dest2 = dir.join("pause-then-cancel.mp4");
+        let part2 = partial_path(&dest2);
+        let entry2 = manager
+            .start_website_download(
+                None,
+                "https://example.test/fixture-pause-resume".into(),
+                dest2.to_string_lossy().into_owned(),
+                exe.clone(),
+                catalog.clone(),
+                crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while manager
+            .snapshot()
+            .unwrap()
+            .iter()
+            .find(|e| e.id == entry2.id)
+            .unwrap()
+            .downloaded_bytes
+            != 32
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        manager.pause_download(&entry2.id).unwrap();
+        manager.cancel_download(None, &entry2.id).unwrap();
+
+        while manager.worker_count.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let e2 = manager
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == entry2.id)
+            .unwrap();
+        assert_eq!(e2.status, DownloadStatus::Cancelled);
+        assert!(!dest2.exists());
+        assert!(
+            !part2.exists(),
+            "pause followed by cancel must clean up .fluxnet-part"
+        );
+
+        // 3. Cancel while Paused via cancel_all_downloads removes .fluxnet-part
+        let dest3 = dir.join("cancel-all-paused.mp4");
+        let part3 = partial_path(&dest3);
+        let entry3 = manager
+            .start_website_download(
+                None,
+                "https://example.test/fixture-pause-resume".into(),
+                dest3.to_string_lossy().into_owned(),
+                exe,
+                catalog,
+                crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while manager
+            .snapshot()
+            .unwrap()
+            .iter()
+            .find(|e| e.id == entry3.id)
+            .unwrap()
+            .downloaded_bytes
+            != 32
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        manager.pause_download(&entry3.id).unwrap();
+        while (manager
+            .snapshot()
+            .unwrap()
+            .iter()
+            .find(|e| e.id == entry3.id)
+            .unwrap()
+            .status
+            != DownloadStatus::Paused
+            || manager.worker_count.load(Ordering::Acquire) > 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(part3.is_file());
+
+        cancel_all_downloads(&manager).unwrap();
+        let e3 = manager
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == entry3.id)
+            .unwrap();
+        assert_eq!(e3.status, DownloadStatus::Cancelled);
+        assert!(
+            !part3.exists(),
+            "cancel_all_downloads must remove paused website .fluxnet-part file"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn website_download_cancel_racing_with_completion_never_becomes_completed_and_cleans_up() {
+        let manager = DownloadManager::default();
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-website-cancel-complete-race-{}-{}",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("race.mp4");
+        let part = partial_path(&dest);
+        let exe = std::env::current_exe().unwrap();
+        let catalog = sample_website_catalog();
+
+        let entry = manager
+            .start_website_download(
+                None,
+                "https://example.test/fixture-fast-complete".into(),
+                dest.to_string_lossy().into_owned(),
+                exe,
+                catalog,
+                crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while manager.snapshot().unwrap()[0].downloaded_bytes != 100 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        manager.cancel_download(None, &entry.id).unwrap();
+
+        while manager.worker_count.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let snap = manager.snapshot().unwrap();
+        assert_eq!(snap[0].status, DownloadStatus::Cancelled);
+        assert!(
+            !dest.exists(),
+            "cancelled race must not leave final destination"
+        );
+        assert!(!part.exists(), "cancelled race must not leave partial file");
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tauri_website_download_wiring_resolves_verified_executable_and_serializes_ipc_types() {
+        let manager = DownloadManager::default();
+        let catalog = crate::media::yt_dlp::retain_muxed_formats(sample_website_catalog()).unwrap();
+        assert_eq!(catalog.formats.len(), 1);
+        assert_eq!(catalog.formats[0].format_id, "muxed-mp4");
+
+        // Verify IPC JSON round-trip for catalog and format selections
+        let catalog_json = serde_json::to_string(&catalog).unwrap();
+        let parsed_catalog: crate::media::yt_dlp::VideoDiscovery =
+            serde_json::from_str(&catalog_json).unwrap();
+        assert_eq!(parsed_catalog, catalog);
+
+        let selection: crate::media::yt_dlp::FormatSelection =
+            serde_json::from_str("{\"exact\":\"muxed-mp4\"}").unwrap();
+        assert_eq!(
+            selection,
+            crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into())
+        );
+
+        // Reject invalid URL, invalid selection, and extension mismatch before queueing
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-phase4a-wiring-{}-{}",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bad_url_err = manager
+            .start_website_download_verified(
+                None,
+                "http://127.0.0.1/private".into(),
+                dir.join("clip.mp4").to_string_lossy().into_owned(),
+                parsed_catalog.clone(),
+                selection.clone(),
+            )
+            .unwrap_err();
+        assert!(bad_url_err.contains("Invalid public website URL"));
+        assert!(!bad_url_err.contains("yt-dlp.exe"));
+
+        let bad_sel_err = manager
+            .start_website_download_verified(
+                None,
+                "https://example.test/watch?v=1".into(),
+                dir.join("clip.mp4").to_string_lossy().into_owned(),
+                parsed_catalog.clone(),
+                crate::media::yt_dlp::FormatSelection::Exact("missing-id".into()),
+            )
+            .unwrap_err();
+        assert!(bad_sel_err.contains("not returned by discovery"));
+
+        if let Ok(verified_exe) = manager.resolve_verified_ytdlp_executable(None) {
+            let reused_exe = manager.resolve_verified_ytdlp_executable(None).unwrap();
+            assert_eq!(verified_exe, reused_exe);
+
+            let ext_mismatch = manager
+                .start_website_download_verified(
+                    None,
+                    "https://example.test/watch?v=1".into(),
+                    dir.join("clip.webm").to_string_lossy().into_owned(),
+                    parsed_catalog,
+                    selection,
+                )
+                .unwrap_err();
+            assert!(ext_mismatch.contains("does not match the selected format container"));
+            assert!(
+                !ext_mismatch.contains(&verified_exe.to_string_lossy().as_ref()),
+                "error message must never leak the executable path"
+            );
+        }
+
+        let entry_info = WebsiteMediaInfo {
+            format_id: "muxed-mp4".into(),
+            container: "mp4".into(),
+            height: Some(720),
+        };
+        let info_json = serde_json::to_string(&entry_info).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WebsiteMediaInfo>(&info_json).unwrap(),
+            entry_info
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

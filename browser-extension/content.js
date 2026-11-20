@@ -16,6 +16,38 @@ const sentCandidateUrls = new Set();
 const candidateRegistrations = new Map();
 const registrationFailures = new Map();
 const downloadGestureTracker = globalThis.FluxNetDownloadGesture.createDownloadGestureTracker();
+/* DEV_DIAGNOSTICS_START */
+const overlayDiagnosticIds = new WeakMap();
+let nextOverlayDiagnosticId = 1;
+function overlayDiagnostic(event, details = {}) {
+  if (globalThis.__FLUXNET_OVERLAY_DIAGNOSTICS__ !== true) return;
+  console.debug("[FluxNet overlay diagnostic]", {
+    event,
+    time: performance.now(),
+    ...(typeof details === "function" ? details() : details),
+  });
+}
+function overlayVideoId(video) {
+  if (!video) return null;
+  if (!overlayDiagnosticIds.has(video)) overlayDiagnosticIds.set(video, `video-${nextOverlayDiagnosticId++}`);
+  return overlayDiagnosticIds.get(video);
+}
+function diagnosticUrlIdentity(rawUrl) {
+  try {
+    const url = new URL(rawUrl, location.href);
+    url.search = "";
+    url.hash = "";
+    return url.href;
+  } catch {
+    return String(rawUrl || "").split(/[?#]/, 1)[0];
+  }
+}
+function diagnosticRect(element) {
+  const rect = element.getBoundingClientRect();
+  return { x: rect.x, y: rect.y, top: rect.top, right: rect.right, bottom: rect.bottom,
+    left: rect.left, width: rect.width, height: rect.height };
+}
+/* DEV_DIAGNOSTICS_END */
 let refreshQueued = false;
 let positionQueued = false;
 const videoResizeObserver = new ResizeObserver(() => schedulePositionOverlays());
@@ -197,6 +229,25 @@ function registrationState(url) {
   };
 }
 
+function sameMediaResourceUrl(leftValue, rightValue) {
+  try {
+    const left = new URL(leftValue);
+    const right = new URL(rightValue);
+    const isInstagramCdn = (url) => url.hostname === "cdninstagram.com"
+      || url.hostname.endsWith(".cdninstagram.com")
+      || url.hostname === "fbcdn.net" || url.hostname.endsWith(".fbcdn.net");
+    left.hash = "";
+    right.hash = "";
+    if (isInstagramCdn(left) && isInstagramCdn(right)) {
+      left.search = "";
+      right.search = "";
+    }
+    return left.href === right.href;
+  } catch {
+    return false;
+  }
+}
+
 function retrySelectedSourceRegistration(overlay) {
   const source = overlay.availableSources.find((item) => item.url === overlay.quality.value);
   if (!source || source.registered || source.pending) return;
@@ -322,6 +373,28 @@ function updateSelector(overlay) {
 }
 
 function positionOverlays() {
+  /* DEV_DIAGNOSTICS_START */
+  overlayDiagnostic("positionOverlays", () => ({
+    overlays: [...overlays].map(([video, overlay]) => ({
+      video: overlayVideoId(video), url: diagnosticUrlIdentity(overlay.url), rect: diagnosticRect(video),
+      hostHidden: overlay.host.hidden,
+      hostRect: diagnosticRect(overlay.host),
+      hitStack: document.elementsFromPoint(
+        overlay.host.getBoundingClientRect().left + overlay.host.getBoundingClientRect().width / 2,
+        overlay.host.getBoundingClientRect().top + overlay.host.getBoundingClientRect().height / 2,
+      ).slice(0, 6).map((element) => ({
+        tag: element.tagName, id: element.id || "", className: typeof element.className === "string" ? element.className.slice(0, 120) : "",
+        text: (element.innerText || element.getAttribute("aria-label") || "").trim().slice(0, 120),
+        fluxNetHost: element.matches?.('[data-fluxnet-video-overlay="true"]') || false,
+      })),
+    })),
+    visiblePageControls: [...document.querySelectorAll('button, [role="button"]')].map((element) => ({
+      text: (element.innerText || element.getAttribute("aria-label") || "").trim().slice(0, 120),
+      rect: diagnosticRect(element),
+      fluxNetHost: Boolean(element.closest('[data-fluxnet-video-overlay="true"]')),
+    })).filter(({ rect }) => rect.width > 0 && rect.height > 0),
+  }));
+  /* DEV_DIAGNOSTICS_END */
   for (const video of trackedVideos) {
     if (!video.isConnected) {
       trackedVideos.delete(video);
@@ -331,6 +404,9 @@ function positionOverlays() {
   }
   for (const [video, overlay] of overlays) {
     if (!video.isConnected || !settings.videoOverlay) {
+      /* DEV_DIAGNOSTICS_START */
+      overlayDiagnostic("host-remove", () => ({ video: overlayVideoId(video), url: diagnosticUrlIdentity(overlay.url), rect: diagnosticRect(video) }));
+      /* DEV_DIAGNOSTICS_END */
       overlay.host.remove();
       overlays.delete(video);
       continue;
@@ -367,6 +443,22 @@ function schedulePositionOverlays() {
 }
 
 function addPlayerOverlay(video, url, mimeType = "", metadata = {}) {
+  /* DEV_DIAGNOSTICS_START */
+  overlayDiagnostic("addPlayerOverlay", () => {
+    const sameVisualPlayers = [...overlays].filter(([otherVideo]) => {
+    if (otherVideo === video) return false;
+    const left = diagnosticRect(otherVideo);
+    const right = diagnosticRect(video);
+    return left.width > 0 && left.height > 0 && left.x === right.x && left.y === right.y
+      && left.width === right.width && left.height === right.height;
+    }).map(([otherVideo, otherOverlay]) => ({ video: overlayVideoId(otherVideo), url: diagnosticUrlIdentity(otherOverlay.url) }));
+    return {
+      video: overlayVideoId(video), url: diagnosticUrlIdentity(url),
+      callSource: new Error().stack?.split("\n").slice(1, 5).map((line) => line.trim()),
+      existingOverlay: overlays.has(video), sameVisualPlayers,
+    };
+  });
+  /* DEV_DIAGNOSTICS_END */
   if (!settings.videoOverlay || !video?.isConnected || video.videoWidth <= 0 || video.videoHeight <= 0) return false;
   const classified = classifyMediaUrl(url, mimeType);
   if (!classified) return false;
@@ -460,6 +552,9 @@ function addPlayerOverlay(video, url, mimeType = "", metadata = {}) {
     });
     document.documentElement.append(host);
     overlays.set(video, overlay);
+    /* DEV_DIAGNOSTICS_START */
+    overlayDiagnostic("host-create", () => ({ video: overlayVideoId(video), url: diagnosticUrlIdentity(classified.url), hostCount: document.querySelectorAll('[data-fluxnet-video-overlay="true"]').length }));
+    /* DEV_DIAGNOSTICS_END */
   }
   const urlChanged = overlay.url !== classified.url;
   if (urlChanged) {
@@ -682,6 +777,19 @@ document.addEventListener("click", (event) => {
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "fluxnet:collect") scheduleScan();
+  if (message?.type === "fluxnet:resource-rejected" && typeof message.url === "string") {
+    const reason = String(message.reason || "FluxNet rejected this incomplete media response.").slice(0, 240);
+    registrationFailures.set(message.url, reason);
+    for (const overlay of overlays.values()) {
+      const source = overlay.availableSources.find((item) => sameMediaResourceUrl(item.url, message.url));
+      if (!source) continue;
+      source.registered = false;
+      source.pending = false;
+      source.registrationError = reason;
+      if (sameMediaResourceUrl(overlay.url, message.url)) overlay.message = reason;
+      updateSelector(overlay);
+    }
+  }
   if (message?.type === "fluxnet:resource-confirmed") {
     const confirmed = classifyMediaUrl(message.url, message.mimeType || "");
     if (confirmed?.downloadable) {

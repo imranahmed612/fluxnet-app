@@ -11,6 +11,7 @@ import {
   downloadResourceIdentity,
   hasPendingDownloadPrompt,
   isEligibleDownload,
+  isPartialMediaResponse,
   isExcludedDomain,
   normalizeSettings,
   parseDashManifest,
@@ -28,10 +29,15 @@ const MAX_RECONNECT_ATTEMPTS = 6;
 const RECONNECT_ALARM = "fluxnet-native-reconnect";
 const HEALTH_ALARM = "fluxnet-native-health-check";
 const processingMedia = new Map();
+const partialMediaResponses = new Set();
 const processingDownloadKeys = new Set();
 let promptCreationQueue = Promise.resolve();
 let userDownloadIntentQueue = Promise.resolve();
 let downloadIdClaimQueue = Promise.resolve();
+
+function partialMediaResponseKey(tabId, url) {
+  return `${tabId}:${browserMediaIdentity({ url, mediaType: "mp4" }) || url}`;
+}
 
 function enqueueDownloadIntent(operation) {
   const task = userDownloadIntentQueue.then(operation);
@@ -105,6 +111,7 @@ async function updateBadge(count) {
 
 async function rememberResource(resource) {
   const { detectedResources = [] } = await chrome.storage.local.get("detectedResources");
+  if (partialMediaResponses.has(partialMediaResponseKey(resource.tabId, resource.url))) return false;
   const next = deduplicateResources([resource, ...detectedResources]).slice(0, RESOURCE_LIMIT);
   await chrome.storage.local.set({ detectedResources: next });
   await updateBadge(next.length);
@@ -201,6 +208,7 @@ async function detectMedia(candidate, sender) {
   if (!Number.isInteger(sender.tab?.id) || sender.tab.id < 0) return false;
   const settings = await getSettings();
   if (!settings.automaticVideoDetection) return false;
+  if (partialMediaResponses.has(partialMediaResponseKey(sender.tab.id, candidate.url))) return false;
   const classified = classifyMediaUrl(candidate.url, candidate.mimeType, candidate.playableVideo === true);
   if (!classified) return false;
   const mediaKey = `${sender.tab.id}:${classified.url}`;
@@ -280,6 +288,7 @@ async function processMediaCandidate(candidate, sender, classified, processing, 
   }
   if (!classified.downloadable && !resource.downloadable && !resource.fromPlayer
     && !resource.manifestVariants.some((variant) => variant.video === true)) return false;
+  if (partialMediaResponses.has(partialMediaResponseKey(sender.tab.id, candidate.url))) return false;
   if (resource.downloadable && !validateMediaMessage(resource)) {
     throw new Error("The detected video source did not pass validation.");
   }
@@ -287,6 +296,7 @@ async function processMediaCandidate(candidate, sender, classified, processing, 
     throw new Error("The detected video source did not pass validation.");
   }
   const isNew = await rememberResource(resource);
+  if (partialMediaResponses.has(partialMediaResponseKey(sender.tab.id, candidate.url))) return false;
   if (isNew) {
     void chrome.runtime.sendMessage({ type: "fluxnet:resource-updated" }).catch((error) => {
       console.debug("FluxNet popup is not open to receive the new resource:", error);
@@ -553,6 +563,28 @@ chrome.webRequest.onBeforeRequest.addListener(
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0) return;
+    if (isPartialMediaResponse(details.url, details.statusCode, details.responseHeaders || [])) {
+      const key = partialMediaResponseKey(details.tabId, details.url);
+      partialMediaResponses.add(key);
+      if (partialMediaResponses.size > 2_000) partialMediaResponses.delete(partialMediaResponses.values().next().value);
+      void chrome.tabs.sendMessage(details.tabId, {
+        type: "fluxnet:resource-rejected",
+        url: details.url,
+        reason: "Instagram returned a partial byte-range response. FluxNet needs a complete MP4 source.",
+      }).catch(() => {});
+      void chrome.storage.local.get("detectedResources").then(async ({ detectedResources = [] }) => {
+        const rejectedIdentity = browserMediaIdentity({ url: details.url, mediaType: "mp4" });
+        const next = detectedResources.filter((resource) => !(resource.tabId === details.tabId
+          && resource.mediaType === "mp4"
+          && browserMediaIdentity(resource) === rejectedIdentity));
+        if (next.length !== detectedResources.length) {
+          await chrome.storage.local.set({ detectedResources: next });
+          await updateBadge(next.length);
+          void chrome.runtime.sendMessage({ type: "fluxnet:resource-updated" });
+        }
+      }).catch((error) => console.debug("FluxNet could not discard a partial media response:", error));
+      return;
+    }
     const header = details.responseHeaders?.find((item) => item.name.toLowerCase() === "content-type");
     const mimeType = header?.value?.split(";")[0]?.trim() || "";
     if (!/^video\//i.test(mimeType)) return;

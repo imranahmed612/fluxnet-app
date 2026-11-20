@@ -9,6 +9,17 @@ import {
   createBrowserHandoffRunner,
   openUserInitiatedBrowserDownloadDialog,
 } from "./browserHandoff.mjs";
+import {
+  buildWebsiteFormatSelection,
+  canRetryDownloadDirectly,
+  formatDiscoveredFormatDetails,
+  formatWebsiteMediaBadge,
+  resolveWebsiteContainerExtension,
+  validateWebsiteDestinationPath,
+  validateWebsitePageUrl,
+  type VideoDiscovery,
+  type WebsiteMediaInfo,
+} from "./websiteDownload.mjs";
 import fluxnetSymbol from "./assets/fluxnet-symbol-128.png";
 import "./App.css";
 
@@ -189,6 +200,7 @@ type DownloadEntry = {
   createdAtMs: number;
   updatedAtMs: number;
   attempts: number;
+  websiteMedia?: WebsiteMediaInfo | null;
 };
 
 type DownloadSettings = {
@@ -383,11 +395,13 @@ function Sidebar({
   onNavigate,
   interfaceSummary,
   navigationDisabled,
+  installedVersion,
 }: {
   activePage: string;
   onNavigate: (page: string) => void;
   interfaceSummary: string;
   navigationDisabled: boolean;
+  installedVersion: string | null;
 }) {
   return (
     <aside className="sidebar">
@@ -432,7 +446,7 @@ function Sidebar({
         </div>
         <div className="sidebar-footer">
           <span>FLUXNET DESKTOP</span>
-          <span>v0.1.0</span>
+          <span>v{installedVersion ?? "..."}</span>
           <span className="sidebar-credit">Developed by Imran</span>
         </div>
       </div>
@@ -3016,6 +3030,13 @@ function VideoDetectionPage({ defaultDownloadDirectory }: { defaultDownloadDirec
 
 function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDirectory: string | null }) {
   const [url, setUrl] = useState("");
+  const [websiteUrl, setWebsiteUrl] = useState("");
+  const [discoveredWebsiteUrl, setDiscoveredWebsiteUrl] = useState<string | null>(null);
+  const [websiteDiscovery, setWebsiteDiscovery] = useState<VideoDiscovery | null>(null);
+  const [selectedWebsiteFormat, setSelectedWebsiteFormat] = useState<string>("bestAvailable");
+  const [websiteDiscovering, setWebsiteDiscovering] = useState(false);
+  const [websiteQueueing, setWebsiteQueueing] = useState(false);
+  const [websiteError, setWebsiteError] = useState<string | null>(null);
   const [entries, setEntries] = useState<DownloadEntry[]>([]);
   const [settings, setSettings] = useState<DownloadSettings>({
     maxConcurrent: 2,
@@ -3025,6 +3046,16 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
   });
   const [loading, setLoading] = useState(true);
   const [feedback, setFeedback] = useState<{ kind: "success" | "cancelled" | "error"; message: string } | null>(null);
+
+  const upsertEntry = useCallback((incoming: DownloadEntry) => {
+    setEntries((current) => {
+      const index = current.findIndex((entry) => entry.id === incoming.id);
+      if (index < 0) return [...current, incoming];
+      const next = [...current];
+      if (next[index].updatedAtMs <= incoming.updatedAtMs) next[index] = incoming;
+      return next;
+    });
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -3049,13 +3080,7 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen<DownloadEntry>("download-manager-update", (event) => {
-      setEntries((current) => {
-        const index = current.findIndex((entry) => entry.id === event.payload.id);
-        if (index < 0) return [...current, event.payload];
-        const next = [...current];
-        if (next[index].updatedAtMs <= event.payload.updatedAtMs) next[index] = event.payload;
-        return next;
-      });
+      upsertEntry(event.payload);
     }).then((stopListening) => {
       if (disposed) stopListening();
       else unlisten = stopListening;
@@ -3070,7 +3095,7 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
       disposed = true;
       unlisten?.();
     };
-  }, [refresh]);
+  }, [refresh, upsertEntry]);
 
   const runAction = useCallback(async (action: () => Promise<unknown>, successMessage?: string) => {
     try {
@@ -3101,11 +3126,12 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
         setFeedback({ kind: "cancelled", message: "Download canceled; no destination was selected." });
         return;
       }
-      await invoke<DownloadEntry>("start_download", {
+      const created = await invoke<DownloadEntry>("start_download", {
         url: url.trim(),
         destination,
         hlsPlaylist: null,
       });
+      upsertEntry(created);
       setUrl("");
       setFeedback({ kind: "success", message: "Download added to the queue." });
     } catch (startError) {
@@ -3114,7 +3140,134 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
         message: startError instanceof Error ? startError.message : String(startError),
       });
     }
-  }, [defaultDownloadDirectory, url]);
+  }, [defaultDownloadDirectory, upsertEntry, url]);
+
+  const discoverWebsiteVideo = useCallback(async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setWebsiteError(null);
+    setFeedback(null);
+    const validated = validateWebsitePageUrl(websiteUrl);
+    if (!validated.ok) {
+      setWebsiteDiscovery(null);
+      setDiscoveredWebsiteUrl(null);
+      setWebsiteError(validated.error);
+      return;
+    }
+    setWebsiteDiscovering(true);
+    setWebsiteDiscovery(null);
+    setDiscoveredWebsiteUrl(null);
+    try {
+      const discovered = await invoke<VideoDiscovery>("discover_website_media", {
+        url: validated.url,
+      });
+      setWebsiteDiscovery(discovered);
+      setDiscoveredWebsiteUrl(validated.url);
+      setSelectedWebsiteFormat(
+        discovered.bestAvailable
+          ? "bestAvailable"
+          : (discovered.formats[0]?.formatId ?? "bestAvailable"),
+      );
+    } catch (discoverError) {
+      setWebsiteError(
+        discoverError instanceof Error ? discoverError.message : String(discoverError),
+      );
+    } finally {
+      setWebsiteDiscovering(false);
+    }
+  }, [websiteUrl]);
+
+  const selectedWebsiteExtension = resolveWebsiteContainerExtension(
+    websiteDiscovery,
+    selectedWebsiteFormat,
+  );
+  const bestAvailableExtension = resolveWebsiteContainerExtension(
+    websiteDiscovery,
+    "bestAvailable",
+  );
+
+  const startWebsiteDownload = useCallback(async () => {
+    if (!websiteDiscovery || !discoveredWebsiteUrl) return;
+    setWebsiteError(null);
+    setFeedback(null);
+    const expectedExtension = resolveWebsiteContainerExtension(
+      websiteDiscovery,
+      selectedWebsiteFormat,
+    );
+    if (!expectedExtension) {
+      setWebsiteError("Choose an available muxed MP4 or WebM format before downloading.");
+      return;
+    }
+    setWebsiteQueueing(true);
+    try {
+      let pageDomain: string | null = null;
+      try {
+        pageDomain = new URL(discoveredWebsiteUrl).hostname;
+      } catch {
+        pageDomain = null;
+      }
+      const suggestedFilename = await invoke<string>("get_download_filename", {
+        url: discoveredWebsiteUrl,
+        pageTitle: websiteDiscovery.title,
+        pageDomain,
+        mediaType: expectedExtension,
+        directory: defaultDownloadDirectory,
+      });
+      const ensuredFilename = suggestedFilename.toLowerCase().endsWith(`.${expectedExtension}`)
+        ? suggestedFilename
+        : `${suggestedFilename.replace(/\.(mp4|webm)$/i, "")}.${expectedExtension}`;
+      const defaultPath = defaultDownloadDirectory
+        ? `${defaultDownloadDirectory.replace(/[\\/]$/, "")}\\${ensuredFilename}`
+        : ensuredFilename;
+      const pickedDestination = await save({
+        title: `Save website video (.${expectedExtension})`,
+        defaultPath,
+        filters: [
+          {
+            name: `${expectedExtension.toUpperCase()} video`,
+            extensions: [expectedExtension],
+          },
+        ],
+      });
+      if (!pickedDestination) {
+        setFeedback({
+          kind: "cancelled",
+          message: "Website video download canceled; no destination was selected.",
+        });
+        return;
+      }
+      const validatedDestination = validateWebsiteDestinationPath(
+        pickedDestination,
+        expectedExtension,
+      );
+      if (!validatedDestination.ok) {
+        setWebsiteError(validatedDestination.error);
+        return;
+      }
+      const created = await invoke<DownloadEntry>("start_website_download", {
+        url: discoveredWebsiteUrl,
+        destination: validatedDestination.destination,
+        catalog: websiteDiscovery,
+        selection: buildWebsiteFormatSelection(selectedWebsiteFormat),
+      });
+      upsertEntry(created);
+      setFeedback({
+        kind: "success",
+        message: `Website video "${websiteDiscovery.title}" added to the Download Manager queue.`,
+      });
+    } catch (queueError) {
+      setWebsiteError(
+        queueError instanceof Error ? queueError.message : String(queueError),
+      );
+    } finally {
+      setWebsiteQueueing(false);
+    }
+  }, [
+    defaultDownloadDirectory,
+    discoveredWebsiteUrl,
+    selectedWebsiteFormat,
+    upsertEntry,
+    websiteDiscovery,
+  ]);
 
   const activeCount = entries.filter((entry) => (
     entry.status === "queued" || entry.status === "downloading"
@@ -3165,6 +3318,183 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
           </div>
           <p>FluxNet verifies TLS normally, follows HTTP redirects, and streams data to a partial file before committing it.</p>
         </form>
+      </section>
+
+      <section className="panel download-website-panel" aria-labelledby="website-download-heading">
+        <div className="panel-heading">
+          <div>
+            <div className="eyebrow">WEBSITE VIDEO DOWNLOAD</div>
+            <h2 id="website-download-heading">Website Video Download</h2>
+          </div>
+          <span className="download-queue-count">Muxed MP4 / WebM · Public URLs only</span>
+        </div>
+        <form className="download-form" onSubmit={(event) => void discoverWebsiteVideo(event)}>
+          <label htmlFor="website-download-url">Public video page URL</label>
+          <div className="download-form-row">
+            <input
+              id="website-download-url"
+              type="url"
+              inputMode="url"
+              maxLength={8192}
+              autoComplete="url"
+              placeholder="https://example.com/watch?v=..."
+              value={websiteUrl}
+              disabled={websiteDiscovering || websiteQueueing}
+              onChange={(event) => {
+                const nextValue = event.currentTarget.value;
+                setWebsiteUrl(nextValue);
+                setWebsiteError(null);
+                if (discoveredWebsiteUrl && nextValue.trim() !== discoveredWebsiteUrl) {
+                  setWebsiteDiscovery(null);
+                  setDiscoveredWebsiteUrl(null);
+                }
+              }}
+              required
+            />
+            <button
+              className="test-connection-button"
+              type="submit"
+              disabled={websiteDiscovering || websiteQueueing || !websiteUrl.trim()}
+            >
+              <Icon name="video" size={16} />
+              {websiteDiscovering ? "Discovering…" : "Discover"}
+            </button>
+          </div>
+          <p>
+            Probes a single public video page for available muxed MP4 or WebM formats. No cookies, browser credentials, DRM bypass, or playlist downloads are used.
+          </p>
+        </form>
+
+        {websiteDiscovering && (
+          <div className="diagnostic-message is-pending website-discovery-message" role="status" aria-live="polite">
+            Inspecting public page metadata for available muxed MP4/WebM formats. No files are downloaded during discovery…
+          </div>
+        )}
+
+        {websiteError && !websiteDiscovering && (
+          <div className="diagnostic-message is-error website-discovery-message" role="alert">
+            <strong>Website video request could not complete</strong>
+            <span>{websiteError}</span>
+          </div>
+        )}
+
+        {websiteDiscovery && discoveredWebsiteUrl && !websiteDiscovering && (
+          <div className="website-discovery-result">
+            <div className="website-discovery-header">
+              <div>
+                <span className="diagnostic-result-label">
+                  DISCOVERED VIDEO · {websiteDiscovery.extractor.toUpperCase()}
+                </span>
+                <strong>{websiteDiscovery.title}</strong>
+              </div>
+              <div className="website-discovery-badges">
+                {websiteDiscovery.durationSeconds !== null && (
+                  <span>Duration {formatDuration(websiteDiscovery.durationSeconds)}</span>
+                )}
+                <span>
+                  {websiteDiscovery.formats.length} muxed format{websiteDiscovery.formats.length === 1 ? "" : "s"}
+                </span>
+              </div>
+            </div>
+
+            <div className="website-format-picker">
+              <label htmlFor="website-format-select">
+                Format selection
+                <select
+                  id="website-format-select"
+                  value={selectedWebsiteFormat}
+                  disabled={websiteQueueing}
+                  onChange={(event) => {
+                    setSelectedWebsiteFormat(event.currentTarget.value);
+                    setWebsiteError(null);
+                  }}
+                >
+                  {websiteDiscovery.bestAvailable && (
+                    <option value="bestAvailable">
+                      Best Available ({(bestAvailableExtension ?? "mp4").toUpperCase()} · highest muxed quality)
+                    </option>
+                  )}
+                  {websiteDiscovery.formats.map((format) => {
+                    const details = formatDiscoveredFormatDetails(format, formatDownloadBytes);
+                    return (
+                      <option key={format.formatId} value={format.formatId}>
+                        {details.label}
+                      </option>
+                    );
+                  })}
+                </select>
+              </label>
+            </div>
+
+            <div className="website-format-list" role="list" aria-label="Available muxed formats">
+              {websiteDiscovery.bestAvailable && (
+                <button
+                  type="button"
+                  role="listitem"
+                  className={`website-format-item${selectedWebsiteFormat === "bestAvailable" ? " is-selected" : ""}`}
+                  disabled={websiteQueueing}
+                  onClick={() => {
+                    setSelectedWebsiteFormat("bestAvailable");
+                    setWebsiteError(null);
+                  }}
+                >
+                  <div className="website-format-item-title">
+                    <strong>Best Available</strong>
+                    <span>{(bestAvailableExtension ?? "mp4").toUpperCase()}</span>
+                  </div>
+                  <div className="website-format-item-meta">
+                    <span>Automatic best muxed stream</span>
+                    <span>.{bestAvailableExtension ?? "mp4"} container</span>
+                  </div>
+                </button>
+              )}
+              {websiteDiscovery.formats.map((format) => {
+                const details = formatDiscoveredFormatDetails(format, formatDownloadBytes);
+                const isSelected = selectedWebsiteFormat === format.formatId;
+                return (
+                  <button
+                    key={format.formatId}
+                    type="button"
+                    role="listitem"
+                    className={`website-format-item${isSelected ? " is-selected" : ""}`}
+                    disabled={websiteQueueing}
+                    onClick={() => {
+                      setSelectedWebsiteFormat(format.formatId);
+                      setWebsiteError(null);
+                    }}
+                  >
+                    <div className="website-format-item-title">
+                      <strong>{details.resolution}</strong>
+                      <span>{details.container}</span>
+                    </div>
+                    <div className="website-format-item-meta">
+                      <span>{details.fps}</span>
+                      <span>{details.size}</span>
+                      <span>Format {format.formatId}</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="website-download-actions">
+              <span>
+                Destination must use a <code>.{selectedWebsiteExtension ?? "mp4"}</code> extension matching the selected container.
+              </span>
+              <button
+                className="test-connection-button"
+                type="button"
+                disabled={websiteQueueing || !selectedWebsiteExtension}
+                onClick={() => void startWebsiteDownload()}
+              >
+                <Icon name="download" size={16} />
+                {websiteQueueing
+                  ? "Choosing save location…"
+                  : `Choose .${selectedWebsiteExtension ?? "mp4"} save location & download`}
+              </button>
+            </div>
+          </div>
+        )}
       </section>
 
       <section className="panel download-settings-panel">
@@ -3300,10 +3630,11 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
               const percent = entry.totalBytes && entry.totalBytes > 0
                 ? Math.min(100, (entry.downloadedBytes / entry.totalBytes) * 100)
                 : null;
+              const websiteMediaBadge = formatWebsiteMediaBadge(entry.websiteMedia);
               return (
                 <article className="download-entry" key={entry.id}>
                   <div className="download-entry-heading">
-                    <div className="download-file-icon"><Icon name="download" size={18} /></div>
+                    <div className="download-file-icon"><Icon name={entry.websiteMedia ? "video" : "download"} size={18} /></div>
                     <div className="download-file-name">
                       <strong title={entry.destination}>{entry.filename}</strong>
                       <span title="Query parameters are hidden to protect URL tokens">{displayDownloadUrl(entry.url)}</span>
@@ -3315,6 +3646,7 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
                     {percent === null && entry.status === "downloading" && <i />}
                   </div>
                   <div className="download-details">
+                    {websiteMediaBadge && <span className="download-website-badge">{websiteMediaBadge}</span>}
                     <span>{formatDownloadBytes(entry.downloadedBytes)} / {formatDownloadBytes(entry.totalBytes)}</span>
                     <span>{percent === null ? (entry.status === "downloading" ? "Progress unknown" : "—") : `${percent.toFixed(1)}%`}</span>
                     <span>{entry.status === "downloading" ? `${(entry.speedBytesPerSecond / 1_000_000).toFixed(2)} MB/s` : "—"}</span>
@@ -3322,6 +3654,9 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
                     <span>Remaining {formatDuration(entry.remainingSeconds)}</span>
                     {entry.status === "completed" && entry.filename.toLowerCase().endsWith(".mp4") && (
                       <span>MP4 container structure validated; codec decoding is not verified.</span>
+                    )}
+                    {entry.status === "completed" && entry.websiteMedia && entry.filename.toLowerCase().endsWith(".webm") && (
+                      <span>WebM container structure validated; codec decoding is not verified.</span>
                     )}
                   </div>
                   {entry.error && <div className="download-entry-error" role="alert">{entry.error}</div>}
@@ -3335,11 +3670,25 @@ function DownloadManagerPage({ defaultDownloadDirectory }: { defaultDownloadDire
                     {["queued", "downloading", "paused"].includes(entry.status) && (
                       <button type="button" onClick={() => void runAction(() => invoke("cancel_download", { id: entry.id }))}>Cancel</button>
                     )}
-                    {(entry.status === "failed" || entry.status === "cancelled") && (
+                    {canRetryDownloadDirectly(entry) && (
                       <>
                         <button type="button" onClick={() => void runAction(() => invoke("retry_download", { id: entry.id, restart: false }))}>Retry / Resume</button>
                         <button type="button" onClick={() => void runAction(() => invoke("retry_download", { id: entry.id, restart: true }))}>Restart</button>
                       </>
+                    )}
+                    {(entry.status === "failed" || entry.status === "cancelled") && entry.websiteMedia && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setWebsiteUrl(entry.url);
+                          setWebsiteDiscovery(null);
+                          setDiscoveredWebsiteUrl(null);
+                          setWebsiteError(null);
+                          document.getElementById("website-download-url")?.focus();
+                        }}
+                      >
+                        Load URL to re-discover
+                      </button>
                     )}
                     {entry.status === "completed" && (
                       <button type="button" onClick={() => void runAction(() => invoke("open_download_containing_folder", { id: entry.id }))}>Open containing folder</button>
@@ -3834,6 +4183,7 @@ function App() {
         onNavigate={setActivePage}
         interfaceSummary={interfaceSummary}
         navigationDisabled={isSpeedTestRunning || isBdixRunning}
+        installedVersion={installedVersion}
       />
       <main className="main-content">
         {browserHandoffError && (

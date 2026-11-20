@@ -1,7 +1,11 @@
 mod app_settings;
 mod browser_bridge;
 mod download_manager;
+#[allow(dead_code)]
+mod media;
 mod network;
+#[cfg(windows)]
+pub(crate) mod process;
 mod speed_test;
 mod updater;
 
@@ -267,6 +271,8 @@ pub fn run() {
             download_manager::configure_download_limits,
             download_manager::configure_download_notifications,
             download_manager::configure_download_notification_preferences,
+            download_manager::discover_website_media,
+            download_manager::start_website_download,
             download_manager::start_download,
             download_manager::pause_download,
             download_manager::resume_download,

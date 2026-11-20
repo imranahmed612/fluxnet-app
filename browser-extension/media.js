@@ -10,6 +10,49 @@ const NON_VIDEO_EXTENSIONS = new Set([
   "mp3", "msi", "opus", "pdf", "png", "ppt", "pptx", "rar", "7z", "tar",
   "txt", "wav", "webp", "wma", "xls", "xlsx", "zip",
 ]);
+
+function isInstagramCdnHostname(hostname) {
+  const host = String(hostname || "").toLowerCase();
+  return host === "cdninstagram.com" || host.endsWith(".cdninstagram.com")
+    || host === "fbcdn.net" || host.endsWith(".fbcdn.net");
+}
+
+export function isPartialMediaResponse(urlValue, statusCode, responseHeaders = []) {
+  let url;
+  try {
+    url = new URL(urlValue);
+  } catch {
+    return false;
+  }
+  if (!isInstagramCdnHostname(url.hostname)) return false;
+  const contentType = responseHeaders.find((header) => (
+    String(header?.name || "").toLowerCase() === "content-type"
+  ))?.value?.split(";", 1)[0]?.trim().toLowerCase() || "";
+  const isVideoResource = /\.(?:mp4|webm)$/i.test(url.pathname)
+    || contentType === "video/mp4" || contentType === "video/webm";
+  if (!isVideoResource) return false;
+  const hasContentRange = responseHeaders.some((header) => (
+    String(header?.name || "").toLowerCase() === "content-range"
+  ));
+  const instagramByteRange = isInstagramCdnHostname(url.hostname)
+    && (url.searchParams.has("bytestart") || url.searchParams.has("byteend"));
+  if (instagramByteRange) return true;
+  if (statusCode !== 206 && !hasContentRange) return false;
+  const contentRange = responseHeaders.find((header) => (
+    String(header?.name || "").toLowerCase() === "content-range"
+  ))?.value;
+  const contentLength = Number(responseHeaders.find((header) => (
+    String(header?.name || "").toLowerCase() === "content-length"
+  ))?.value);
+  const rangeMatch = typeof contentRange === "string"
+    ? /^bytes 0-(\d+)\/(\d+)$/i.exec(contentRange.trim())
+    : null;
+  const end = Number(rangeMatch?.[1]);
+  const total = Number(rangeMatch?.[2]);
+  const completeRange = Number.isSafeInteger(end) && Number.isSafeInteger(total)
+    && end + 1 === total && contentLength === total;
+  return !completeRange;
+}
 export const DEFAULT_FILE_TYPES = [
   "mp4", "webm", "mov", "m4v", "mkv", "avi", "ogv", "mpeg", "mpg", "3gp",
   "mp3", "m4a", "aac", "wav", "flac", "ogg", "pdf", "zip", "rar", "7z",
@@ -38,6 +81,8 @@ export function classifyMediaUrl(rawUrl, mimeType = "", playableVideo = false) {
     return null;
   }
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return null;
+  if (isInstagramCdnHostname(url.hostname)
+    && (url.searchParams.has("bytestart") || url.searchParams.has("byteend"))) return null;
   const extension = url.pathname.toLowerCase().split(".").pop();
   if (STREAM_TYPES.has(extension)) return { url: url.href, mediaType: STREAM_TYPES.get(extension), downloadable: false };
   if (NON_VIDEO_EXTENSIONS.has(extension)) return null;

@@ -22,6 +22,8 @@ test("reproducible extension package includes every manifest resource and gestur
     ].filter(Boolean);
 
     assert.ok(manifest.content_scripts.some(({ js }) => js.includes("download-gesture.js")));
+    const builtContent = await readFile(path.join(outputDirectory, "content.js"), "utf8");
+    assert.doesNotMatch(builtContent, /DEV_DIAGNOSTICS|FluxNet overlay diagnostic|__FLUXNET_OVERLAY_DIAGNOSTICS__/);
     for (const file of manifestFiles) {
       await readFile(path.join(outputDirectory, file));
     }

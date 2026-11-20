@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, rm } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,6 +47,14 @@ export async function buildExtension(outputDirectory = defaultOutputDirectory) {
       return first !== "tests" && !(first === "build.mjs" && rest.length === 0);
     },
   });
+
+  const contentScriptPath = path.join(output, "content.js");
+  const contentScript = await readFile(contentScriptPath, "utf8");
+  const productionContentScript = contentScript.replace(
+    /\s*\/\* DEV_DIAGNOSTICS_START \*\/[\s\S]*?\/\* DEV_DIAGNOSTICS_END \*\//g,
+    "",
+  );
+  await writeFile(contentScriptPath, productionContentScript);
 
   const manifest = JSON.parse(await readFile(path.join(output, "manifest.json"), "utf8"));
   for (const file of manifestFiles(manifest)) {

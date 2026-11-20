@@ -705,6 +705,11 @@ fn validate_resource_metadata(
     resource: BrowserMediaResource,
     url: reqwest::Url,
 ) -> Result<BrowserMediaResource, String> {
+    if resource.media_type == "mp4" && is_instagram_byte_range_url(&url) {
+        return Err(
+            "Instagram supplied a byte-range MP4 response, not a complete video source.".into(),
+        );
+    }
     if resource.page_title.len() > MAX_TEXT_LENGTH || resource.page_domain.len() > MAX_TEXT_LENGTH {
         return Err("The source page information is too long.".into());
     }
@@ -735,6 +740,20 @@ fn validate_resource_metadata(
         received_at_ms: current_timestamp_ms(),
         ..resource
     })
+}
+
+fn is_instagram_byte_range_url(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    let instagram_cdn = host == "cdninstagram.com"
+        || host.ends_with(".cdninstagram.com")
+        || host == "fbcdn.net"
+        || host.ends_with(".fbcdn.net");
+    instagram_cdn
+        && url
+            .query_pairs()
+            .any(|(name, _)| name == "bytestart" || name == "byteend")
 }
 
 fn handle_native_message(
@@ -1072,6 +1091,23 @@ mod tests {
         candidate.hls_playlist.as_mut().unwrap().init.url =
             "https://user:password@cdn.example/init.mp4".into();
         assert!(validate_resource(candidate).is_err());
+    }
+
+    #[test]
+    fn rejects_instagram_reel_and_story_byte_range_mp4_handoffs() {
+        for url in [
+            "https://scontent.cdninstagram.com/v/t51/reel.mp4?bytestart=0&byteend=10399&token=private",
+            "https://instagram.fdac5-1.fna.fbcdn.net/v/t51/story.mp4?signature=private&bytestart=0&byteend=10399",
+        ] {
+            assert!(validate_resource(resource(url, "mp4")).is_err());
+        }
+        assert!(
+            validate_resource(resource(
+                "https://scontent.cdninstagram.com/v/t51/reel.mp4?signature=private",
+                "mp4",
+            ))
+            .is_ok()
+        );
     }
 
     #[test]

@@ -416,7 +416,6 @@ function Sidebar({
       >
         <BrandMark />
         <span className="brand-name">flux<span>net</span></span>
-        <span className="brand-version">BETA</span>
       </a>
 
       <div className="sidebar-label">WORKSPACE</div>

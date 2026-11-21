@@ -1,10 +1,10 @@
 {
-    "platforms":  {
-                      "windows-x86_64":  {
-                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRa1F1SkxTTVdvOTcxZVBkRFljR2NjeWhjSkJza09jR0ptdXNsdmJ1ZjZETDIvRlJrUEY1SWIyb2p5TnZPNWNhYVNPa3VDTW0zMVUwUmdNWXZtMzVwUWxyaVlJYm8rUUFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk0MTU4NjM3CWZpbGU6Rmx1eE5ldF8wLjEuMV94NjQtc2V0dXAuZXhlCXZlcnNpb246MC4xLjEKRUxCeUhOSkZpMEdmRlN1dlQzQlBOaW56c0F3YmdNaUxYWXZLNHpyNzlxT3Y3SGhPWXozY0M3WElWcFFKKzFkRjFRdEVxK0I4eVlrc2kzaUoxTThCRFE9PQo=",
-                                             "url":  "https://github.com/imranahmed612/fluxnet-app/releases/download/0.1.1/FluxNet_0.1.1_x64-setup.exe"
-                                         }
-                  },
-    "version":  "0.1.1",
-    "notes":  "FluxNet v0.1.1 release"
+    "platforms": {
+        "windows-x86_64": {
+            "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRa1F1SkxTTVdvOTZLOXZJVDBUelkrUzk0Wk5yVUppSERaVENKbitTZG1FM1d0d0FhWmNjQVM4Z3ZmcW9zc0tWTGpMM3MwVlEweFAvZzVUWXlXN0RjMlkvdnJGYVp4UUFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1Mjc2NjA4CWZpbGU6Rmx1eE5ldF8wLjEuMl94NjQtc2V0dXAuZXhlCXZlcnNpb246MC4xLjIKTmdkN0RteFBFMTBQc1VLNTZuVExKMk4wZFltVzlmbUlLaFV5UERqOHV3R1U2UmkvaUZLbkpqN0xVcmYraVM1bzRyK0hIdFJLT3QvSnBrYzhoRnFjQXc9PQo=",
+            "url": "https://github.com/imranahmed612/fluxnet-app/releases/download/v0.1.2/FluxNet_0.1.2_x64-setup.exe"
+        }
+    },
+    "version": "0.1.2",
+    "notes": "FluxNet v0.1.2 release"
 }

@@ -23,3 +23,14 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local external media test binaries and archives (never commit)
+experiments/media-engine-poc/test-tools/
+experiments/**/*.exe
+experiments/**/*.zip
+experiments/**/*.obj
+
+# Local backups, preserved release installers, and signing keys (never commit)
+/backups/
+/releases/
+*.pem

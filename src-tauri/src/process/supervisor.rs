@@ -4,7 +4,10 @@ use std::{
     io::{self, Read},
     os::windows::io::AsRawHandle,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -19,6 +22,8 @@ use crate::download_manager::DownloadTaskControl;
 const POLL: Duration = Duration::from_millis(15);
 const JOB_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_TERMINATED: u32 = 0xC000_013A;
+#[allow(dead_code)]
+pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CapturedOutput {
@@ -41,6 +46,10 @@ pub(crate) enum ProcessOutcome {
         stderr: CapturedOutput,
     },
     TimedOut {
+        stdout: CapturedOutput,
+        stderr: CapturedOutput,
+    },
+    IdleTimedOut {
         stdout: CapturedOutput,
         stderr: CapturedOutput,
     },
@@ -89,6 +98,7 @@ fn run_with_hooks(
     if spec.stdout_limit > 4 * 1024 * 1024
         || spec.stderr_limit > 4 * 1024 * 1024
         || spec.timeout.is_zero()
+        || spec.idle_timeout.is_some_and(|idle| idle.is_zero())
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -119,6 +129,10 @@ fn run_with_hooks(
             },
         });
     }
+    let mut max_staged_bytes = match monitored_output.as_ref().map(output_exceeds_limit) {
+        Some(MonitoredOutputStatus::WithinLimit { staged_bytes }) => staged_bytes,
+        _ => 0,
+    };
     let child = spawn_contained(spec)?;
     let super::windows_spawn::ContainedProcess {
         _job: job,
@@ -127,11 +141,14 @@ fn run_with_hooks(
         stdout: stdout_pipe,
         stderr: stderr_pipe,
     } = child;
+    let started_at = Instant::now();
+    let last_activity_ns = Arc::new(AtomicU64::new(0));
     let stdout = match drain(
         stdout_pipe,
         spec.stdout_limit,
         ProcessStream::Stdout,
         handler.clone(),
+        Some((started_at, Arc::clone(&last_activity_ns))),
     ) {
         Ok(reader) => reader,
         Err(error) => {
@@ -144,6 +161,7 @@ fn run_with_hooks(
         spec.stderr_limit,
         ProcessStream::Stderr,
         handler,
+        Some((started_at, Arc::clone(&last_activity_ns))),
     ) {
         Ok(reader) => reader,
         Err(error) => {
@@ -152,7 +170,7 @@ fn run_with_hooks(
             return Err(error);
         }
     };
-    let deadline = Instant::now() + spec.timeout;
+    let deadline = started_at + spec.timeout;
     let mut next_output_check = Instant::now();
     let mut terminal = None;
     loop {
@@ -169,11 +187,29 @@ fn run_with_hooks(
             break;
         }
         if Instant::now() >= next_output_check {
-            if monitored_output.as_ref().is_some_and(output_exceeds_limit) {
-                terminal = Some(ProcessOutcomeTag::OutputLimitExceeded);
-                break;
+            if let Some(monitored) = monitored_output.as_ref() {
+                match output_exceeds_limit(monitored) {
+                    MonitoredOutputStatus::ExceedsLimit => {
+                        terminal = Some(ProcessOutcomeTag::OutputLimitExceeded);
+                        break;
+                    }
+                    MonitoredOutputStatus::WithinLimit { staged_bytes } => {
+                        if staged_bytes > max_staged_bytes {
+                            max_staged_bytes = staged_bytes;
+                            record_activity(started_at, &last_activity_ns);
+                        }
+                    }
+                }
             }
             next_output_check = Instant::now() + Duration::from_millis(100);
+        }
+        if let Some(idle_timeout) = spec.idle_timeout {
+            let last_ns = last_activity_ns.load(Ordering::Acquire);
+            let now_ns = started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            if Duration::from_nanos(now_ns.saturating_sub(last_ns)) >= idle_timeout {
+                terminal = Some(ProcessOutcomeTag::IdleTimedOut);
+                break;
+            }
         }
         // SAFETY: supervisor owns a valid process handle.
         match unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, 0) } {
@@ -253,6 +289,7 @@ fn run_with_hooks(
         Some(ProcessOutcomeTag::Cancelled) => ProcessOutcome::Cancelled { stdout, stderr },
         Some(ProcessOutcomeTag::Paused) => ProcessOutcome::Paused { stdout, stderr },
         Some(ProcessOutcomeTag::TimedOut) => ProcessOutcome::TimedOut { stdout, stderr },
+        Some(ProcessOutcomeTag::IdleTimedOut) => ProcessOutcome::IdleTimedOut { stdout, stderr },
         Some(ProcessOutcomeTag::OutputLimitExceeded) => {
             ProcessOutcome::OutputLimitExceeded { stdout, stderr }
         }
@@ -269,39 +306,76 @@ enum ProcessOutcomeTag {
     Cancelled,
     Paused,
     TimedOut,
+    IdleTimedOut,
     OutputLimitExceeded,
     Failure,
 }
 
-fn output_exceeds_limit(output: &MonitoredOutput) -> bool {
+enum MonitoredOutputStatus {
+    ExceedsLimit,
+    WithinLimit { staged_bytes: u64 },
+}
+
+fn record_activity(started_at: Instant, last_activity_ns: &AtomicU64) {
+    let now_ns = started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    last_activity_ns.store(now_ns, Ordering::Release);
+}
+
+fn output_exceeds_limit(output: &MonitoredOutput) -> MonitoredOutputStatus {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
-    let Ok(entries) = std::fs::read_dir(&output.directory) else {
-        return true;
-    };
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return true;
+    let mut aggregate_bytes = 0u64;
+    let mut staged_bytes = 0u64;
+    let mut pending_dirs = vec![(output.directory.clone(), true)];
+
+    while let Some((dir, is_root)) = pending_dirs.pop() {
+        let Ok(dir_meta) = std::fs::symlink_metadata(&dir) else {
+            return MonitoredOutputStatus::ExceedsLimit;
         };
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(&output.filename_prefix)
-        {
-            continue;
+        if !dir_meta.is_dir() || dir_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return MonitoredOutputStatus::ExceedsLimit;
         }
-        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
-            return true;
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return MonitoredOutputStatus::ExceedsLimit;
         };
-        if !metadata.is_file()
-            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || metadata.len() > output.maximum_bytes
-        {
-            return true;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return MonitoredOutputStatus::ExceedsLimit;
+            };
+            let entry_path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&entry_path) else {
+                return MonitoredOutputStatus::ExceedsLimit;
+            };
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return MonitoredOutputStatus::ExceedsLimit;
+            }
+            let matches_prefix = is_root
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&output.filename_prefix);
+            if metadata.is_dir() {
+                if matches_prefix {
+                    return MonitoredOutputStatus::ExceedsLimit;
+                }
+                pending_dirs.push((entry_path, false));
+                continue;
+            }
+            if !metadata.is_file() {
+                return MonitoredOutputStatus::ExceedsLimit;
+            }
+            let len = metadata.len();
+            aggregate_bytes = aggregate_bytes.saturating_add(len);
+            if aggregate_bytes > output.maximum_bytes {
+                return MonitoredOutputStatus::ExceedsLimit;
+            }
+            if matches_prefix {
+                staged_bytes = staged_bytes.saturating_add(len);
+            }
         }
     }
-    false
+    MonitoredOutputStatus::WithinLimit { staged_bytes }
 }
 
 fn terminate_and_reap(
@@ -334,6 +408,7 @@ fn drain<R: Read + Send + 'static>(
     limit: usize,
     stream: ProcessStream,
     handler: Option<OutputHandler>,
+    activity: Option<(Instant, Arc<AtomicU64>)>,
 ) -> io::Result<thread::JoinHandle<io::Result<CapturedOutput>>> {
     thread::Builder::new()
         .name("fluxnet-process-output".into())
@@ -345,6 +420,15 @@ fn drain<R: Read + Send + 'static>(
                 let n = reader.read(&mut chunk)?;
                 if n == 0 {
                     break;
+                }
+                if let Some((started_at, ref last_activity_ns)) = activity {
+                    if stream == ProcessStream::Stdout
+                        || chunk[..n]
+                            .windows(b"FLUXNET_PROGRESS\t".len())
+                            .any(|w| w == b"FLUXNET_PROGRESS\t")
+                    {
+                        record_activity(started_at, last_activity_ns);
+                    }
                 }
                 if let Some(handler) = &handler {
                     handler(stream, &chunk[..n]);

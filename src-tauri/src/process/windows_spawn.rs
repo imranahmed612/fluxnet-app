@@ -46,6 +46,7 @@ pub(crate) struct ProcessSpec {
     pub(crate) working_directory: PathBuf,
     pub(crate) environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     pub(crate) timeout: Duration,
+    pub(crate) idle_timeout: Option<Duration>,
     pub(crate) stdout_limit: usize,
     pub(crate) stderr_limit: usize,
 }

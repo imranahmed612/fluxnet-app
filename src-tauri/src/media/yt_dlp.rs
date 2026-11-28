@@ -383,6 +383,56 @@ pub(crate) fn retain_muxed_formats(
     Ok(discovery)
 }
 
+/// Retains muxed MP4/WebM formats when present; otherwise falls back to keeping
+/// valid split video/audio streams when a split merge plan is available.
+pub(crate) fn retain_downloadable_formats(
+    mut discovery: VideoDiscovery,
+) -> Result<VideoDiscovery, VideoDownloadError> {
+    if discovery.formats.iter().any(is_muxed_mp4_or_webm) {
+        return retain_muxed_formats(discovery);
+    }
+    if select_split_format(&discovery, &FormatSelection::BestAvailable).is_ok() {
+        discovery
+            .formats
+            .retain(|format| is_video_only_format(format) || is_audio_only_format(format));
+        discovery.best_available = true;
+        return Ok(discovery);
+    }
+    Err(VideoDownloadError::NoMuxedMp4)
+}
+
+/// Runs metadata-only discovery inside an exclusively created per-call task
+/// workspace and returns downloadable formats (muxed preferred, split fallback).
+#[cfg(windows)]
+pub(crate) fn discover_in_workspace(
+    executable: &Path,
+    base_directory: &Path,
+    page_url: &str,
+    control: &DownloadTaskControl,
+) -> Result<VideoDiscovery, String> {
+    let mut task_workspace = RuntimeTempDir::create(base_directory)
+        .map_err(|_| DiscoveryError::TemporaryWorkspaceUnavailable.to_string())?;
+    let discovery = discover_with_limits(
+        executable,
+        task_workspace.path(),
+        page_url,
+        control,
+        DISCOVERY_TIMEOUT,
+        MAX_METADATA_BYTES,
+        Vec::new(),
+        None,
+    );
+    if matches!(discovery, Err(DiscoveryError::TemporaryCleanupFailed)) {
+        task_workspace.preserve_with_evidence("discovery_task_cleanup_failed");
+        return Err(DiscoveryError::TemporaryCleanupFailed.to_string());
+    }
+    task_workspace
+        .cleanup()
+        .map_err(|_| DiscoveryError::TemporaryCleanupFailed.to_string())?;
+    let discovery = discovery.map_err(|error| error.to_string())?;
+    retain_downloadable_formats(discovery).map_err(|error| error.to_string())
+}
+
 /// Runs metadata-only discovery inside an exclusively created per-call task
 /// workspace and returns only available muxed MP4/WebM formats.
 #[cfg(windows)]
@@ -2690,6 +2740,67 @@ mod tests {
             "private per-discovery task workspace must be cleaned up"
         );
         std::fs::remove_dir(base_dir).unwrap();
+    }
+
+    #[test]
+    fn retain_downloadable_formats_accepts_split_only_catalog_and_selects_split_plan() {
+        let split_only_json = r#"{
+            "title": "Split DASH Video",
+            "duration": 19.06,
+            "formats": [
+                {
+                    "format_id": "133",
+                    "ext": "mp4",
+                    "height": 240,
+                    "vcodec": "avc1.4D400C",
+                    "acodec": "none",
+                    "filesize": 422930
+                },
+                {
+                    "format_id": "140",
+                    "ext": "m4a",
+                    "vcodec": "none",
+                    "acodec": "mp4a.40.2",
+                    "filesize": 302040
+                }
+            ]
+        }"#;
+        let parsed =
+            parse_discovery_json(split_only_json.as_bytes()).expect("valid split-only JSON");
+        let retained = retain_downloadable_formats(parsed)
+            .expect("split-only catalog with valid bestvideo+bestaudio must pass discovery");
+        assert!(retained.best_available);
+        assert_eq!(retained.formats.len(), 2);
+
+        let plan = select_download_plan(&retained, &FormatSelection::BestAvailable)
+            .expect("retained split-only catalog must select a split download plan");
+        assert_eq!(
+            plan,
+            DownloadPlan::Split(SplitFormatSelection {
+                video_format_id: "133".into(),
+                audio_format_id: "140".into(),
+                container: "mp4".into(),
+            })
+        );
+
+        // Catalog with video-only and no audio stream must still fail closed.
+        let video_only_json = r#"{
+            "title": "Video Only",
+            "formats": [
+                {
+                    "format_id": "133",
+                    "ext": "mp4",
+                    "height": 240,
+                    "vcodec": "avc1.4D400C",
+                    "acodec": "none"
+                }
+            ]
+        }"#;
+        let video_only = parse_discovery_json(video_only_json.as_bytes()).unwrap();
+        assert_eq!(
+            retain_downloadable_formats(video_only).unwrap_err(),
+            VideoDownloadError::NoMuxedMp4
+        );
     }
 
     #[cfg(windows)]

@@ -827,10 +827,7 @@ impl DownloadManager {
                 if let Some(control) = control {
                     control.request_cancel();
                 }
-                let cleanup_partial = cancelled
-                    .website_media
-                    .as_ref()
-                    .map(|_| PathBuf::from(&cancelled.destination));
+                let cleanup_partial = Some(PathBuf::from(&cancelled.destination));
                 let seg_cleanup =
                     has_segments.then(|| (PathBuf::from(&cancelled.destination), cancelled.id.clone()));
                 (Some(cancelled), cleanup_partial, seg_cleanup)
@@ -972,7 +969,7 @@ impl DownloadManager {
         };
 
         tauri::async_runtime::spawn_blocking(move || {
-            crate::media::yt_dlp::discover_muxed_in_workspace(
+            crate::media::yt_dlp::discover_in_workspace(
                 &executable,
                 &base_dir,
                 &normalized_url,
@@ -4951,6 +4948,14 @@ async fn download_worker(
         }
     }
 
+    if offset == 0 {
+        if let Ok(meta) = fs::metadata(&partial).await {
+            if meta.len() == 0 {
+                let _ = fs::remove_file(&partial).await;
+            }
+        }
+    }
+
     let mut output = OpenOptions::new()
         .create(offset == 0)
         .create_new(offset == 0)
@@ -4988,14 +4993,13 @@ async fn download_worker(
 
     while total_bytes.is_none() || offset < total_bytes.unwrap_or(0) {
         if control.cancelled.load(Ordering::Acquire) {
-            output
-                .flush()
-                .await
-                .map_err(|error| filesystem_error("could not flush the partial file", error))?;
+            drop(output);
+            let _ = fs::remove_file(&partial).await;
+            remove_all_segment_parts(&destination, id).await;
             let elapsed_ms = base_elapsed_ms
                 .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
             update_entry_optional(app, state, id, |entry| {
-                entry.downloaded_bytes = offset;
+                entry.downloaded_bytes = 0;
                 entry.elapsed_ms = elapsed_ms;
                 Ok(())
             })?;
@@ -5069,8 +5073,11 @@ async fn download_worker(
                 let elapsed_ms = base_elapsed_ms
                     .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
                 if control.cancelled.load(Ordering::Acquire) {
+                    drop(output);
+                    let _ = fs::remove_file(&partial).await;
+                    remove_all_segment_parts(&destination, id).await;
                     update_entry_optional(app, state, id, |entry| {
-                        entry.downloaded_bytes = offset;
+                        entry.downloaded_bytes = 0;
                         entry.elapsed_ms = elapsed_ms;
                         Ok(())
                     })?;
@@ -5352,14 +5359,13 @@ async fn download_worker(
 
         loop {
             if control.cancelled.load(Ordering::Acquire) {
-                output
-                    .flush()
-                    .await
-                    .map_err(|error| filesystem_error("could not flush the partial file", error))?;
+                drop(output);
+                let _ = fs::remove_file(&partial).await;
+                remove_all_segment_parts(&destination, id).await;
                 let elapsed_ms = base_elapsed_ms
                     .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
                 update_entry_optional(app, state, id, |entry| {
-                    entry.downloaded_bytes = offset;
+                    entry.downloaded_bytes = 0;
                     entry.elapsed_ms = elapsed_ms;
                     Ok(())
                 })?;
@@ -5487,10 +5493,13 @@ async fn download_worker(
             .map_err(|error| filesystem_error("could not flush the downloaded file", error))?;
 
         if control.cancelled.load(Ordering::Acquire) {
+            drop(output);
+            let _ = fs::remove_file(&partial).await;
+            remove_all_segment_parts(&destination, id).await;
             let elapsed_ms = base_elapsed_ms
                 .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
             update_entry_optional(app, state, id, |entry| {
-                entry.downloaded_bytes = offset;
+                entry.downloaded_bytes = 0;
                 entry.elapsed_ms = elapsed_ms;
                 Ok(())
             })?;
@@ -11661,6 +11670,123 @@ mod tests {
         );
         assert_eq!(settled.attempts, 2);
         assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_pause_at_zero_bytes_resumes_and_completes_with_exact_size() {
+        let mp4 = valid_mp4(false);
+        let expected_mp4 = mp4.clone();
+        let (url, server) = spawn_synthetic_http_server(2, move |idx, _| {
+            let mut r = SyntheticHttpResponse::ok_mp4(mp4.clone());
+            if idx == 0 {
+                // Delay body bytes so pause occurs while status is Downloading with 0 bytes
+                // written and a 0-byte .fluxnet-part already created on disk.
+                r.delay_before_body_ms = 600;
+            }
+            r
+        });
+        let dir = create_test_temp_dir("pause-zero-bytes");
+        let dest = dir.join("paused_at_zero.mp4");
+        let part = partial_path(&dest);
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+
+        // Wait until the worker has created the 0-byte .fluxnet-part and entered Downloading.
+        let wait_start = Instant::now();
+        loop {
+            let snap = manager.snapshot().unwrap();
+            let current = snap.iter().find(|e| e.id == entry.id).unwrap();
+            if part.exists() && current.status == DownloadStatus::Downloading {
+                break;
+            }
+            assert!(
+                !current.status.is_terminal() && wait_start.elapsed() < Duration::from_secs(5),
+                "download did not reach Downloading at 0 bytes (state={current:?})"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
+
+        manager.pause_download(&entry.id).unwrap();
+        let paused = wait_for_download_settlement(&manager, &entry.id);
+        assert_eq!(paused.status, DownloadStatus::Paused);
+        assert_eq!(paused.downloaded_bytes, 0);
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
+
+        // Resume from the 0-byte .fluxnet-part — must NOT fail with os error 80.
+        manager.resume_download(None, &entry.id).unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        server.stop_and_join();
+
+        assert_eq!(
+            settled.status,
+            DownloadStatus::Completed,
+            "resuming from 0-byte partial must complete cleanly: {:?}",
+            settled.error
+        );
+        assert_eq!(settled.downloaded_bytes, expected_mp4.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+        assert!(!part.exists());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_sequential_cancel_deletes_partial_file_and_frees_slot() {
+        let mp4 = valid_mp4(false);
+        let (url, server) = spawn_synthetic_http_server(1, move |_, _| {
+            // Delay the single non-Range response body so cancel fires while .fluxnet-part is open.
+            let mut r = SyntheticHttpResponse::ok_mp4(mp4.clone());
+            r.delay_before_body_ms = 600;
+            r
+        });
+        let dir = create_test_temp_dir("seq-cancel-cleanup");
+        let dest = dir.join("cancelled_seq.mp4");
+        let part = partial_path(&dest);
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+
+        let wait_start = Instant::now();
+        loop {
+            let snap = manager.snapshot().unwrap();
+            let current = snap.iter().find(|e| e.id == entry.id).unwrap();
+            if part.exists() && current.status == DownloadStatus::Downloading {
+                break;
+            }
+            assert!(
+                !current.status.is_terminal() && wait_start.elapsed() < Duration::from_secs(5),
+                "download did not reach Downloading before cancel (state={current:?})"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(part.exists(), "partial file should exist before cancelling");
+
+        manager.cancel_download(None, &entry.id).unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        server.stop_and_join();
+
+        assert_eq!(settled.status, DownloadStatus::Cancelled);
+        assert!(!dest.exists());
+        assert!(
+            !part.exists(),
+            "cancelling a sequential direct download must delete .fluxnet-part"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "staging directory must be empty after cancelling sequential direct download"
+        );
+        assert_eq!(
+            manager.concurrency.active.load(Ordering::Acquire),
+            0,
+            "concurrency slot must be freed after cancel"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }

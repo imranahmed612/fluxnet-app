@@ -1,4 +1,4 @@
-//! yt-dlp metadata-only website discovery. No download or queue integration.
+//! Supervised yt-dlp website discovery and muxed-only video download (`download_selected_video`), wired into `DownloadManager::start_website_download`.
 
 use std::{
     collections::HashSet,
@@ -16,6 +16,8 @@ const MAX_FORMATS: usize = 2048;
 const MAX_TITLE_CHARS: usize = 512;
 const MAX_TEXT_CHARS: usize = 128;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SOCKET_TIMEOUT_SECS: &str = "30";
 const MAX_VIDEO_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 const VIDEO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const PROGRESS_PREFIX: &str = "FLUXNET_PROGRESS";
@@ -243,8 +245,10 @@ pub(crate) enum VideoDownloadError {
     InvalidSelection,
     SplitStreamsUnsupported,
     NoMuxedMp4,
+    MergeFailed,
     ProcessFailed,
     TimedOut,
+    IdleTimedOut,
     Cancelled,
     Paused { downloaded_bytes: u64 },
     OutputTooLarge,
@@ -264,8 +268,10 @@ impl std::fmt::Display for VideoDownloadError {
                 "This prototype downloads muxed formats only; separate audio/video merging is not available yet."
             }
             Self::NoMuxedMp4 => "No muxed MP4 or WebM format is available for this video.",
+            Self::MergeFailed => "Audio and video streams could not be merged.",
             Self::ProcessFailed => "The video could not be downloaded from this page.",
             Self::TimedOut => "The video download timed out.",
+            Self::IdleTimedOut => "The video download stalled without progress and timed out.",
             Self::Cancelled => "The video download was cancelled.",
             Self::Paused { .. } => "The video download was paused.",
             Self::OutputTooLarge => "The video exceeded the configured size limit.",
@@ -303,6 +309,7 @@ pub(crate) enum DiscoveryError {
     InvalidUrl,
     ProcessFailed,
     TimedOut,
+    IdleTimedOut,
     Cancelled,
     OutputTooLarge,
     InvalidJson,
@@ -318,6 +325,9 @@ impl std::fmt::Display for DiscoveryError {
             Self::InvalidUrl => "Enter a public HTTP or HTTPS video page URL.",
             Self::ProcessFailed => "Video information could not be retrieved from this page.",
             Self::TimedOut => "Video information retrieval timed out.",
+            Self::IdleTimedOut => {
+                "Video information retrieval stalled without progress and timed out."
+            }
             Self::Cancelled => "Video information retrieval was cancelled.",
             Self::OutputTooLarge => "The video information response exceeded the safe size limit.",
             Self::InvalidJson => "The video information response was invalid.",
@@ -493,6 +503,7 @@ fn discover_with_limits(
         working_directory: working_directory.to_path_buf(),
         environment,
         timeout,
+        idle_timeout: Some(IDLE_TIMEOUT),
         stdout_limit: output_limit,
         stderr_limit: 16 * 1024,
     };
@@ -528,6 +539,7 @@ fn discover_with_limits(
             return Err(DiscoveryError::Cancelled);
         }
         ProcessOutcome::TimedOut { .. } => return Err(DiscoveryError::TimedOut),
+        ProcessOutcome::IdleTimedOut { .. } => return Err(DiscoveryError::IdleTimedOut),
         ProcessOutcome::OutputLimitExceeded { .. } => return Err(DiscoveryError::OutputTooLarge),
     };
     if stdout.truncated || stdout.bytes.len() > output_limit {
@@ -560,6 +572,12 @@ fn yt_dlp_metadata_args(url: &str) -> Vec<std::ffi::OsString> {
         OsString::from("--no-cookies"),
         OsString::from("--no-cookies-from-browser"),
         OsString::from("--no-playlist"),
+        OsString::from("--socket-timeout"),
+        OsString::from(SOCKET_TIMEOUT_SECS),
+        OsString::from("--retries"),
+        OsString::from("0"),
+        OsString::from("--fragment-retries"),
+        OsString::from("0"),
         OsString::from("--skip-download"),
         OsString::from("--dump-single-json"),
         OsString::from("--no-write-info-json"),
@@ -819,12 +837,21 @@ pub(crate) fn download_selected_video_with_test_hooks(
             OsString::from(fixture_url),
         ));
     }
+    #[cfg(test)]
+    let effective_idle_timeout = if url_fixture_mode == Some("https://example.test/fixture-stall-idle") {
+        Some(Duration::from_millis(200))
+    } else {
+        Some(IDLE_TIMEOUT)
+    };
+    #[cfg(not(test))]
+    let effective_idle_timeout = Some(IDLE_TIMEOUT);
     let spec = ProcessSpec {
         executable: executable.to_path_buf(),
         args,
         working_directory: stage.path().to_path_buf(),
         environment,
         timeout,
+        idle_timeout: effective_idle_timeout,
         stdout_limit: 64 * 1024,
         stderr_limit: 64 * 1024,
     };
@@ -878,6 +905,16 @@ pub(crate) fn download_selected_video_with_test_hooks(
         return Err(VideoDownloadError::Paused {
             downloaded_bytes: paused_bytes,
         });
+    }
+
+    if matches!(process_outcome, ProcessOutcome::IdleTimedOut { .. }) && !control.is_cancelled() {
+        let _ = persist_paused_partial_file(
+            stage.path(),
+            &partial_destination,
+            maximum_bytes,
+            selected_format.extension,
+        );
+        return cleanup_stage_with_error(stage, VideoDownloadError::IdleTimedOut);
     }
 
     let prepared = prepare_download_file(
@@ -961,6 +998,605 @@ pub(crate) fn download_selected_video_with_test_hooks(
 pub(crate) struct SelectedFormat {
     pub(crate) selector: String,
     pub(crate) extension: &'static str,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SplitFormatSelection {
+    pub(crate) video_format_id: String,
+    pub(crate) audio_format_id: String,
+    pub(crate) container: &'static str,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DownloadPlan {
+    Muxed(SelectedFormat),
+    Split(SplitFormatSelection),
+}
+
+#[cfg(windows)]
+impl DownloadPlan {
+    pub(crate) fn extension(&self) -> &'static str {
+        match self {
+            Self::Muxed(m) => m.extension,
+            Self::Split(s) => s.container,
+        }
+    }
+
+    pub(crate) fn primary_format_id(&self) -> &str {
+        match self {
+            Self::Muxed(m) => &m.selector,
+            Self::Split(s) => &s.video_format_id,
+        }
+    }
+
+    pub(crate) fn audio_format_id(&self) -> Option<&str> {
+        match self {
+            Self::Muxed(_) => None,
+            Self::Split(s) => Some(&s.audio_format_id),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn download_plan_from_info(
+    format_id: &str,
+    audio_format_id: Option<&str>,
+    container: &str,
+) -> Result<DownloadPlan, VideoDownloadError> {
+    if let Some(audio_id) = audio_format_id {
+        if !valid_format_id(format_id) || !valid_format_id(audio_id) {
+            return Err(VideoDownloadError::InvalidSelection);
+        }
+        let ext = if container.eq_ignore_ascii_case("mp4") {
+            "mp4"
+        } else if container.eq_ignore_ascii_case("webm") {
+            "webm"
+        } else {
+            return Err(VideoDownloadError::NoMuxedMp4);
+        };
+        Ok(DownloadPlan::Split(SplitFormatSelection {
+            video_format_id: format_id.to_owned(),
+            audio_format_id: audio_id.to_owned(),
+            container: ext,
+        }))
+    } else {
+        Ok(DownloadPlan::Muxed(selected_format_from_info(
+            format_id, container,
+        )?))
+    }
+}
+
+#[cfg(windows)]
+fn is_video_only_format(format: &DiscoveredFormat) -> bool {
+    valid_format_id(&format.format_id)
+        && format.has_video
+        && !format.has_audio
+        && format.video_codec.as_deref() != Some("none")
+        && format.audio_codec.as_deref() == Some("none")
+}
+
+#[cfg(windows)]
+fn is_audio_only_format(format: &DiscoveredFormat) -> bool {
+    valid_format_id(&format.format_id)
+        && format.has_audio
+        && !format.has_video
+        && format.audio_codec.as_deref() != Some("none")
+        && format.video_codec.as_deref() == Some("none")
+}
+
+#[cfg(windows)]
+fn is_mp4_friendly_audio(format: &DiscoveredFormat) -> bool {
+    let ext = format.container.as_deref().map(str::to_ascii_lowercase);
+    matches!(ext.as_deref(), Some("m4a" | "mp4"))
+}
+
+#[cfg(windows)]
+fn is_mp4_friendly_video(format: &DiscoveredFormat) -> bool {
+    let ext = format.container.as_deref().map(str::to_ascii_lowercase);
+    matches!(ext.as_deref(), Some("mp4"))
+}
+
+#[cfg(windows)]
+fn best_audio_for_container<'a>(
+    formats: &'a [DiscoveredFormat],
+    prefer_mp4: bool,
+) -> Option<&'a DiscoveredFormat> {
+    let audio_candidates = formats
+        .iter()
+        .filter(|f| is_audio_only_format(f))
+        .collect::<Vec<_>>();
+    if audio_candidates.is_empty() {
+        return None;
+    }
+    let pick_best = |list: &[&'a DiscoveredFormat]| -> Option<&'a DiscoveredFormat> {
+        list.iter()
+            .copied()
+            .max_by_key(|f| f.file_size.unwrap_or(0))
+    };
+    if prefer_mp4 {
+        let mp4_audio = audio_candidates
+            .iter()
+            .copied()
+            .filter(|f| is_mp4_friendly_audio(f))
+            .collect::<Vec<_>>();
+        if let Some(best) = pick_best(&mp4_audio) {
+            return Some(best);
+        }
+    } else {
+        let webm_audio = audio_candidates
+            .iter()
+            .copied()
+            .filter(|f| {
+                f.container
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case("webm"))
+            })
+            .collect::<Vec<_>>();
+        if let Some(best) = pick_best(&webm_audio) {
+            return Some(best);
+        }
+    }
+    pick_best(&audio_candidates)
+}
+
+#[cfg(windows)]
+pub(crate) fn select_split_format(
+    catalog: &VideoDiscovery,
+    selection: &FormatSelection,
+) -> Result<SplitFormatSelection, VideoDownloadError> {
+    match selection {
+        FormatSelection::BestAvailable => {
+            let videos = catalog
+                .formats
+                .iter()
+                .filter(|f| is_video_only_format(f))
+                .collect::<Vec<_>>();
+            if videos.is_empty() {
+                return Err(VideoDownloadError::NoMuxedMp4);
+            }
+            let mp4_videos = videos
+                .iter()
+                .copied()
+                .filter(|f| is_mp4_friendly_video(f))
+                .collect::<Vec<_>>();
+            let (chosen_video, prefer_mp4) = if !mp4_videos.is_empty() {
+                let v = mp4_videos
+                    .into_iter()
+                    .max_by_key(|f| {
+                        (
+                            f.height.unwrap_or(0),
+                            f.fps.map(|v| (v * 100.0) as u64).unwrap_or(0),
+                            f.file_size.unwrap_or(0),
+                        )
+                    })
+                    .ok_or(VideoDownloadError::NoMuxedMp4)?;
+                (v, true)
+            } else {
+                let v = videos
+                    .into_iter()
+                    .max_by_key(|f| {
+                        (
+                            f.height.unwrap_or(0),
+                            f.fps.map(|v| (v * 100.0) as u64).unwrap_or(0),
+                            f.file_size.unwrap_or(0),
+                        )
+                    })
+                    .ok_or(VideoDownloadError::NoMuxedMp4)?;
+                (v, false)
+            };
+            let chosen_audio = best_audio_for_container(&catalog.formats, prefer_mp4)
+                .ok_or(VideoDownloadError::NoMuxedMp4)?;
+            let container = if prefer_mp4 && is_mp4_friendly_audio(chosen_audio) {
+                "mp4"
+            } else if chosen_video
+                .container
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("webm"))
+                && chosen_audio
+                    .container
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case("webm"))
+            {
+                "webm"
+            } else {
+                "mp4"
+            };
+            Ok(SplitFormatSelection {
+                video_format_id: chosen_video.format_id.clone(),
+                audio_format_id: chosen_audio.format_id.clone(),
+                container,
+            })
+        }
+        FormatSelection::Exact(id) => {
+            if !valid_format_id(id) {
+                return Err(VideoDownloadError::InvalidSelection);
+            }
+            let format = catalog
+                .formats
+                .iter()
+                .find(|format| &format.format_id == id)
+                .ok_or(VideoDownloadError::InvalidSelection)?;
+            if !is_video_only_format(format) {
+                return Err(VideoDownloadError::InvalidSelection);
+            }
+            let prefer_mp4 = is_mp4_friendly_video(format);
+            let chosen_audio = best_audio_for_container(&catalog.formats, prefer_mp4)
+                .ok_or(VideoDownloadError::NoMuxedMp4)?;
+            let container = if prefer_mp4 && is_mp4_friendly_audio(chosen_audio) {
+                "mp4"
+            } else if format
+                .container
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("webm"))
+                && chosen_audio
+                    .container
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case("webm"))
+            {
+                "webm"
+            } else {
+                "mp4"
+            };
+            Ok(SplitFormatSelection {
+                video_format_id: format.format_id.clone(),
+                audio_format_id: chosen_audio.format_id.clone(),
+                container,
+            })
+        }
+    }
+}
+
+/// Prefers muxed MP4/WebM when available; falls back to split video+audio
+/// selection (validated IDs, no leading '-') when no muxed format exists.
+#[cfg(windows)]
+pub(crate) fn select_download_plan(
+    catalog: &VideoDiscovery,
+    selection: &FormatSelection,
+) -> Result<DownloadPlan, VideoDownloadError> {
+    match select_muxed_format(catalog, selection) {
+        Ok(muxed) => Ok(DownloadPlan::Muxed(muxed)),
+        Err(VideoDownloadError::InvalidSelection) => Err(VideoDownloadError::InvalidSelection),
+        Err(VideoDownloadError::NoMuxedMp4 | VideoDownloadError::SplitStreamsUnsupported) => {
+            Ok(DownloadPlan::Split(select_split_format(catalog, selection)?))
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Downloads a split video-only + audio-only pair via supervised `yt-dlp`,
+/// merges them locally via verified LGPL `ffmpeg.exe` + `ffprobe.exe`,
+/// validates 1 video + 1 audio stream + full decode, and commits atomically.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn download_split_video(
+    ytdlp_executable: &Path,
+    ffmpeg_executable: &Path,
+    ffprobe_executable: &Path,
+    page_url: &str,
+    destination: &Path,
+    split: &SplitFormatSelection,
+    control: &DownloadTaskControl,
+    on_progress: std::sync::Arc<dyn Fn(VideoDownloadProgress) + Send + Sync>,
+) -> Result<VideoDownloadResult, VideoDownloadError> {
+    use crate::media::ffmpeg::{
+        EngineError, FfmpegAdapter, MediaProcessor, OutputContainer, StagedInput,
+    };
+
+    let normalized_url =
+        validate_public_page_url(page_url).map_err(|_| VideoDownloadError::InvalidUrl)?;
+    if !valid_format_id(&split.video_format_id) || !valid_format_id(&split.audio_format_id) {
+        return Err(VideoDownloadError::InvalidSelection);
+    }
+    let output_container = match split.container {
+        "mp4" => OutputContainer::Mp4,
+        "webm" => OutputContainer::Webm,
+        _ => return Err(VideoDownloadError::NoMuxedMp4),
+    };
+    let destination_text = destination
+        .to_str()
+        .ok_or(VideoDownloadError::InvalidDestination)?;
+    let (validated_destination, filename) =
+        crate::download_manager::validate_resumable_download_destination(destination_text)
+            .map_err(|_| VideoDownloadError::InvalidDestination)?;
+    if validated_destination
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_none_or(|ext| !ext.eq_ignore_ascii_case(split.container))
+    {
+        return Err(VideoDownloadError::InvalidDestination);
+    }
+    let parent = validated_destination
+        .parent()
+        .ok_or(VideoDownloadError::InvalidDestination)?;
+    let parent =
+        std::fs::canonicalize(parent).map_err(|_| VideoDownloadError::InvalidDestination)?;
+    let final_destination = parent.join(filename);
+    if final_destination.exists() {
+        return Err(VideoDownloadError::DestinationExists);
+    }
+
+    let job_stage =
+        RuntimeTempDir::create(&parent).map_err(|_| VideoDownloadError::TemporaryCleanupFailed)?;
+
+    let video_stage = match RuntimeTempDir::create(job_stage.path()) {
+        Ok(dir) => dir,
+        Err(_) => return cleanup_stage_with_error(job_stage, VideoDownloadError::TemporaryCleanupFailed),
+    };
+    let (video_file, video_bytes) = match run_ytdlp_stream_into_dir(
+        ytdlp_executable,
+        &normalized_url,
+        &split.video_format_id,
+        "video",
+        video_stage.path(),
+        MAX_VIDEO_DOWNLOAD_BYTES,
+        control,
+        std::sync::Arc::clone(&on_progress),
+    ) {
+        Ok(res) => res,
+        Err(err) => {
+            let _ = video_stage.cleanup();
+            return cleanup_stage_with_error(job_stage, err);
+        }
+    };
+
+    if control.is_cancelled() {
+        let _ = video_stage.cleanup();
+        return cleanup_stage_with_error(job_stage, VideoDownloadError::Cancelled);
+    }
+    let remaining_budget = MAX_VIDEO_DOWNLOAD_BYTES.saturating_sub(video_bytes);
+    if remaining_budget == 0 {
+        let _ = video_stage.cleanup();
+        return cleanup_stage_with_error(job_stage, VideoDownloadError::OutputTooLarge);
+    }
+
+    let audio_stage = match RuntimeTempDir::create(job_stage.path()) {
+        Ok(dir) => dir,
+        Err(_) => {
+            let _ = video_stage.cleanup();
+            return cleanup_stage_with_error(job_stage, VideoDownloadError::TemporaryCleanupFailed);
+        }
+    };
+    let (audio_file, _audio_bytes) = match run_ytdlp_stream_into_dir(
+        ytdlp_executable,
+        &normalized_url,
+        &split.audio_format_id,
+        "audio",
+        audio_stage.path(),
+        remaining_budget,
+        control,
+        std::sync::Arc::clone(&on_progress),
+    ) {
+        Ok(res) => res,
+        Err(err) => {
+            let _ = audio_stage.cleanup();
+            let _ = video_stage.cleanup();
+            return cleanup_stage_with_error(job_stage, err);
+        }
+    };
+
+    let adapter = FfmpegAdapter {
+        ffmpeg_executable: ffmpeg_executable.to_path_buf(),
+        ffprobe_executable: ffprobe_executable.to_path_buf(),
+    };
+    let merged = match adapter.merge(
+        &StagedInput {
+            primary_path: video_file,
+            secondary_path: Some(audio_file),
+            working_directory: job_stage.path().to_path_buf(),
+        },
+        output_container,
+        control,
+    ) {
+        Ok(out) => out,
+        Err(err) => {
+            let _ = audio_stage.cleanup();
+            let _ = video_stage.cleanup();
+            let mapped = match err {
+                EngineError::Cancelled => VideoDownloadError::Cancelled,
+                EngineError::TimedOut => VideoDownloadError::TimedOut,
+                EngineError::IdleTimedOut => VideoDownloadError::IdleTimedOut,
+                EngineError::OutputTooLarge => VideoDownloadError::OutputTooLarge,
+                EngineError::ValidationFailed => VideoDownloadError::InvalidMedia,
+                _ => VideoDownloadError::MergeFailed,
+            };
+            return cleanup_stage_with_error(job_stage, mapped);
+        }
+    };
+
+    let _ = audio_stage.cleanup();
+    let _ = video_stage.cleanup();
+
+    let transfer_path = match create_transfer_link(&merged.path, &parent) {
+        Ok(path) => path,
+        Err(err) => return cleanup_stage_with_error(job_stage, err),
+    };
+    if merged.path.exists() && std::fs::remove_file(&merged.path).is_err() {
+        let _ = std::fs::remove_file(&transfer_path);
+        return cleanup_stage_with_error(job_stage, VideoDownloadError::Filesystem);
+    }
+    if job_stage.cleanup().is_err() {
+        let _ = std::fs::remove_file(&transfer_path);
+        return Err(VideoDownloadError::TemporaryCleanupFailed);
+    }
+    if control.is_cancelled() {
+        let _ = std::fs::remove_file(&transfer_path);
+        return Err(VideoDownloadError::Cancelled);
+    }
+    if final_destination.exists() {
+        let _ = std::fs::remove_file(&transfer_path);
+        return Err(VideoDownloadError::DestinationExists);
+    }
+    let committed = if std::fs::hard_link(&transfer_path, &final_destination).is_ok() {
+        if std::fs::remove_file(&transfer_path).is_err() {
+            return Err(VideoDownloadError::TemporaryCleanupFailed);
+        }
+        Ok(())
+    } else if !final_destination.exists()
+        && std::fs::rename(&transfer_path, &final_destination).is_ok()
+    {
+        Ok(())
+    } else {
+        let _ = std::fs::remove_file(&transfer_path);
+        Err(if final_destination.exists() {
+            VideoDownloadError::DestinationExists
+        } else {
+            VideoDownloadError::Filesystem
+        })
+    };
+    committed?;
+    on_progress(VideoDownloadProgress {
+        downloaded_bytes: merged.bytes,
+        total_bytes: Some(merged.bytes),
+        speed_bytes_per_second: None,
+        eta_seconds: Some(0.0),
+        percent: Some(100.0),
+    });
+    Ok(VideoDownloadResult {
+        destination: final_destination,
+        bytes: merged.bytes,
+    })
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn run_ytdlp_stream_into_dir(
+    executable: &Path,
+    normalized_url: &str,
+    format_id: &str,
+    stream_role: &str,
+    stream_stage: &Path,
+    maximum_bytes: u64,
+    control: &DownloadTaskControl,
+    on_progress: std::sync::Arc<dyn Fn(VideoDownloadProgress) + Send + Sync>,
+) -> Result<(PathBuf, u64), VideoDownloadError> {
+    use crate::process::{
+        MonitoredOutput, OutputHandler, ProcessOutcome, ProcessSpec, ProcessStream,
+        run_supervised_with_output,
+    };
+    use std::ffi::OsString;
+
+    let mut runtime = RuntimeTempDir::create(stream_stage)
+        .map_err(|_| VideoDownloadError::TemporaryCleanupFailed)?;
+
+    #[cfg(test)]
+    let url_fixture_mode = normalized_url
+        .starts_with("https://example.test/fixture-")
+        .then_some(normalized_url);
+    #[cfg(not(test))]
+    let url_fixture_mode: Option<&str> = None;
+
+    let args = if url_fixture_mode.is_some() {
+        vec![
+            OsString::from("--exact"),
+            OsString::from("process::tests::job_object_test_child_fixture"),
+            OsString::from("--nocapture"),
+        ]
+    } else {
+        yt_dlp_download_args(normalized_url, format_id, maximum_bytes)
+    };
+
+    let mut environment = Vec::new();
+    for name in ["SystemRoot", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            environment.push((OsString::from(name), value));
+        }
+    }
+    environment.extend([
+        (OsString::from("TEMP"), runtime.path().as_os_str().to_owned()),
+        (OsString::from("TMP"), runtime.path().as_os_str().to_owned()),
+        (OsString::from("PYTHONNOUSERSITE"), OsString::from("1")),
+        (OsString::from("PYTHONDONTWRITEBYTECODE"), OsString::from("1")),
+    ]);
+    #[cfg(test)]
+    if let Some(fixture_url) = url_fixture_mode {
+        environment.push((OsString::from("FLUXNET_JOB_OBJECT_TEST_CHILD"), OsString::from("1")));
+        environment.push((
+            OsString::from("FLUXNET_JOB_OBJECT_TEST_FIXTURE_URL"),
+            OsString::from(fixture_url),
+        ));
+        environment.push((
+            OsString::from("FLUXNET_JOB_OBJECT_TEST_STREAM_ROLE"),
+            OsString::from(stream_role),
+        ));
+    }
+    #[cfg(not(test))]
+    let _ = stream_role;
+
+    let spec = ProcessSpec {
+        executable: executable.to_path_buf(),
+        args,
+        working_directory: stream_stage.to_path_buf(),
+        environment,
+        timeout: VIDEO_DOWNLOAD_TIMEOUT,
+        idle_timeout: Some(IDLE_TIMEOUT),
+        stdout_limit: 64 * 1024,
+        stderr_limit: 64 * 1024,
+    };
+    let progress_buffers =
+        std::sync::Arc::new(std::sync::Mutex::new(ProgressLineBuffers::default()));
+    let callback_buffers = std::sync::Arc::clone(&progress_buffers);
+    let progress_callback = std::sync::Arc::clone(&on_progress);
+    let handler: OutputHandler = std::sync::Arc::new(move |stream: ProcessStream, bytes: &[u8]| {
+        let lines = match callback_buffers.lock() {
+            Ok(mut buffers) => buffers.feed(stream, bytes),
+            Err(_) => Vec::new(),
+        };
+        for line in lines {
+            if let Some(progress) = parse_download_progress_line(&line) {
+                progress_callback(progress);
+            }
+        }
+    });
+    let monitored = MonitoredOutput {
+        directory: stream_stage.to_path_buf(),
+        filename_prefix: "fluxnet-media.".into(),
+        maximum_bytes,
+    };
+    let outcome = match run_supervised_with_output(&spec, control, handler, Some(monitored)) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            runtime.preserve_with_evidence("process_tree_shutdown_unconfirmed");
+            return Err(VideoDownloadError::TemporaryCleanupFailed);
+        }
+    };
+    if runtime.cleanup().is_err() {
+        return Err(VideoDownloadError::TemporaryCleanupFailed);
+    }
+    match outcome {
+        ProcessOutcome::Exited { code: 0, .. } => {}
+        ProcessOutcome::Exited { .. } => return Err(VideoDownloadError::ProcessFailed),
+        ProcessOutcome::Cancelled { .. } | ProcessOutcome::Paused { .. } => {
+            return Err(VideoDownloadError::Cancelled);
+        }
+        ProcessOutcome::TimedOut { .. } => return Err(VideoDownloadError::TimedOut),
+        ProcessOutcome::IdleTimedOut { .. } => return Err(VideoDownloadError::IdleTimedOut),
+        ProcessOutcome::OutputLimitExceeded { .. } => {
+            return Err(VideoDownloadError::OutputTooLarge);
+        }
+    }
+
+    let entries = std::fs::read_dir(stream_stage).map_err(|_| VideoDownloadError::Filesystem)?;
+    let files = entries
+        .map(|entry| entry.map_err(|_| VideoDownloadError::Filesystem))
+        .collect::<Result<Vec<_>, _>>()?;
+    if files.len() != 1 {
+        return Err(VideoDownloadError::InvalidMedia);
+    }
+    let file = &files[0];
+    if !file
+        .file_name()
+        .to_string_lossy()
+        .starts_with("fluxnet-media.")
+    {
+        return Err(VideoDownloadError::InvalidMedia);
+    }
+    let bytes = validate_regular_non_reparse_file(&file.path(), maximum_bytes)?;
+    if bytes == 0 {
+        return Err(VideoDownloadError::InvalidMedia);
+    }
+    Ok((file.path(), bytes))
 }
 
 #[cfg(windows)]
@@ -1078,6 +1714,12 @@ fn yt_dlp_download_args(
         OsString::from("--no-cookies"),
         OsString::from("--no-cookies-from-browser"),
         OsString::from("--no-playlist"),
+        OsString::from("--socket-timeout"),
+        OsString::from(SOCKET_TIMEOUT_SECS),
+        OsString::from("--retries"),
+        OsString::from("0"),
+        OsString::from("--fragment-retries"),
+        OsString::from("0"),
         OsString::from("--continue"),
         OsString::from("--part"),
         OsString::from("--no-write-info-json"),
@@ -1189,6 +1831,7 @@ fn prepare_download_file(
             return Err(VideoDownloadError::Cancelled);
         }
         ProcessOutcome::TimedOut { .. } => return Err(VideoDownloadError::TimedOut),
+        ProcessOutcome::IdleTimedOut { .. } => return Err(VideoDownloadError::IdleTimedOut),
         ProcessOutcome::OutputLimitExceeded { .. } => {
             return Err(VideoDownloadError::OutputTooLarge);
         }
@@ -1524,6 +2167,7 @@ fn codec(value: Option<&serde_json::Value>) -> Option<&str> {
 }
 fn valid_format_id(value: &str) -> bool {
     !value.is_empty()
+        && !value.starts_with('-')
         && value.len() <= MAX_TEXT_CHARS
         && value
             .bytes()
@@ -1592,17 +2236,10 @@ pub(crate) fn verify_ytdlp_executable(candidate: &Path) -> Result<PathBuf, Strin
 }
 
 #[cfg(windows)]
-pub(crate) fn resolve_verified_executable(
-    app: Option<&tauri::AppHandle>,
-) -> Result<PathBuf, String> {
+fn collect_trusted_release_candidates(app: Option<&tauri::AppHandle>) -> Vec<PathBuf> {
     use tauri::Manager;
 
     let mut candidates = Vec::new();
-    for env_name in ["FLUXNET_YTDLP_REAL_EXE", "FLUXNET_YTDLP_EXE"] {
-        if let Some(value) = std::env::var_os(env_name).filter(|v| !v.is_empty()) {
-            candidates.push(PathBuf::from(value));
-        }
-    }
     if let Some(app) = app {
         if let Ok(resource_dir) = app.path().resource_dir() {
             candidates.push(resource_dir.join("yt-dlp.exe"));
@@ -1620,22 +2257,54 @@ pub(crate) fn resolve_verified_executable(
             candidates.push(exe_dir.join("tools").join("yt-dlp.exe"));
         }
     }
-    if let Some(repo_root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
-        candidates.push(
-            repo_root
-                .join("experiments")
-                .join("media-engine-poc")
-                .join("test-tools")
-                .join("yt-dlp-2026.10.26")
-                .join("yt-dlp.exe"),
-        );
-        candidates.push(
-            repo_root
-                .join("experiments")
-                .join("media-engine-poc")
-                .join("yt-dlp-2026.10.26.exe"),
-        );
+    candidates
+}
+
+#[cfg(windows)]
+fn collect_executable_candidates_for_profile(
+    app: Option<&tauri::AppHandle>,
+    allow_dev_candidates: bool,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    #[cfg(any(test, debug_assertions))]
+    if allow_dev_candidates {
+        for env_name in ["FLUXNET_YTDLP_REAL_EXE", "FLUXNET_YTDLP_EXE"] {
+            if let Some(value) = std::env::var_os(env_name).filter(|v| !v.is_empty()) {
+                candidates.push(PathBuf::from(value));
+            }
+        }
     }
+    candidates.extend(collect_trusted_release_candidates(app));
+    #[cfg(any(test, debug_assertions))]
+    if allow_dev_candidates {
+        if let Some(repo_root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+            candidates.push(
+                repo_root
+                    .join("experiments")
+                    .join("media-engine-poc")
+                    .join("test-tools")
+                    .join("yt-dlp-2026.10.26")
+                    .join("yt-dlp.exe"),
+            );
+            candidates.push(
+                repo_root
+                    .join("experiments")
+                    .join("media-engine-poc")
+                    .join("yt-dlp-2026.10.26.exe"),
+            );
+        }
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    let _ = allow_dev_candidates;
+    candidates
+}
+
+#[cfg(windows)]
+pub(crate) fn resolve_verified_executable(
+    app: Option<&tauri::AppHandle>,
+) -> Result<PathBuf, String> {
+    let candidates =
+        collect_executable_candidates_for_profile(app, cfg!(any(test, debug_assertions)));
     resolve_verified_executable_from_candidates(&candidates)
 }
 
@@ -2052,6 +2721,30 @@ mod tests {
                 VERIFIED_YTDLP_SIZE_BYTES
             );
         }
+
+        // Gap 3: Release-profile candidate list excludes experiments/PoC and env overrides,
+        // whereas test/debug candidate list retains them.
+        let release_candidates = collect_executable_candidates_for_profile(None, false);
+        assert!(
+            !release_candidates.is_empty(),
+            "release profile should still check exe-adjacent trusted paths"
+        );
+        assert!(
+            release_candidates.iter().all(|path| {
+                let text = path.to_string_lossy().to_ascii_lowercase();
+                !text.contains("experiments") && !text.contains("media-engine-poc")
+            }),
+            "release candidates must not contain dev/PoC experiments paths: {release_candidates:?}"
+        );
+
+        let dev_candidates = collect_executable_candidates_for_profile(None, true);
+        assert!(
+            dev_candidates.iter().any(|path| {
+                let text = path.to_string_lossy();
+                text.contains("experiments") && text.contains("media-engine-poc")
+            }),
+            "test/debug candidates must retain experiments/media-engine-poc paths"
+        );
     }
 
     const SAMPLE: &[u8] = br#"{"title":"Demo","duration":12.5,"extractor":"Example","extractor_key":"ExampleSite","webpage_url":"https://example.test/v?token=SECRET","formats":[{"format_id":"v1080","width":1920,"height":1080,"fps":60,"vcodec":"avc1.640028","acodec":"none","ext":"mp4","filesize":1234,"url":"https://cdn.test/a?signature=SECRET"},{"format_id":"a","vcodec":"none","acodec":"mp4a.40.2","ext":"m4a"},{"format_id":"muxed","height":720,"vcodec":"vp9","acodec":"opus","ext":"webm"}]}"#;
@@ -2173,6 +2866,105 @@ mod tests {
                 extension: "mp4"
             }
         );
+
+        // Gap 4: Reject any format_id starting with '-' (option-like strings) across all entry points.
+        for bad_id in ["-best", "--help", "--cookies", "-f", "-"] {
+            assert!(
+                !valid_format_id(bad_id),
+                "format_id starting with '-' must be rejected: {bad_id}"
+            );
+            assert_eq!(
+                selected_format_from_info(bad_id, "mp4"),
+                Err(VideoDownloadError::InvalidSelection)
+            );
+            let mut injected = with_muxed_mp4.clone();
+            injected.formats.push(DiscoveredFormat {
+                format_id: bad_id.into(),
+                resolution: Some("1280x720".into()),
+                height: Some(720),
+                fps: Some(30.0),
+                video_codec: Some("avc1".into()),
+                audio_codec: Some("mp4a".into()),
+                container: Some("mp4".into()),
+                file_size: None,
+                has_video: true,
+                has_audio: true,
+                requires_separate_audio: false,
+            });
+            assert_eq!(
+                select_muxed_format(&injected, &FormatSelection::Exact(bad_id.into())),
+                Err(VideoDownloadError::InvalidSelection)
+            );
+        }
+        let dash_json = br#"{"title":"OptionId","formats":[{"format_id":"-best","vcodec":"avc1","acodec":"mp4a","ext":"mp4"},{"format_id":"--help","vcodec":"avc1","acodec":"mp4a","ext":"mp4"}]}"#;
+        assert_eq!(
+            parse_discovery_json(dash_json).unwrap_err(),
+            DiscoveryError::NoFormats
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn split_format_selection_falls_back_when_no_muxed_and_rejects_option_ids() {
+        let split_only_json = br#"{"title":"DASH Reel","duration":18.0,"extractor_key":"Instagram","formats":[
+            {"format_id":"-evil","width":3840,"height":2160,"vcodec":"avc1","acodec":"none","ext":"mp4","filesize":99999},
+            {"format_id":"--help","vcodec":"none","acodec":"mp4a.40.2","ext":"m4a","filesize":99999},
+            {"format_id":"136","width":1280,"height":720,"fps":30,"vcodec":"avc1.64001f","acodec":"none","ext":"mp4","filesize":2000},
+            {"format_id":"137","width":1920,"height":1080,"fps":60,"vcodec":"avc1.640028","acodec":"none","ext":"mp4","filesize":5000},
+            {"format_id":"140","vcodec":"none","acodec":"mp4a.40.2","ext":"m4a","filesize":1200}
+        ]}"#;
+        let catalog = parse_discovery_json(split_only_json).unwrap();
+        assert_eq!(
+            select_muxed_format(&catalog, &FormatSelection::BestAvailable),
+            Err(VideoDownloadError::NoMuxedMp4)
+        );
+        assert_eq!(
+            select_download_plan(&catalog, &FormatSelection::BestAvailable).unwrap(),
+            DownloadPlan::Split(SplitFormatSelection {
+                video_format_id: "137".into(),
+                audio_format_id: "140".into(),
+                container: "mp4",
+            })
+        );
+        assert_eq!(
+            select_download_plan(&catalog, &FormatSelection::Exact("136".into())).unwrap(),
+            DownloadPlan::Split(SplitFormatSelection {
+                video_format_id: "136".into(),
+                audio_format_id: "140".into(),
+                container: "mp4",
+            })
+        );
+        assert_eq!(
+            select_download_plan(&catalog, &FormatSelection::Exact("-evil".into())),
+            Err(VideoDownloadError::InvalidSelection)
+        );
+        assert_eq!(
+            select_download_plan(&catalog, &FormatSelection::Exact("--help".into())),
+            Err(VideoDownloadError::InvalidSelection)
+        );
+
+        // When a muxed format exists, muxed remains preferred over split fallback.
+        let mut with_muxed = catalog;
+        with_muxed.formats.push(DiscoveredFormat {
+            format_id: "18".into(),
+            resolution: Some("640x360".into()),
+            height: Some(360),
+            fps: Some(30.0),
+            video_codec: Some("avc1".into()),
+            audio_codec: Some("mp4a".into()),
+            container: Some("mp4".into()),
+            file_size: Some(1500),
+            has_video: true,
+            has_audio: true,
+            requires_separate_audio: false,
+        });
+        assert_eq!(
+            select_download_plan(&with_muxed, &FormatSelection::BestAvailable).unwrap(),
+            DownloadPlan::Muxed(SelectedFormat {
+                selector: "best[ext=mp4]".into(),
+                extension: "mp4",
+            })
+        );
     }
 
     #[test]
@@ -2226,6 +3018,10 @@ mod tests {
             "--no-cookies",
             "--no-cookies-from-browser",
             "--no-playlist",
+            "--socket-timeout",
+            "30",
+            "--retries",
+            "--fragment-retries",
             "--skip-download",
             "--dump-single-json",
             "--no-write-info-json",
@@ -2241,6 +3037,16 @@ mod tests {
                 "missing safety option {required}"
             );
         }
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--retries" && pair[1] == "0"),
+            "metadata args must pass --retries 0"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--fragment-retries" && pair[1] == "0"),
+            "metadata args must pass --fragment-retries 0"
+        );
         assert_eq!(
             args.last().map(|s| s.as_ref()),
             Some("https://example.test/watch?v=1")
@@ -2264,6 +3070,10 @@ mod tests {
             "--no-cookies",
             "--no-cookies-from-browser",
             "--no-playlist",
+            "--socket-timeout",
+            "30",
+            "--retries",
+            "--fragment-retries",
             "--continue",
             "--part",
             "--no-write-info-json",
@@ -2279,6 +3089,16 @@ mod tests {
                 "missing required download option {required}"
             );
         }
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--retries" && pair[1] == "0"),
+            "download args must pass --retries 0"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--fragment-retries" && pair[1] == "0"),
+            "download args must pass --fragment-retries 0"
+        );
         assert_eq!(
             args.last().map(|s| s.as_ref()),
             Some("https://example.test/watch?v=1")

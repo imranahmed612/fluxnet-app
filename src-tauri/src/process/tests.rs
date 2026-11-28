@@ -157,6 +157,106 @@ fn job_object_test_child_fixture() {
             stdout.flush().unwrap();
             thread::sleep(Duration::from_millis(40));
             std::process::exit(0);
+        } else if fixture_url.contains("fixture-stall-idle") {
+            std::fs::write(&part, b"PARTIAL_MP4_PREFIX_BYTES_32_____").unwrap();
+            let mut stdout = std::io::stdout();
+            stdout
+                .write_all(b"FLUXNET_PROGRESS\tdownloading\t32\t100\t100\t64.0\t1\n")
+                .unwrap();
+            stdout.flush().unwrap();
+            let executable = std::env::current_exe().expect("fixture executable should resolve");
+            let ready_marker = std::env::var_os("TEMP")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| cwd.clone())
+                .join("stall-grandchild.ready");
+            let _grandchild = Command::new(executable)
+                .arg("--exact")
+                .arg("process::tests::job_object_test_child_fixture")
+                .arg("--nocapture")
+                .env(CHILD_FIXTURE_ENV, "wait")
+                .env(CHILD_READY_ENV, ready_marker)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("stalled fixture descendant should start");
+            loop {
+                thread::sleep(Duration::from_secs(1));
+            }
+        } else if fixture_url.contains("fixture-aggregate-overflow") {
+            const CHUNK_220_MIB: u64 = 220 * 1024 * 1024;
+            let f1 = std::fs::File::create(&part).unwrap();
+            f1.set_len(CHUNK_220_MIB).unwrap();
+            let f2 = std::fs::File::create(cwd.join("sidecar-chunk.tmp")).unwrap();
+            f2.set_len(CHUNK_220_MIB).unwrap();
+            if let Some(temp) = std::env::var_os("TEMP") {
+                let mei = std::path::PathBuf::from(temp).join("_MEI_overflow");
+                std::fs::create_dir_all(&mei).unwrap();
+                for name in ["chunk-a.bin", "chunk-b.bin", "chunk-c.bin"] {
+                    let ft = std::fs::File::create(mei.join(name)).unwrap();
+                    ft.set_len(CHUNK_220_MIB).unwrap();
+                }
+            }
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        } else if fixture_url.contains("fixture-split-ok")
+            || fixture_url.contains("fixture-split-merge-fail")
+        {
+            let role = std::env::var("FLUXNET_JOB_OBJECT_TEST_STREAM_ROLE").unwrap_or_default();
+            let ffmpeg = crate::media::ffmpeg::resolve_verified_ffmpeg_executable(None)
+                .expect("verified LGPL ffmpeg.exe should resolve in split fixture");
+            if role == "video" {
+                let out = cwd.join("fluxnet-media.mp4");
+                let status = Command::new(&ffmpeg)
+                    .args([
+                        "-nostdin",
+                        "-hide_banner",
+                        "-v",
+                        "error",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "testsrc=duration=0.5:size=160x120:rate=10",
+                        "-c:v",
+                        "mpeg4",
+                        "-an",
+                    ])
+                    .arg(&out)
+                    .status()
+                    .expect("generate split video-only stream");
+                assert!(status.success());
+            } else if fixture_url.contains("fixture-split-merge-fail") {
+                std::fs::write(cwd.join("fluxnet-media.m4a"), b"CORRUPT_AUDIO_BYTES").unwrap();
+            } else {
+                let out = cwd.join("fluxnet-media.m4a");
+                let status = Command::new(&ffmpeg)
+                    .args([
+                        "-nostdin",
+                        "-hide_banner",
+                        "-v",
+                        "error",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "sine=frequency=440:duration=0.5",
+                        "-c:a",
+                        "aac",
+                        "-vn",
+                    ])
+                    .arg(&out)
+                    .status()
+                    .expect("generate split audio-only stream");
+                assert!(status.success());
+            }
+            let mut stdout = std::io::stdout();
+            stdout
+                .write_all(b"FLUXNET_PROGRESS\tdownloading\t50\t100\t100\t128.0\t0\n")
+                .unwrap();
+            stdout.flush().unwrap();
+            std::process::exit(0);
         }
     }
 
@@ -248,6 +348,17 @@ fn job_object_test_child_fixture() {
             existing.extend_from_slice(b"INCOMPATIBLE_NON_MP4_RANGE_BYTES");
             std::fs::write(&part, &existing).unwrap();
             std::fs::rename(&part, cwd.join("fluxnet-media.mp4")).unwrap();
+            std::process::exit(0);
+        }
+        Ok("yt-dlp-file-growth") => {
+            let cwd = std::env::current_dir().unwrap();
+            let part = cwd.join("fluxnet-media.mp4.part");
+            let mut data = Vec::new();
+            for _ in 0..6 {
+                data.extend_from_slice(&[b'G'; 32]);
+                std::fs::write(&part, &data).unwrap();
+                thread::sleep(Duration::from_millis(85));
+            }
             std::process::exit(0);
         }
         _ => {}
@@ -639,6 +750,47 @@ fn supervisor_streams_output_and_enforces_task_output_size_limit() {
         ProcessOutcome::OutputLimitExceeded { .. }
     ));
     std::fs::remove_dir_all(monitored_directory).unwrap();
+
+    // Gap 5: Many files across stage + nested runtime/temp summing over 1 GiB (MAX_VIDEO_DOWNLOAD_BYTES)
+    // must trigger OutputLimitExceeded even when no single file exceeds 1 GiB!
+    const ONE_GIB: u64 = 1024 * 1024 * 1024;
+    const CHUNK_220_MIB: u64 = 220 * 1024 * 1024; // 5 * 220 MiB = 1,100 MiB > 1,024 MiB (1 GiB), each < 1 GiB
+    let aggregate_stage = std::env::temp_dir().join(format!(
+        "fluxnet-aggregate-1gib-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let nested_runtime = aggregate_stage
+        .join(".fluxnet-yt-dlp-runtime-sim")
+        .join("_MEI_nested");
+    std::fs::create_dir_all(&nested_runtime).unwrap();
+    for name in ["fluxnet-media.mp4.part", "sidecar-frag-1.tmp"] {
+        let f = std::fs::File::create(aggregate_stage.join(name)).unwrap();
+        f.set_len(CHUNK_220_MIB).unwrap();
+    }
+    for name in ["temp-a.bin", "temp-b.bin", "temp-c.bin"] {
+        let f = std::fs::File::create(nested_runtime.join(name)).unwrap();
+        f.set_len(CHUNK_220_MIB).unwrap();
+    }
+    let agg_outcome = run_with_output(
+        &spec,
+        &DownloadTaskControl::default(),
+        Arc::new(|_, _| {}),
+        Some(MonitoredOutput {
+            directory: aggregate_stage.clone(),
+            filename_prefix: "fluxnet-media.".into(),
+            maximum_bytes: ONE_GIB,
+        }),
+    )
+    .unwrap();
+    assert!(
+        matches!(agg_outcome, ProcessOutcome::OutputLimitExceeded { .. }),
+        "5 x 220 MiB files across stage + runtime summing over 1 GiB must trigger OutputLimitExceeded; got {agg_outcome:?}"
+    );
+    std::fs::remove_dir_all(aggregate_stage).unwrap();
 }
 
 #[test]
@@ -824,11 +976,89 @@ pub(crate) fn process_fixture_spec_for_integration() -> (ProcessSpec, std::path:
             working_directory,
             environment,
             timeout: Duration::from_secs(30),
+            idle_timeout: None,
             stdout_limit: 64 * 1024,
             stderr_limit: 64 * 1024,
         },
         ready_path,
     )
+}
+
+#[test]
+fn supervisor_idle_timeout_resets_on_file_growth_and_kills_stalled_tree() {
+    use super::supervisor::{MonitoredOutput, ProcessOutcome, run, run_with_output};
+    use crate::download_manager::DownloadTaskControl;
+    use std::sync::Arc;
+
+    // 1. Stalled process with 45-minute wall timeout fails fast on idle_timeout and kills grandchild.
+    let (mut spec, ready_path) = process_fixture_spec();
+    spec.args.truncate(3);
+    spec.environment.retain(|(k, _)| k != CHILD_CHECK_ARGS_ENV);
+    let grandchild_pid_path = ready_path.with_extension("grandchild.pid");
+    let grandchild_ready_path = ready_path.with_extension("grandchild.ready");
+    spec.timeout = Duration::from_secs(45 * 60);
+    spec.idle_timeout = Some(Duration::from_millis(280));
+
+    let started = Instant::now();
+    let outcome = run(&spec, &DownloadTaskControl::default()).unwrap();
+    assert!(
+        matches!(outcome, ProcessOutcome::IdleTimedOut { .. }),
+        "expected IdleTimedOut, got {outcome:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "idle timeout must fail fast instead of waiting for 45-minute wall timeout"
+    );
+    if let Ok(pid_text) = std::fs::read_to_string(&grandchild_pid_path) {
+        if let Ok(grandchild_pid) = pid_text.trim().parse::<u32>() {
+            assert_process_terminated(grandchild_pid);
+        }
+    }
+    let _ = std::fs::remove_file(&ready_path);
+    let _ = std::fs::remove_file(&grandchild_pid_path);
+    let _ = std::fs::remove_file(&grandchild_ready_path);
+
+    // 2. Active process growing staged output every 90ms (~360ms total) resets 220ms idle timer and exits 0.
+    let growth_dir = std::env::temp_dir().join(format!(
+        "fluxnet-idle-growth-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&growth_dir).unwrap();
+    let (mut growth_spec, _) = process_fixture_spec();
+    growth_spec.args.truncate(3);
+    growth_spec.working_directory = growth_dir.clone();
+    growth_spec.environment.retain(|(k, _)| {
+        k != CHILD_CHECK_ARGS_ENV
+            && k != CHILD_GRANDCHILD_PID_ENV
+            && k != CHILD_GRANDCHILD_READY_ENV
+            && k != CHILD_READY_ENV
+    });
+    growth_spec.environment.push((
+        OsString::from(CHILD_MODE_ENV),
+        OsString::from("yt-dlp-file-growth"),
+    ));
+    growth_spec.timeout = Duration::from_secs(10);
+    growth_spec.idle_timeout = Some(Duration::from_millis(280));
+    let growth_outcome = run_with_output(
+        &growth_spec,
+        &DownloadTaskControl::default(),
+        Arc::new(|_, _| {}),
+        Some(MonitoredOutput {
+            directory: growth_dir.clone(),
+            filename_prefix: "fluxnet-media.".into(),
+            maximum_bytes: 1024 * 1024,
+        }),
+    )
+    .unwrap();
+    assert!(
+        matches!(growth_outcome, ProcessOutcome::Exited { code: 0, .. }),
+        "staged file byte growth must reset idle timer; got {growth_outcome:?}"
+    );
+    let _ = std::fs::remove_dir_all(growth_dir);
 }
 
 pub(crate) fn assert_process_terminated(process_id: u32) {

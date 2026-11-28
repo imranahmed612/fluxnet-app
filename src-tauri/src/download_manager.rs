@@ -4,7 +4,7 @@ use crate::browser_bridge::{
 use futures_util::StreamExt;
 use reqwest::{
     Client, StatusCode,
-    header::{CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE},
+    header::{ACCEPT_RANGES, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,13 +23,19 @@ use tauri_plugin_notification::NotificationExt;
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
-    sync::Notify,
+    sync::{Notify, Semaphore},
     time::sleep,
 };
 
 const DOWNLOAD_EVENT: &str = "download-manager-update";
 const DOWNLOAD_HISTORY_FILE: &str = "download-history.json";
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
+const DEFAULT_CONNECTIONS_PER_DOWNLOAD: usize = 4;
+const MAX_CONNECTIONS_PER_DOWNLOAD: usize = 16;
+const MIN_PARALLEL_SEGMENT_BYTES: u64 = 16;
+const MIN_PARALLEL_FILE_BYTES: u64 = 64;
+const MAX_SEGMENT_ATTEMPTS: usize = 3;
+const MAX_AUTO_RESUME_ATTEMPTS: u32 = 5;
 const MAX_URL_LENGTH: usize = 8192;
 const MAX_FILENAME_STEM_CHARS: usize = 80;
 const MAX_MP4_ATOM_COUNT: usize = 100_000;
@@ -62,9 +68,25 @@ impl DownloadStatus {
 #[serde(rename_all = "camelCase")]
 pub struct WebsiteMediaInfo {
     pub format_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_format_id: Option<String>,
     pub container: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadSegment {
+    pub index: usize,
+    pub start: u64,
+    pub end: u64,
+    pub downloaded_bytes: u64,
+    pub completed: bool,
+}
+
+fn default_connections_per_download() -> usize {
+    DEFAULT_CONNECTIONS_PER_DOWNLOAD
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +112,8 @@ pub struct DownloadEntry {
     hls_completed_parts: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub website_media: Option<WebsiteMediaInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<DownloadSegment>,
     etag: Option<String>,
     last_modified: Option<String>,
     pub notifications_enabled: bool,
@@ -104,6 +128,8 @@ struct PersistedDownloads {
     version: u8,
     entries: Vec<DownloadEntry>,
     max_concurrent: usize,
+    #[serde(default = "default_connections_per_download")]
+    max_connections_per_download: usize,
     bandwidth_limit_bytes_per_second: Option<u64>,
     #[serde(default)]
     notifications_enabled: bool,
@@ -128,6 +154,7 @@ fn persisted_notification_preferences(
 pub(crate) struct DownloadTaskControl {
     cancelled: AtomicBool,
     pause_requested: AtomicBool,
+    shutdown_requested: AtomicBool,
     wake: Notify,
 }
 
@@ -140,7 +167,7 @@ async fn run_ytdlp_download_worker(
     concurrency: &Arc<ConcurrencyLimiter>,
     id: &str,
     executable: PathBuf,
-    selected_format: crate::media::yt_dlp::SelectedFormat,
+    download_plan: crate::media::yt_dlp::DownloadPlan,
     control: &Arc<DownloadTaskControl>,
 ) -> Result<(), String> {
     let Some(_slot) = concurrency.acquire(state, control).await? else {
@@ -243,18 +270,45 @@ async fn run_ytdlp_download_worker(
                 },
             );
         });
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::media::yt_dlp::download_selected_video(
-            &executable,
-            &url,
-            &destination_for_worker,
-            &selected_format,
-            &process_control,
-            progress,
-        )
-    })
-    .await
-    .map_err(|_| "The video download worker could not finish.".to_owned())?;
+    let app_for_split = app.cloned();
+    let result = match download_plan {
+        crate::media::yt_dlp::DownloadPlan::Muxed(selected_format) => {
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::media::yt_dlp::download_selected_video(
+                    &executable,
+                    &url,
+                    &destination_for_worker,
+                    &selected_format,
+                    &process_control,
+                    progress,
+                )
+            })
+            .await
+            .map_err(|_| "The video download worker could not finish.".to_owned())?
+        }
+        crate::media::yt_dlp::DownloadPlan::Split(split) => {
+            let ffmpeg_exe = crate::media::ffmpeg::resolve_verified_ffmpeg_executable(
+                app_for_split.as_ref(),
+            )?;
+            let ffprobe_exe = crate::media::ffmpeg::resolve_verified_ffprobe_executable(
+                app_for_split.as_ref(),
+            )?;
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::media::yt_dlp::download_split_video(
+                    &executable,
+                    &ffmpeg_exe,
+                    &ffprobe_exe,
+                    &url,
+                    &destination_for_worker,
+                    &split,
+                    &process_control,
+                    progress,
+                )
+            })
+            .await
+            .map_err(|_| "The video download worker could not finish.".to_owned())?
+        }
+    };
 
     let elapsed_ms =
         base_elapsed_ms.saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
@@ -348,6 +402,34 @@ fn remove_website_partial_if_present(state: &Mutex<DownloadState>, id: &str) {
 }
 
 #[cfg(windows)]
+fn verify_website_executable_for_resume(candidate: &Path, url: &str) -> Result<PathBuf, String> {
+    #[cfg(test)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if url.starts_with("https://example.test/fixture-") {
+            if let (Ok(current_exe), Ok(meta)) =
+                (std::env::current_exe(), std::fs::symlink_metadata(candidate))
+            {
+                if meta.is_file() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                    if let (Ok(canon_candidate), Ok(canon_self)) = (
+                        std::fs::canonicalize(candidate),
+                        std::fs::canonicalize(current_exe),
+                    ) {
+                        if canon_candidate == canon_self {
+                            return Ok(candidate.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(test))]
+    let _ = url;
+    crate::media::yt_dlp::verify_ytdlp_executable(candidate)
+}
+
+#[cfg(windows)]
 fn spawn_website_worker(
     app: Option<tauri::AppHandle>,
     state: Arc<Mutex<DownloadState>>,
@@ -355,7 +437,7 @@ fn spawn_website_worker(
     worker_count: Arc<AtomicUsize>,
     id: String,
     executable: PathBuf,
-    selected_format: crate::media::yt_dlp::SelectedFormat,
+    download_plan: crate::media::yt_dlp::DownloadPlan,
     control: Arc<DownloadTaskControl>,
 ) {
     worker_count.fetch_add(1, Ordering::AcqRel);
@@ -367,7 +449,7 @@ fn spawn_website_worker(
             &concurrency,
             &id,
             executable,
-            selected_format,
+            download_plan,
             &control,
         )
         .await
@@ -384,6 +466,7 @@ impl Default for DownloadTaskControl {
         Self {
             cancelled: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
+            shutdown_requested: AtomicBool::new(false),
             wake: Notify::new(),
         }
     }
@@ -396,6 +479,7 @@ impl DownloadTaskControl {
 
     pub(crate) fn request_cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.wake.notify_waiters();
         self.wake.notify_one();
     }
 
@@ -406,6 +490,17 @@ impl DownloadTaskControl {
     #[allow(dead_code)]
     pub(crate) fn request_pause(&self) {
         self.pause_requested.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+        self.wake.notify_one();
+    }
+
+    pub(crate) fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.wake.notify_waiters();
         self.wake.notify_one();
     }
 }
@@ -418,6 +513,7 @@ struct DownloadState {
     #[cfg(windows)]
     verified_ytdlp_executable: Option<(PathBuf, Option<SystemTime>)>,
     max_concurrent: usize,
+    max_connections_per_download: usize,
     bandwidth_limit_bytes_per_second: Option<u64>,
     history_path: Option<PathBuf>,
     notifications_enabled: bool,
@@ -435,6 +531,7 @@ impl Default for DownloadState {
             #[cfg(windows)]
             verified_ytdlp_executable: None,
             max_concurrent: 2,
+            max_connections_per_download: DEFAULT_CONNECTIONS_PER_DOWNLOAD,
             bandwidth_limit_bytes_per_second: None,
             history_path: None,
             notifications_enabled: false,
@@ -466,7 +563,9 @@ impl ConcurrencyLimiter {
         control: &DownloadTaskControl,
     ) -> Result<Option<DownloadSlot>, String> {
         loop {
-            if control.cancelled.load(Ordering::Acquire) {
+            if control.cancelled.load(Ordering::Acquire)
+                || control.shutdown_requested.load(Ordering::Acquire)
+            {
                 return Ok(None);
             }
             let notified = self.notify.notified();
@@ -563,7 +662,7 @@ impl DownloadManager {
             #[cfg(windows)]
             Website {
                 executable: PathBuf,
-                selected_format: crate::media::yt_dlp::SelectedFormat,
+                download_plan: crate::media::yt_dlp::DownloadPlan,
             },
         }
 
@@ -587,16 +686,18 @@ impl DownloadManager {
             let target = if let Some(website_media) = &original.website_media {
                 #[cfg(windows)]
                 {
-                    let executable = state
+                    let cached_executable = state
                         .website_executables
                         .get(id)
                         .cloned()
-                        .filter(|path| path.is_file())
                         .ok_or_else(|| {
                             "The yt-dlp executable for this paused website download is no longer available; start a new download to retry.".to_owned()
                         })?;
-                    let selected_format = crate::media::yt_dlp::selected_format_from_info(
+                    let executable =
+                        verify_website_executable_for_resume(&cached_executable, &original.url)?;
+                    let download_plan = crate::media::yt_dlp::download_plan_from_info(
                         &website_media.format_id,
+                        website_media.audio_format_id.as_deref(),
                         &website_media.container,
                     )
                     .map_err(|error| error.to_string())?;
@@ -605,7 +706,7 @@ impl DownloadManager {
                     if validated_dest
                         .extension()
                         .and_then(|ext| ext.to_str())
-                        .is_none_or(|ext| !ext.eq_ignore_ascii_case(selected_format.extension))
+                        .is_none_or(|ext| !ext.eq_ignore_ascii_case(download_plan.extension()))
                     {
                         return Err(
                             "The paused website download destination extension no longer matches its format container."
@@ -614,7 +715,7 @@ impl DownloadManager {
                     }
                     ResumeTarget::Website {
                         executable,
-                        selected_format,
+                        download_plan,
                     }
                 }
                 #[cfg(not(windows))]
@@ -648,14 +749,8 @@ impl DownloadManager {
         emit_entry_optional(app, entry);
         match target {
             ResumeTarget::Standard => {
-                let Some(app) = app.cloned() else {
-                    return Err(
-                        "An application handle is required to resume standard HTTP/HLS downloads."
-                            .into(),
-                    );
-                };
                 spawn_worker(
-                    app,
+                    app.cloned(),
                     Arc::clone(&self.state),
                     Arc::clone(&self.concurrency),
                     Arc::clone(&self.bandwidth),
@@ -668,7 +763,7 @@ impl DownloadManager {
             #[cfg(windows)]
             ResumeTarget::Website {
                 executable,
-                selected_format,
+                download_plan,
             } => {
                 spawn_website_worker(
                     app.cloned(),
@@ -677,7 +772,7 @@ impl DownloadManager {
                     Arc::clone(&self.worker_count),
                     id.to_owned(),
                     executable,
-                    selected_format,
+                    download_plan,
                     control,
                 );
             }
@@ -690,7 +785,7 @@ impl DownloadManager {
         app: Option<&tauri::AppHandle>,
         id: &str,
     ) -> Result<(), String> {
-        let (cancelled_entry, cleanup_website_partial) = {
+        let (cancelled_entry, cleanup_website_partial, cleanup_segments) = {
             let mut state = self
                 .state
                 .lock()
@@ -712,6 +807,8 @@ impl DownloadManager {
                 transition(&mut cancelled, DownloadStatus::Cancelled)?;
                 cancelled.speed_bytes_per_second = 0.0;
                 cancelled.remaining_seconds = None;
+                let has_segments = !cancelled.segments.is_empty();
+                cancelled.segments.clear();
                 state.entries[index] = cancelled.clone();
                 state.controls.remove(id);
                 #[cfg(windows)]
@@ -734,7 +831,9 @@ impl DownloadManager {
                     .website_media
                     .as_ref()
                     .map(|_| PathBuf::from(&cancelled.destination));
-                (Some(cancelled), cleanup_partial)
+                let seg_cleanup =
+                    has_segments.then(|| (PathBuf::from(&cancelled.destination), cancelled.id.clone()));
+                (Some(cancelled), cleanup_partial, seg_cleanup)
             } else {
                 let control =
                     control.ok_or_else(|| "The download worker was not found.".to_owned())?;
@@ -742,10 +841,14 @@ impl DownloadManager {
                 // worker's Completed and Paused transitions. Cancellation always
                 // wins over both pause and completion races.
                 control.request_cancel();
-                (None, None)
+                (None, None, None)
             }
         };
         if let Some(dest) = cleanup_website_partial {
+            let _ = std::fs::remove_file(partial_path(&dest));
+        }
+        if let Some((dest, cancel_id)) = cleanup_segments {
+            remove_all_segment_parts_sync(&dest, &cancel_id);
             let _ = std::fs::remove_file(partial_path(&dest));
         }
         if let Some(entry) = cancelled_entry {
@@ -764,7 +867,7 @@ impl DownloadManager {
         selection: crate::media::yt_dlp::FormatSelection,
         control: &Arc<DownloadTaskControl>,
     ) -> Result<(), String> {
-        let selected_format = crate::media::yt_dlp::select_muxed_format(&catalog, &selection)
+        let download_plan = crate::media::yt_dlp::select_download_plan(&catalog, &selection)
             .map_err(|error| error.to_string())?;
         run_ytdlp_download_worker(
             app,
@@ -772,7 +875,7 @@ impl DownloadManager {
             &self.concurrency,
             id,
             executable,
-            selected_format,
+            download_plan,
             control,
         )
         .await
@@ -783,23 +886,17 @@ impl DownloadManager {
         &self,
         app: Option<&tauri::AppHandle>,
     ) -> Result<PathBuf, String> {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-
         {
-            let state = self
+            let cached = self
                 .state
                 .lock()
-                .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
-            if let Some((cached_path, cached_modified)) = &state.verified_ytdlp_executable {
-                if let Ok(meta) = std::fs::symlink_metadata(cached_path) {
-                    if meta.is_file()
-                        && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
-                        && meta.len() == crate::media::yt_dlp::VERIFIED_YTDLP_SIZE_BYTES
-                        && &meta.modified().ok() == cached_modified
-                    {
-                        return Ok(cached_path.clone());
-                    }
+                .map_err(|_| "Download manager state lock was poisoned.".to_owned())?
+                .verified_ytdlp_executable
+                .as_ref()
+                .map(|(cached_path, _)| cached_path.clone());
+            if let Some(cached_path) = cached {
+                if let Ok(verified) = crate::media::yt_dlp::verify_ytdlp_executable(&cached_path) {
+                    return Ok(verified);
                 }
             }
         }
@@ -900,7 +997,7 @@ impl DownloadManager {
         }
         let normalized_url = crate::media::yt_dlp::validate_public_page_url(&url)
             .map_err(|error| format!("Invalid public website URL: {error}"))?;
-        let _ = crate::media::yt_dlp::select_muxed_format(&catalog, &selection)
+        let _ = crate::media::yt_dlp::select_download_plan(&catalog, &selection)
             .map_err(|error| error.to_string())?;
         let executable = self.resolve_verified_ytdlp_executable(app)?;
         self.start_website_download(
@@ -926,12 +1023,18 @@ impl DownloadManager {
         if url.len() > MAX_URL_LENGTH {
             return Err("Download URL is too long.".into());
         }
-        if !executable.is_file() {
-            return Err("The yt-dlp executable path is invalid or does not exist.".into());
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            let meta = std::fs::symlink_metadata(&executable)
+                .map_err(|_| "The yt-dlp executable path is invalid or does not exist.".to_owned())?;
+            if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err("The yt-dlp executable path is invalid or does not exist.".into());
+            }
         }
         let normalized_url = crate::media::yt_dlp::validate_public_page_url(&url)
             .map_err(|error| format!("Invalid public website URL: {error}"))?;
-        let selected_format = crate::media::yt_dlp::select_muxed_format(&catalog, &selection)
+        let download_plan = crate::media::yt_dlp::select_download_plan(&catalog, &selection)
             .map_err(|error| error.to_string())?;
 
         let id = format!("{}-{}", current_timestamp_ms(), rand_id());
@@ -950,32 +1053,39 @@ impl DownloadManager {
                 .extension()
                 .and_then(|value| value.to_str())
                 .map(str::to_ascii_lowercase);
-            if dest_ext.as_deref() != Some(selected_format.extension) {
+            if dest_ext.as_deref() != Some(download_plan.extension()) {
                 return Err(format!(
                     "The destination file extension (.{:?}) does not match the selected format container (.{}). FluxNet never renames WebM to MP4 or vice versa.",
                     dest_ext.unwrap_or_default(),
-                    selected_format.extension
+                    download_plan.extension()
                 ));
             }
 
-            let height = match &selection {
-                crate::media::yt_dlp::FormatSelection::Exact(id) => catalog
+            let height = match &download_plan {
+                crate::media::yt_dlp::DownloadPlan::Muxed(selected_format) => match &selection {
+                    crate::media::yt_dlp::FormatSelection::Exact(id) => catalog
+                        .formats
+                        .iter()
+                        .find(|f| &f.format_id == id)
+                        .and_then(|f| f.height),
+                    crate::media::yt_dlp::FormatSelection::BestAvailable => catalog
+                        .formats
+                        .iter()
+                        .filter(|f| {
+                            f.container
+                                .as_deref()
+                                .is_some_and(|c| c.eq_ignore_ascii_case(selected_format.extension))
+                                && f.video_codec.as_deref() != Some("none")
+                                && f.audio_codec.as_deref() != Some("none")
+                        })
+                        .filter_map(|f| f.height)
+                        .max(),
+                },
+                crate::media::yt_dlp::DownloadPlan::Split(split) => catalog
                     .formats
                     .iter()
-                    .find(|f| &f.format_id == id)
+                    .find(|f| f.format_id == split.video_format_id)
                     .and_then(|f| f.height),
-                crate::media::yt_dlp::FormatSelection::BestAvailable => catalog
-                    .formats
-                    .iter()
-                    .filter(|f| {
-                        f.container
-                            .as_deref()
-                            .is_some_and(|c| c.eq_ignore_ascii_case(selected_format.extension))
-                            && f.video_codec.as_deref() != Some("none")
-                            && f.audio_codec.as_deref() != Some("none")
-                    })
-                    .filter_map(|f| f.height)
-                    .max(),
             };
 
             let control = Arc::new(DownloadTaskControl::default());
@@ -997,10 +1107,12 @@ impl DownloadManager {
                 hls_playlist: None,
                 hls_completed_parts: None,
                 website_media: Some(WebsiteMediaInfo {
-                    format_id: selected_format.selector.clone(),
-                    container: selected_format.extension.to_string(),
+                    format_id: download_plan.primary_format_id().to_owned(),
+                    audio_format_id: download_plan.audio_format_id().map(str::to_owned),
+                    container: download_plan.extension().to_string(),
                     height,
                 }),
+                segments: Vec::new(),
                 etag: None,
                 last_modified: None,
                 notifications_enabled: state.notifications_enabled,
@@ -1029,7 +1141,7 @@ impl DownloadManager {
             Arc::clone(&self.worker_count),
             id,
             executable,
-            selected_format,
+            download_plan,
             control,
         );
         Ok(entry)
@@ -1056,6 +1168,14 @@ impl DownloadManager {
             filesystem_error("could not create FluxNet's app-data directory", error)
         })?;
         let path = directory.join(DOWNLOAD_HISTORY_FILE);
+        self.initialize_with_history_path(Some(app), path)
+    }
+
+    pub(crate) fn initialize_with_history_path(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        path: PathBuf,
+    ) -> Result<(), String> {
         let persisted = match std::fs::read(&path) {
             Ok(contents) => Some(
                 serde_json::from_slice::<PersistedDownloads>(&contents).map_err(|error| {
@@ -1070,49 +1190,164 @@ impl DownloadManager {
                 ));
             }
         };
+        let mut to_resume: Vec<(String, Arc<DownloadTaskControl>)> = Vec::new();
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+            state.history_path = Some(path);
+            if let Some(mut persisted) = persisted {
+                if persisted.version != 1 {
+                    return Err("Saved download history uses an unsupported version.".into());
+                }
+                state.max_concurrent = persisted.max_concurrent.clamp(1, MAX_CONCURRENT_DOWNLOADS);
+                state.max_connections_per_download = persisted
+                    .max_connections_per_download
+                    .clamp(1, MAX_CONNECTIONS_PER_DOWNLOAD);
+                state.bandwidth_limit_bytes_per_second =
+                    persisted.bandwidth_limit_bytes_per_second;
+                state.notifications_enabled = persisted.notifications_enabled;
+                (state.notify_on_complete, state.notify_on_failure) =
+                    persisted_notification_preferences(
+                        persisted.notifications_enabled,
+                        persisted.notify_on_complete,
+                        persisted.notify_on_failure,
+                    );
+
+                let now = current_timestamp_ms();
+                for entry in &mut persisted.entries {
+                    if entry.notifications_enabled
+                        && !entry.notify_on_complete
+                        && !entry.notify_on_failure
+                    {
+                        entry.notify_on_complete = true;
+                        entry.notify_on_failure = true;
+                    }
+                    entry.speed_bytes_per_second = 0.0;
+                    entry.remaining_seconds = None;
+
+                    match entry.status {
+                        DownloadStatus::Completed
+                        | DownloadStatus::Cancelled
+                        | DownloadStatus::Failed => {
+                            // Never automatically restart completed, cancelled, or permanently failed entries.
+                        }
+                        DownloadStatus::Paused => {
+                            // Respect Paused state while verifying partial/segment data on disk.
+                            verify_and_repair_partial_state_on_disk(entry);
+                        }
+                        DownloadStatus::Queued | DownloadStatus::Downloading => {
+                            // Prevent duplicate workers if one is already active for this ID.
+                            if state.controls.contains_key(&entry.id) {
+                                continue;
+                            }
+                            if entry.website_media.is_some() {
+                                entry.status = DownloadStatus::Failed;
+                                entry.error = Some(
+                                    "Interrupted when FluxNet exited. Start a new website download to retry."
+                                        .into(),
+                                );
+                                entry.updated_at_ms = now;
+                                continue;
+                            }
+                            if entry.attempts >= MAX_AUTO_RESUME_ATTEMPTS {
+                                entry.status = DownloadStatus::Failed;
+                                entry.error = Some(
+                                    "Automatic resume limit reached after repeated interruptions. Retry explicitly to continue or restart."
+                                        .into(),
+                                );
+                                entry.updated_at_ms = now;
+                                continue;
+                            }
+                            let validated_url = validated_download_url(&entry.url).and_then(|u| {
+                                if entry.hls_playlist.is_none() {
+                                    normalize_instagram_media_url(&u)
+                                } else {
+                                    Ok(u)
+                                }
+                            });
+                            let parsed_url = match validated_url {
+                                Ok(parsed) => parsed,
+                                Err(error) => {
+                                    entry.status = DownloadStatus::Failed;
+                                    entry.error = Some(error);
+                                    entry.updated_at_ms = now;
+                                    continue;
+                                }
+                            };
+                            if is_signed_url_expired(&parsed_url) {
+                                entry.status = DownloadStatus::Failed;
+                                entry.error = Some(
+                                    "The signed download URL has expired and cannot be automatically resumed. Obtain a fresh download link to retry."
+                                        .into(),
+                                );
+                                entry.updated_at_ms = now;
+                                continue;
+                            }
+                            entry.url = parsed_url.to_string();
+                            let dest_path = Path::new(&entry.destination);
+                            if dest_path.exists() {
+                                entry.status = DownloadStatus::Failed;
+                                entry.error = Some(
+                                    "The destination file already exists; choose a different filename."
+                                        .into(),
+                                );
+                                entry.updated_at_ms = now;
+                                continue;
+                            }
+                            verify_and_repair_partial_state_on_disk(entry);
+                            entry.status = DownloadStatus::Queued;
+                            entry.attempts = entry.attempts.saturating_add(1);
+                            entry.error = None;
+                            entry.updated_at_ms = now;
+                            let control = Arc::new(DownloadTaskControl::default());
+                            state
+                                .controls
+                                .insert(entry.id.clone(), Arc::clone(&control));
+                            to_resume.push((entry.id.clone(), control));
+                        }
+                    }
+                }
+                // If any existing in-memory entry had an active control not present in persisted, preserve its control lock.
+                state.entries = persisted.entries;
+            }
+            persist_locked(&state)?;
+        }
+        for (id, control) in to_resume {
+            spawn_worker(
+                app.cloned(),
+                Arc::clone(&self.state),
+                Arc::clone(&self.concurrency),
+                Arc::clone(&self.bandwidth),
+                Arc::clone(&self.worker_count),
+                id,
+                control,
+                false,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn configure_connections_per_download(
+        &self,
+        max_connections: usize,
+    ) -> Result<(), String> {
+        if !(1..=MAX_CONNECTIONS_PER_DOWNLOAD).contains(&max_connections) {
+            return Err(format!(
+                "Choose between 1 and {MAX_CONNECTIONS_PER_DOWNLOAD} parallel connections per download."
+            ));
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
-        state.history_path = Some(path);
-        if let Some(mut persisted) = persisted {
-            if persisted.version != 1 {
-                return Err("Saved download history uses an unsupported version.".into());
-            }
-            for entry in &mut persisted.entries {
-                if matches!(
-                    &entry.status,
-                    DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Paused
-                ) {
-                    entry.status = DownloadStatus::Failed;
-                    entry.error = Some(
-                        "Interrupted when FluxNet exited. The partial file was retained; retry explicitly to continue or restart."
-                            .into(),
-                    );
-                    entry.updated_at_ms = current_timestamp_ms();
-                }
-            }
-            state.entries = persisted.entries;
-            state.max_concurrent = persisted.max_concurrent.clamp(1, MAX_CONCURRENT_DOWNLOADS);
-            state.bandwidth_limit_bytes_per_second = persisted.bandwidth_limit_bytes_per_second;
-            state.notifications_enabled = persisted.notifications_enabled;
-            (state.notify_on_complete, state.notify_on_failure) =
-                persisted_notification_preferences(
-                    persisted.notifications_enabled,
-                    persisted.notify_on_complete,
-                    persisted.notify_on_failure,
-                );
-            for entry in &mut state.entries {
-                if entry.notifications_enabled
-                    && !entry.notify_on_complete
-                    && !entry.notify_on_failure
-                {
-                    entry.notify_on_complete = true;
-                    entry.notify_on_failure = true;
-                }
-            }
+        let previous = state.max_connections_per_download;
+        state.max_connections_per_download = max_connections;
+        if let Err(error) = persist_locked(&state) {
+            state.max_connections_per_download = previous;
+            return Err(error);
         }
-        persist_locked(&state)?;
         Ok(())
     }
 
@@ -1131,6 +1366,7 @@ impl DownloadManager {
             .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
         Ok(DownloadSettings {
             max_concurrent: state.max_concurrent,
+            max_connections_per_download: state.max_connections_per_download,
             bandwidth_limit_mbps: state
                 .bandwidth_limit_bytes_per_second
                 .map_or(0.0, |limit| limit as f64 * 8.0 / 1_000_000.0),
@@ -1145,6 +1381,7 @@ impl DownloadManager {
 #[serde(rename_all = "camelCase")]
 pub struct DownloadSettings {
     max_concurrent: usize,
+    max_connections_per_download: usize,
     bandwidth_limit_mbps: f64,
     notifications_enabled: bool,
     notify_on_complete: bool,
@@ -1275,14 +1512,48 @@ fn fallback_video_title(page_domain: Option<&str>) -> &'static str {
     }
 }
 
-fn preferred_video_title(page_title: Option<&str>, page_domain: Option<&str>) -> String {
-    let title = page_title.unwrap_or_default().trim();
-    let generic_title = matches!(
-        title.to_ascii_lowercase().as_str(),
-        "" | "instagram" | "instagram video" | "facebook" | "facebook video"
-    );
+fn short_url_media_hash(parsed: &reqwest::Url) -> String {
+    let mut canonical = parsed.clone();
+    canonical.set_fragment(None);
+    if let Some(host) = canonical.host_str().map(str::to_ascii_lowercase) {
+        if host == "cdninstagram.com"
+            || host.ends_with(".cdninstagram.com")
+            || host == "fbcdn.net"
+            || host.ends_with(".fbcdn.net")
+        {
+            canonical.set_query(None);
+        }
+    }
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in canonical.as_str().as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{hash:08x}")
+}
+
+fn is_generic_video_title(title: &str) -> bool {
+    let trimmed = title.trim();
+    let without_count = trimmed
+        .strip_prefix('(')
+        .and_then(|rest| rest.split_once(')'))
+        .filter(|(digits, _)| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(_, after)| after.trim())
+        .unwrap_or(trimmed);
+    matches!(
+        without_count.to_ascii_lowercase().as_str(),
+        "" | "instagram"
+            | "instagram video"
+            | "instagram reels"
+            | "reels"
+            | "facebook"
+            | "facebook video"
+    )
+}
+
+fn looks_like_url_or_media_filename(title: &str) -> bool {
     let lowercase_title = title.to_ascii_lowercase();
-    let looks_like_url_or_media_filename = lowercase_title.starts_with("http://")
+    lowercase_title.starts_with("http://")
         || lowercase_title.starts_with("https://")
         || lowercase_title.starts_with("www.")
         || (!title.chars().any(char::is_whitespace)
@@ -1295,12 +1566,42 @@ fn preferred_video_title(page_title: Option<&str>, page_domain: Option<&str>) ->
                     .split(['?', '#'])
                     .next()
                     .is_some_and(|path| path.ends_with(extension))
-            }));
-    if !generic_title && !looks_like_url_or_media_filename {
+            }))
+}
+
+fn preferred_video_title(page_title: Option<&str>, page_domain: Option<&str>) -> String {
+    let title = page_title.unwrap_or_default().trim();
+    if !is_generic_video_title(title) && !looks_like_url_or_media_filename(title) {
         title.to_owned()
     } else {
         fallback_video_title(page_domain).to_owned()
     }
+}
+
+fn is_usable_preferred_video_filename(
+    preferred: &str,
+    path_filename: &str,
+    raw_title: &str,
+) -> bool {
+    let trimmed = preferred.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(path_filename) {
+        return false;
+    }
+    if !raw_title.is_empty()
+        && looks_like_url_or_media_filename(raw_title)
+        && raw_title.to_ascii_lowercase().contains(&trimmed.to_ascii_lowercase())
+    {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") {
+        return false;
+    }
+    let stem = trimmed
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(trimmed);
+    !is_generic_video_title(stem)
 }
 
 pub(crate) fn suggested_filename_with_metadata(
@@ -1321,7 +1622,42 @@ pub(crate) fn suggested_filename_with_metadata(
         .map(|(_, extension)| extension)
         .unwrap_or_default();
     if let Some(extension) = video_extension(media_type, path_extension) {
-        let title = preferred_video_title(page_title, page_domain).replace(['/', '\\'], "_");
+        let raw_title = page_title.unwrap_or_default().trim();
+        let has_meaningful_title =
+            !is_generic_video_title(raw_title) && !looks_like_url_or_media_filename(raw_title);
+        if has_meaningful_title {
+            let title = preferred_video_title(page_title, page_domain).replace(['/', '\\'], "_");
+            return Ok(sanitize_filename(&format!("{title}.{extension}")));
+        }
+        if let Some(preferred) = preferred_filename
+            .map(str::trim)
+            .filter(|name| is_usable_preferred_video_filename(name, path_filename, raw_title))
+        {
+            let sanitized = sanitize_filename(preferred);
+            if sanitized
+                .rsplit_once('.')
+                .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case(&extension))
+            {
+                return Ok(sanitized);
+            }
+            let stem = sanitized
+                .rsplit_once('.')
+                .map(|(stem, _)| stem)
+                .unwrap_or(&sanitized);
+            return Ok(sanitize_filename(&format!("{stem}.{extension}")));
+        }
+        let mut title = preferred_video_title(page_title, page_domain).replace(['/', '\\'], "_");
+        let host = parsed
+            .host_str()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        let is_social_cdn = host == "cdninstagram.com"
+            || host.ends_with(".cdninstagram.com")
+            || host == "fbcdn.net"
+            || host.ends_with(".fbcdn.net");
+        if is_social_cdn {
+            title = format!("{title}_{}", short_url_media_hash(&parsed));
+        }
         return Ok(sanitize_filename(&format!("{title}.{extension}")));
     }
     Ok(sanitize_filename(
@@ -1418,6 +1754,7 @@ fn validated_download_url(url: &str) -> Result<reqwest::Url, String> {
     Ok(parsed)
 }
 
+#[cfg(test)]
 fn validate_unranged_media_response(
     status: StatusCode,
     content_range: Option<&str>,
@@ -1447,18 +1784,174 @@ fn validate_unranged_media_response(
     Ok(())
 }
 
-fn is_instagram_byte_range_url(url: &reqwest::Url) -> bool {
+pub(crate) fn is_instagram_cdn_url(url: &reqwest::Url) -> bool {
     let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
         return false;
     };
-    let instagram_cdn = host == "cdninstagram.com"
+    host == "cdninstagram.com"
         || host.ends_with(".cdninstagram.com")
         || host == "fbcdn.net"
-        || host.ends_with(".fbcdn.net");
-    instagram_cdn
-        && url
-            .query_pairs()
-            .any(|(name, _)| name == "bytestart" || name == "byteend")
+        || host.ends_with(".fbcdn.net")
+}
+
+fn decode_base64_bytes(input: &str) -> Option<Vec<u8>> {
+    let trimmed = input.trim().trim_end_matches('=');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut sextets = Vec::with_capacity(trimmed.len());
+    for byte in trimmed.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' | b' ' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        sextets.push(value);
+    }
+    if sextets.len() % 4 == 1 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(sextets.len() * 3 / 4);
+    for chunk in sextets.chunks(4) {
+        let b0 = (chunk[0] << 2) | (chunk[1] >> 4);
+        output.push(b0);
+        if chunk.len() > 2 {
+            let b1 = (chunk[1] << 4) | (chunk[2] >> 2);
+            output.push(b1);
+        }
+        if chunk.len() > 3 {
+            let b2 = (chunk[2] << 6) | chunk[3];
+            output.push(b2);
+        }
+    }
+    Some(output)
+}
+
+fn decode_instagram_vencode_tag(url: &reqwest::Url) -> Option<String> {
+    let efg_value = url
+        .query_pairs()
+        .find_map(|(name, value)| name.eq_ignore_ascii_case("efg").then(|| value.into_owned()))?;
+    let decoded = decode_base64_bytes(&efg_value)?;
+    let json = serde_json::from_slice::<serde_json::Value>(&decoded).ok()?;
+    json.get("vencode_tag")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)
+}
+
+pub(crate) fn is_instagram_audio_only_url(url: &reqwest::Url) -> bool {
+    if !is_instagram_cdn_url(url) {
+        return false;
+    }
+    let is_m78_audio_path = url.path().to_ascii_lowercase().contains("/m78/");
+    if let Some(tag) = decode_instagram_vencode_tag(url) {
+        let has_video_marker = [
+            "vp9", "vp8", "vp09", "vp08", "avc1", "avc3", "h264", "hev1", "hvc1", "hevc", "av01",
+            "progressive", "144p", "240p", "360p", "480p", "540p", "720p", "1080p", "1440p",
+            "2160p", "_q90", "_q80", "_q70", "_q60", "_q50", "_q40", "_q30",
+        ]
+        .iter()
+        .any(|marker| tag.contains(marker));
+        let has_audio_marker = tag == "audio"
+            || [
+                "_audio",
+                ".audio",
+                "-audio",
+                "audio_",
+                "audio.",
+                "audio-",
+                "audio_only",
+                "audioonly",
+                "heaac",
+                "aac",
+                "opus",
+                "mp4a",
+                "vorbis",
+            ]
+            .iter()
+            .any(|marker| tag.contains(marker));
+        if has_audio_marker && !has_video_marker {
+            return true;
+        }
+        if has_video_marker && !has_audio_marker && !is_m78_audio_path {
+            return false;
+        }
+    }
+    is_m78_audio_path
+}
+
+#[allow(dead_code)]
+pub(crate) fn is_instagram_byte_range_url(url: &reqwest::Url) -> bool {
+    is_instagram_cdn_url(url)
+        && url.query_pairs().any(|(name, _)| {
+            name.eq_ignore_ascii_case("bytestart") || name.eq_ignore_ascii_case("byteend")
+        })
+}
+
+pub(crate) fn normalize_instagram_media_url(url: &reqwest::Url) -> Result<reqwest::Url, String> {
+    if !is_instagram_cdn_url(url) {
+        return Ok(url.clone());
+    }
+    if is_instagram_audio_only_url(url) {
+        return Err(
+            "Instagram supplied an audio-only DASH track, not a complete video source.".into(),
+        );
+    }
+    let mut byte_start: Option<u64> = None;
+    let mut byte_end: Option<u64> = None;
+    let mut has_range_param = false;
+    for (name, value) in url.query_pairs() {
+        if name.eq_ignore_ascii_case("bytestart") {
+            has_range_param = true;
+            if byte_start.is_some() {
+                return Err("Instagram supplied duplicate bytestart parameters.".into());
+            }
+            byte_start = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "Instagram supplied a malformed bytestart parameter.".to_owned())?,
+            );
+        } else if name.eq_ignore_ascii_case("byteend") {
+            has_range_param = true;
+            if byte_end.is_some() {
+                return Err("Instagram supplied duplicate byteend parameters.".into());
+            }
+            byte_end = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "Instagram supplied a malformed byteend parameter.".to_owned())?,
+            );
+        }
+    }
+    if !has_range_param {
+        return Ok(url.clone());
+    }
+    if let (Some(start), Some(end)) = (byte_start, byte_end) {
+        if start > end {
+            return Err("Instagram supplied an invalid byte range (bytestart > byteend).".into());
+        }
+    }
+    let mut normalized = url.clone();
+    if let Some(raw_query) = url.query() {
+        let preserved: Vec<&str> = raw_query
+            .split('&')
+            .filter(|segment| !segment.is_empty())
+            .filter(|segment| {
+                let raw_key = segment.split('=').next().unwrap_or_default();
+                !raw_key.eq_ignore_ascii_case("bytestart")
+                    && !raw_key.eq_ignore_ascii_case("byteend")
+            })
+            .collect();
+        if preserved.is_empty() {
+            normalized.set_query(None);
+        } else {
+            let joined = preserved.join("&");
+            normalized.set_query(Some(&joined));
+        }
+    }
+    Ok(normalized)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2085,6 +2578,87 @@ fn mp4_track_kinds(path: &Path) -> Result<(bool, bool), String> {
     Ok((has_video, has_audio))
 }
 
+fn parse_mp4_sidx_expected_end<R: Read + Seek>(
+    file: &mut R,
+    sidx: Mp4Atom,
+) -> Result<u64, String> {
+    let payload_len = sidx.end.saturating_sub(sidx.payload_start);
+    if payload_len < 24 {
+        return Err("The MP4 segment index (sidx) box is truncated.".into());
+    }
+    if payload_len > 1_048_576 {
+        return Err("The MP4 segment index (sidx) box exceeds the 1 MiB safety limit.".into());
+    }
+    let mut payload = vec![0_u8; payload_len as usize];
+    file.seek(SeekFrom::Start(sidx.payload_start))
+        .and_then(|_| file.read_exact(&mut payload))
+        .map_err(|error| filesystem_error("could not read MP4 segment index (sidx)", error))?;
+    let version = payload[0];
+    let (first_offset, reference_count, entries_start) = match version {
+        0 => {
+            let first_offset = u64::from(u32::from_be_bytes(payload[16..20].try_into().unwrap()));
+            let reference_count = usize::from(u16::from_be_bytes(payload[22..24].try_into().unwrap()));
+            (first_offset, reference_count, 24_usize)
+        }
+        1 => {
+            if payload.len() < 32 {
+                return Err("The MP4 v1 segment index (sidx) box is truncated.".into());
+            }
+            let first_offset = u64::from_be_bytes(payload[20..28].try_into().unwrap());
+            let reference_count = usize::from(u16::from_be_bytes(payload[30..32].try_into().unwrap()));
+            (first_offset, reference_count, 32_usize)
+        }
+        _ => {
+            return Err("The MP4 segment index (sidx) uses an unsupported version.".into());
+        }
+    };
+    let required_len = entries_start
+        .checked_add(reference_count.checked_mul(12).ok_or_else(|| {
+            "The MP4 segment index (sidx) reference count overflows.".to_owned()
+        })?)
+        .ok_or_else(|| "The MP4 segment index (sidx) size overflows.".to_owned())?;
+    if payload.len() < required_len {
+        return Err("The MP4 segment index (sidx) entries are truncated.".into());
+    }
+    let mut total_referenced_size = 0_u64;
+    for index in 0..reference_count {
+        let entry_offset = entries_start + index * 12;
+        let word0 = u32::from_be_bytes(payload[entry_offset..entry_offset + 4].try_into().unwrap());
+        let referenced_size = u64::from(word0 & 0x7FFF_FFFF);
+        total_referenced_size = total_referenced_size
+            .checked_add(referenced_size)
+            .ok_or_else(|| "The MP4 segment index (sidx) byte total overflows.".to_owned())?;
+    }
+    sidx.end
+        .checked_add(first_offset)
+        .and_then(|anchor| anchor.checked_add(total_referenced_size))
+        .ok_or_else(|| "The MP4 segment index (sidx) extent overflows.".to_owned())
+}
+
+fn inspect_mp4_sidx_expected_bytes(path: &Path) -> Result<Option<u64>, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| filesystem_error("could not inspect MP4 segment index", error))?;
+    let file_length = file
+        .metadata()
+        .map_err(|error| filesystem_error("could not inspect MP4 segment index", error))?
+        .len();
+    if file_length < 8 {
+        return Ok(None);
+    }
+    let Ok(atoms) = read_mp4_atoms(&mut file, 0, file_length) else {
+        return Ok(None);
+    };
+    if !has_mp4_atom(&atoms, b"ftyp") || !has_mp4_atom(&atoms, b"moov") {
+        return Ok(None);
+    }
+    let mut max_expected_end: Option<u64> = None;
+    for sidx in atoms.into_iter().filter(|atom| &atom.kind == b"sidx") {
+        let expected_end = parse_mp4_sidx_expected_end(&mut file, sidx)?;
+        max_expected_end = Some(max_expected_end.map_or(expected_end, |prev| prev.max(expected_end)));
+    }
+    Ok(max_expected_end)
+}
+
 fn validate_mp4_reader<R: Read + Seek>(
     mut file: &mut R,
     file_length: u64,
@@ -2119,6 +2693,17 @@ fn validate_mp4_reader<R: Read + Seek>(
         Ok(atoms) => atoms,
         Err(error) => return Ok(Mp4Validation::Invalid(error)),
     };
+    for sidx in atoms.iter().copied().filter(|atom| &atom.kind == b"sidx") {
+        let expected_end = match parse_mp4_sidx_expected_end(&mut file, sidx) {
+            Ok(expected_end) => expected_end,
+            Err(error) => return Ok(Mp4Validation::Invalid(error)),
+        };
+        if file_length < expected_end {
+            return Ok(Mp4Validation::Invalid(format!(
+                "The fragmented MP4 is incomplete: downloaded {file_length} bytes, but its segment index (sidx) declares {expected_end} bytes."
+            )));
+        }
+    }
     let moof_count = atoms.iter().filter(|atom| &atom.kind == b"moof").count();
     if !atoms.iter().any(|atom| &atom.kind == b"mdat")
         || atoms
@@ -2348,6 +2933,7 @@ fn resume_validator<'a>(etag: Option<&'a str>, last_modified: Option<&'a str>) -
         .or(last_modified)
 }
 
+#[cfg(test)]
 fn validate_range_response(
     status: StatusCode,
     content_range: Option<&str>,
@@ -2434,6 +3020,7 @@ fn persist_locked(state: &DownloadState) -> Result<(), String> {
         version: 1,
         entries: state.entries.clone(),
         max_concurrent: state.max_concurrent,
+        max_connections_per_download: state.max_connections_per_download,
         bandwidth_limit_bytes_per_second: state.bandwidth_limit_bytes_per_second,
         notifications_enabled: state.notifications_enabled,
         notify_on_complete: state.notify_on_complete,
@@ -2449,7 +3036,31 @@ fn persist_locked(state: &DownloadState) -> Result<(), String> {
         .map_err(|error| filesystem_error("could not commit download history", error))
 }
 
+#[cfg(test)]
+type TestCommitHook = Box<dyn Fn(&str, &str, &DownloadTaskControl) + Send + Sync>;
+
+#[cfg(test)]
+static TEST_COMMIT_HOOK: std::sync::LazyLock<Mutex<Option<TestCommitHook>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+static TEST_EMITTED_EVENTS: std::sync::LazyLock<Mutex<Vec<(String, DownloadStatus, u32)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[cfg(test)]
+fn invoke_test_commit_hook(stage: &str, id: &str, control: &DownloadTaskControl) {
+    if let Ok(guard) = TEST_COMMIT_HOOK.lock() {
+        if let Some(hook) = guard.as_ref() {
+            hook(stage, id, control);
+        }
+    }
+}
+
 fn emit_entry_optional(app: Option<&tauri::AppHandle>, entry: DownloadEntry) {
+    #[cfg(test)]
+    if let Ok(mut events) = TEST_EMITTED_EVENTS.lock() {
+        events.push((entry.id.clone(), entry.status.clone(), entry.attempts));
+    }
     if let Some(app) = app {
         if let Err(error) = app.emit(DOWNLOAD_EVENT, entry) {
             eprintln!("Could not publish Download Manager update: {error}");
@@ -2457,6 +3068,7 @@ fn emit_entry_optional(app: Option<&tauri::AppHandle>, entry: DownloadEntry) {
     }
 }
 
+#[allow(dead_code)]
 fn emit_entry(app: &tauri::AppHandle, entry: DownloadEntry) {
     emit_entry_optional(Some(app), entry);
 }
@@ -2500,6 +3112,7 @@ where
     Ok(entry)
 }
 
+#[allow(dead_code)]
 fn update_entry<F>(
     app: &tauri::AppHandle,
     state: &Mutex<DownloadState>,
@@ -2705,6 +3318,168 @@ pub fn start_website_download(
     Err("Website video downloads are supported on Windows only.".into())
 }
 
+impl DownloadManager {
+    pub(crate) fn start_download_internal(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        url: String,
+        destination: String,
+        hls_playlist: Option<HlsPlaylist>,
+    ) -> Result<DownloadEntry, String> {
+        if url.len() > MAX_URL_LENGTH {
+            return Err("Download URL is too long.".into());
+        }
+        let parsed_url = validated_download_url(&url)?;
+        let parsed_url = if hls_playlist.is_none() {
+            normalize_instagram_media_url(&parsed_url)?
+        } else {
+            parsed_url
+        };
+        let hls_playlist = hls_playlist
+            .map(|playlist| validate_hls_playlist(playlist, &parsed_url))
+            .transpose()?;
+        let _suggested = suggested_filename(parsed_url.as_str())?;
+        let id = format!("{}-{}", current_timestamp_ms(), rand_id());
+        let now = current_timestamp_ms();
+        let (entry, control) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+            let control = Arc::new(DownloadTaskControl::default());
+            let destination = unique_destination(Path::new(&destination), &state.entries)?;
+            let (destination, filename) =
+                validate_download_destination(destination.to_string_lossy().as_ref())?;
+            if hls_playlist.is_some() {
+                validate_hls_destination(&destination)?;
+            }
+            let entry = DownloadEntry {
+                id: id.clone(),
+                url: parsed_url.to_string(),
+                destination: destination.to_string_lossy().to_string(),
+                filename,
+                status: DownloadStatus::Queued,
+                total_bytes: hls_playlist
+                    .as_ref()
+                    .and_then(|playlist| playlist.expected_bytes),
+                downloaded_bytes: 0,
+                speed_bytes_per_second: 0.0,
+                elapsed_ms: 0,
+                remaining_seconds: None,
+                error: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+                attempts: 1,
+                hls_playlist: hls_playlist.clone(),
+                hls_completed_parts: hls_playlist.as_ref().map(|_| 0),
+                website_media: None,
+                segments: Vec::new(),
+                etag: None,
+                last_modified: None,
+                notifications_enabled: state.notifications_enabled,
+                notify_on_complete: state.notify_on_complete,
+                notify_on_failure: state.notify_on_failure,
+            };
+            state.entries.push(entry.clone());
+            state.controls.insert(id.clone(), Arc::clone(&control));
+            if let Err(error) = persist_locked(&state) {
+                state.entries.pop();
+                state.controls.remove(&id);
+                return Err(error);
+            }
+            (entry, control)
+        };
+        emit_entry_optional(app, entry.clone());
+        spawn_worker(
+            app.cloned(),
+            Arc::clone(&self.state),
+            Arc::clone(&self.concurrency),
+            Arc::clone(&self.bandwidth),
+            Arc::clone(&self.worker_count),
+            id,
+            control,
+            false,
+        );
+        Ok(entry)
+    }
+
+    pub(crate) fn retry_download_internal(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        id: String,
+        restart: bool,
+    ) -> Result<(), String> {
+        let control = Arc::new(DownloadTaskControl::default());
+        let cleanup_dest = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+            let index = state
+                .entries
+                .iter()
+                .position(|entry| entry.id == id)
+                .ok_or_else(|| "Download record was not found.".to_owned())?;
+            if state.controls.contains_key(&id) {
+                return Err("A download worker is already active for this item.".into());
+            }
+            let original = state.entries[index].clone();
+            if original.website_media.is_some() {
+                return Err("Website video downloads must be re-queued with a format selection; start a new download to retry.".into());
+            }
+            let mut entry = original.clone();
+            if !entry.status.can_retry() {
+                return Err("Only failed or cancelled downloads can be retried.".into());
+            }
+            transition(&mut entry, DownloadStatus::Queued)?;
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.error = None;
+            let dest_for_cleanup = if restart {
+                entry.downloaded_bytes = 0;
+                entry.total_bytes = None;
+                entry.speed_bytes_per_second = 0.0;
+                entry.elapsed_ms = 0;
+                entry.remaining_seconds = None;
+                entry.segments.clear();
+                if entry.hls_playlist.is_some() {
+                    entry.hls_completed_parts = Some(0);
+                }
+                Some(PathBuf::from(&entry.destination))
+            } else {
+                verify_and_repair_partial_state_on_disk(&mut entry);
+                None
+            };
+            state.entries[index] = entry.clone();
+            let old_control = state.controls.insert(id.clone(), Arc::clone(&control));
+            if let Err(error) = persist_locked(&state) {
+                state.entries[index] = original;
+                if let Some(old_control) = old_control {
+                    state.controls.insert(id.clone(), old_control);
+                } else {
+                    state.controls.remove(&id);
+                }
+                return Err(error);
+            }
+            (entry, dest_for_cleanup)
+        };
+        if let Some(dest) = cleanup_dest.1 {
+            remove_all_segment_parts_sync(&dest, &id);
+        }
+        emit_entry_optional(app, cleanup_dest.0);
+        spawn_worker(
+            app.cloned(),
+            Arc::clone(&self.state),
+            Arc::clone(&self.concurrency),
+            Arc::clone(&self.bandwidth),
+            Arc::clone(&self.worker_count),
+            id,
+            control,
+            restart,
+        );
+        Ok(())
+    }
+}
+
 #[tauri::command]
 pub fn start_download(
     app: tauri::AppHandle,
@@ -2713,81 +3488,7 @@ pub fn start_download(
     destination: String,
     hls_playlist: Option<HlsPlaylist>,
 ) -> Result<DownloadEntry, String> {
-    if url.len() > MAX_URL_LENGTH {
-        return Err("Download URL is too long.".into());
-    }
-    let parsed_url = validated_download_url(&url)?;
-    if hls_playlist.is_none() && is_instagram_byte_range_url(&parsed_url) {
-        return Err(
-            "Instagram supplied a byte-range media URL, not a complete video source. FluxNet did not queue it."
-                .into(),
-        );
-    }
-    let hls_playlist = hls_playlist
-        .map(|playlist| validate_hls_playlist(playlist, &parsed_url))
-        .transpose()?;
-    let _suggested = suggested_filename(parsed_url.as_str())?;
-    let id = format!("{}-{}", current_timestamp_ms(), rand_id());
-    let now = current_timestamp_ms();
-    let (entry, control) = {
-        let mut state = manager
-            .state
-            .lock()
-            .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
-        let control = Arc::new(DownloadTaskControl::default());
-        let destination = unique_destination(Path::new(&destination), &state.entries)?;
-        let (destination, filename) =
-            validate_download_destination(destination.to_string_lossy().as_ref())?;
-        if hls_playlist.is_some() {
-            validate_hls_destination(&destination)?;
-        }
-        let entry = DownloadEntry {
-            id: id.clone(),
-            url: parsed_url.to_string(),
-            destination: destination.to_string_lossy().to_string(),
-            filename,
-            status: DownloadStatus::Queued,
-            total_bytes: hls_playlist
-                .as_ref()
-                .and_then(|playlist| playlist.expected_bytes),
-            downloaded_bytes: 0,
-            speed_bytes_per_second: 0.0,
-            elapsed_ms: 0,
-            remaining_seconds: None,
-            error: None,
-            created_at_ms: now,
-            updated_at_ms: now,
-            attempts: 1,
-            hls_playlist: hls_playlist.clone(),
-            hls_completed_parts: hls_playlist.as_ref().map(|_| 0),
-            website_media: None,
-            etag: None,
-            last_modified: None,
-            notifications_enabled: state.notifications_enabled,
-            notify_on_complete: state.notify_on_complete,
-            notify_on_failure: state.notify_on_failure,
-        };
-        state.entries.push(entry.clone());
-        state.controls.insert(id.clone(), Arc::clone(&control));
-        if let Err(error) = persist_locked(&state) {
-            state.entries.pop();
-            state.controls.remove(&id);
-            return Err(error);
-        }
-        (entry, control)
-    };
-    emit_entry(&app, entry.clone());
-    spawn_worker(
-        app,
-        Arc::clone(&manager.state),
-        Arc::clone(&manager.concurrency),
-        Arc::clone(&manager.bandwidth),
-        Arc::clone(&manager.worker_count),
-        id,
-        control,
-        false,
-    );
-    Ok(entry)
+    manager.start_download_internal(Some(&app), url, destination, hls_playlist)
 }
 
 fn rand_id() -> String {
@@ -2801,7 +3502,7 @@ fn rand_id() -> String {
 }
 
 fn spawn_worker(
-    app: tauri::AppHandle,
+    app: Option<tauri::AppHandle>,
     state: Arc<Mutex<DownloadState>>,
     concurrency: Arc<ConcurrencyLimiter>,
     bandwidth: Arc<BandwidthLimiter>,
@@ -2814,7 +3515,7 @@ fn spawn_worker(
     tauri::async_runtime::spawn(async move {
         let _worker_guard = WorkerGuard(worker_count);
         if let Err(error) = download_worker(
-            &app,
+            app.as_ref(),
             &state,
             &concurrency,
             &bandwidth,
@@ -2824,11 +3525,1207 @@ fn spawn_worker(
         )
         .await
         {
-            if let Err(update_error) = fail_entry(&app, &state, &id, error).await {
+            if let Err(update_error) = fail_entry_optional(app.as_ref(), &state, &id, error).await {
                 eprintln!("Could not record download failure: {update_error}");
             }
         }
     });
+}
+
+pub(crate) fn segment_part_path(destination: &Path, id: &str, index: usize) -> PathBuf {
+    let mut name = destination.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{id}.seg-{index}.fluxnet-part"));
+    destination.with_file_name(name)
+}
+
+fn remove_all_segment_parts_sync(destination: &Path, id: &str) {
+    for index in 0..MAX_CONNECTIONS_PER_DOWNLOAD {
+        let _ = std::fs::remove_file(segment_part_path(destination, id, index));
+    }
+}
+
+async fn remove_all_segment_parts(destination: &Path, id: &str) {
+    for index in 0..MAX_CONNECTIONS_PER_DOWNLOAD {
+        let _ = fs::remove_file(segment_part_path(destination, id, index)).await;
+    }
+}
+
+pub(crate) fn plan_parallel_segments(
+    total_bytes: u64,
+    max_connections: usize,
+) -> Vec<DownloadSegment> {
+    if total_bytes < MIN_PARALLEL_FILE_BYTES || max_connections <= 1 {
+        return Vec::new();
+    }
+    let clamped = max_connections.clamp(1, MAX_CONNECTIONS_PER_DOWNLOAD);
+    let max_by_size =
+        usize::try_from(total_bytes / MIN_PARALLEL_SEGMENT_BYTES).unwrap_or(clamped);
+    let count = clamped.min(max_by_size).max(1);
+    if count <= 1 {
+        return Vec::new();
+    }
+    let base_len = total_bytes / (count as u64);
+    let remainder = total_bytes % (count as u64);
+    let mut cursor = 0_u64;
+    let mut segments = Vec::with_capacity(count);
+    for index in 0..count {
+        let seg_len = base_len + u64::from((index as u64) < remainder);
+        let start = cursor;
+        let end = start + seg_len - 1;
+        cursor = end + 1;
+        segments.push(DownloadSegment {
+            index,
+            start,
+            end,
+            downloaded_bytes: 0,
+            completed: false,
+        });
+    }
+    segments
+}
+
+pub(crate) fn validate_segment_plan(
+    segments: &[DownloadSegment],
+    total_bytes: u64,
+) -> Result<(), String> {
+    if segments.is_empty() || total_bytes == 0 {
+        return Err("The parallel segment plan is empty.".into());
+    }
+    if segments.len() > MAX_CONNECTIONS_PER_DOWNLOAD {
+        return Err("The parallel segment plan exceeds the connection limit.".into());
+    }
+    let mut expected_start = 0_u64;
+    for (expected_index, seg) in segments.iter().enumerate() {
+        if seg.index != expected_index {
+            return Err(format!(
+                "Parallel segment index mismatch or duplicated segment at index {}.",
+                seg.index
+            ));
+        }
+        if seg.start > seg.end {
+            return Err(format!(
+                "Parallel segment {} has an invalid byte range ({}-{}).",
+                seg.index, seg.start, seg.end
+            ));
+        }
+        if seg.start < expected_start {
+            return Err(format!(
+                "Parallel segment {} overlaps with a previous segment at byte {}.",
+                seg.index, seg.start
+            ));
+        }
+        if seg.start > expected_start {
+            return Err(format!(
+                "Parallel segment {} leaves a missing byte gap between {} and {}.",
+                seg.index, expected_start, seg.start
+            ));
+        }
+        let capacity = seg.end - seg.start + 1;
+        if seg.downloaded_bytes > capacity {
+            return Err(format!(
+                "Parallel segment {} downloaded bytes ({}) exceed its capacity ({capacity}).",
+                seg.index, seg.downloaded_bytes
+            ));
+        }
+        if seg.completed && seg.downloaded_bytes != capacity {
+            return Err(format!(
+                "Parallel segment {} is marked complete but has {} of {capacity} bytes.",
+                seg.index, seg.downloaded_bytes
+            ));
+        }
+        expected_start = seg
+            .end
+            .checked_add(1)
+            .ok_or_else(|| "Parallel segment range overflow.".to_owned())?;
+    }
+    if expected_start != total_bytes {
+        return Err(format!(
+            "Parallel segments end at byte {expected_start}, but total file size is {total_bytes} bytes."
+        ));
+    }
+    Ok(())
+}
+
+fn response_advertises_byte_ranges(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(ACCEPT_RANGES)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| {
+            v.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("bytes"))
+        })
+}
+
+fn current_unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub(crate) fn is_signed_url_expired(url: &reqwest::Url) -> bool {
+    let now_secs = current_unix_timestamp_secs();
+    if is_instagram_cdn_url(url) {
+        for (name, value) in url.query_pairs() {
+            if name.eq_ignore_ascii_case("oe") {
+                if let Ok(expiry) = u64::from_str_radix(value.trim(), 16) {
+                    if expiry > 0 && expiry < now_secs {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    for (name, value) in url.query_pairs() {
+        if name.eq_ignore_ascii_case("expires") {
+            if let Ok(expiry) = value.trim().parse::<u64>() {
+                if expiry >= 946_684_800 && expiry < now_secs {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn verify_and_repair_partial_state_on_disk(entry: &mut DownloadEntry) {
+    let destination = PathBuf::from(&entry.destination);
+    if entry.hls_playlist.is_some() {
+        let staging = hls_staging_path(&destination, &entry.id);
+        let _ = std::fs::remove_file(staging);
+        let partial = partial_path(&destination);
+        match std::fs::symlink_metadata(&partial) {
+            Ok(meta) if meta.file_type().is_file() => {
+                if meta.len() < entry.downloaded_bytes {
+                    entry.downloaded_bytes = 0;
+                    entry.hls_completed_parts = Some(0);
+                    let _ = std::fs::remove_file(&partial);
+                } else if meta.len() > entry.downloaded_bytes {
+                    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&partial) {
+                        let _ = file.set_len(entry.downloaded_bytes);
+                    }
+                }
+            }
+            _ => {
+                entry.downloaded_bytes = 0;
+                entry.hls_completed_parts = Some(0);
+            }
+        }
+        return;
+    }
+
+    if !entry.segments.is_empty() {
+        let Some(total_bytes) = entry.total_bytes else {
+            remove_all_segment_parts_sync(&destination, &entry.id);
+            let _ = std::fs::remove_file(partial_path(&destination));
+            entry.segments.clear();
+            entry.downloaded_bytes = 0;
+            return;
+        };
+        if validate_segment_plan(&entry.segments, total_bytes).is_err() {
+            remove_all_segment_parts_sync(&destination, &entry.id);
+            let _ = std::fs::remove_file(partial_path(&destination));
+            entry.segments.clear();
+            entry.downloaded_bytes = 0;
+            return;
+        }
+        let mut verified_total = 0_u64;
+        for seg in &mut entry.segments {
+            let seg_path = segment_part_path(&destination, &entry.id, seg.index);
+            let capacity = seg.end - seg.start + 1;
+            match std::fs::symlink_metadata(&seg_path) {
+                Ok(meta) if meta.file_type().is_file() => {
+                    let actual_len = meta.len();
+                    if seg.completed {
+                        if actual_len == capacity && seg.downloaded_bytes == capacity {
+                            verified_total = verified_total.saturating_add(actual_len);
+                        } else {
+                            let _ = std::fs::remove_file(&seg_path);
+                            seg.downloaded_bytes = 0;
+                            seg.completed = false;
+                        }
+                    } else if seg.downloaded_bytes > 0
+                        && actual_len == seg.downloaded_bytes
+                        && actual_len <= capacity
+                    {
+                        verified_total = verified_total.saturating_add(actual_len);
+                    } else if seg.downloaded_bytes > 0
+                        && actual_len > seg.downloaded_bytes
+                        && actual_len <= capacity
+                    {
+                        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&seg_path) {
+                            if file.set_len(seg.downloaded_bytes).is_ok() {
+                                verified_total =
+                                    verified_total.saturating_add(seg.downloaded_bytes);
+                            } else {
+                                drop(file);
+                                let _ = std::fs::remove_file(&seg_path);
+                                seg.downloaded_bytes = 0;
+                                seg.completed = false;
+                            }
+                        } else {
+                            let _ = std::fs::remove_file(&seg_path);
+                            seg.downloaded_bytes = 0;
+                            seg.completed = false;
+                        }
+                    } else {
+                        let _ = std::fs::remove_file(&seg_path);
+                        seg.downloaded_bytes = 0;
+                        seg.completed = false;
+                    }
+                }
+                _ => {
+                    let _ = std::fs::remove_file(&seg_path);
+                    seg.downloaded_bytes = 0;
+                    seg.completed = false;
+                }
+            }
+        }
+        entry.downloaded_bytes = verified_total;
+        return;
+    }
+
+    let partial = partial_path(&destination);
+    match std::fs::symlink_metadata(&partial) {
+        Ok(meta) if meta.file_type().is_file() => {
+            let actual_len = meta.len();
+            if entry.total_bytes.is_some_and(|total| actual_len > total) {
+                let _ = std::fs::remove_file(&partial);
+                entry.downloaded_bytes = 0;
+            } else if entry.downloaded_bytes == 0 {
+                entry.downloaded_bytes = actual_len;
+            } else if actual_len < entry.downloaded_bytes {
+                entry.downloaded_bytes = actual_len;
+            } else if actual_len > entry.downloaded_bytes {
+                if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&partial) {
+                    if file.set_len(entry.downloaded_bytes).is_err() {
+                        drop(file);
+                        let _ = std::fs::remove_file(&partial);
+                        entry.downloaded_bytes = 0;
+                    }
+                } else {
+                    let _ = std::fs::remove_file(&partial);
+                    entry.downloaded_bytes = 0;
+                }
+            }
+        }
+        _ => {
+            entry.downloaded_bytes = 0;
+        }
+    }
+}
+
+enum ParallelDownloadOutcome {
+    Handled,
+    FallbackToSequential,
+}
+
+enum ParallelSegmentResult {
+    Completed,
+    Paused,
+    Shutdown,
+    Cancelled,
+    RangeUnsupported(String),
+    FatalError(String),
+}
+
+struct ParallelProgressTracker {
+    last_update: Instant,
+    last_bytes: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_parallel_segments_worker(
+    app: Option<&tauri::AppHandle>,
+    state: &Mutex<DownloadState>,
+    bandwidth: &Arc<BandwidthLimiter>,
+    client: &Client,
+    id: &str,
+    control: &Arc<DownloadTaskControl>,
+    url: &str,
+    destination: &Path,
+    total_bytes: u64,
+    mut segments: Vec<DownloadSegment>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    response_content_type: Option<String>,
+    base_elapsed_ms: u64,
+    max_connections: usize,
+    initial_fresh_download: bool,
+) -> Result<ParallelDownloadOutcome, String> {
+    if let Err(error) = validate_segment_plan(&segments, total_bytes) {
+        remove_all_segment_parts(destination, id).await;
+        return Err(error);
+    }
+
+    let mut initial_verified_bytes = 0_u64;
+    for seg in &mut segments {
+        let seg_path = segment_part_path(destination, id, seg.index);
+        let capacity = seg.end - seg.start + 1;
+        match fs::symlink_metadata(&seg_path).await {
+            Ok(meta) if meta.file_type().is_file() => {
+                let actual_len = meta.len();
+                if seg.completed {
+                    if actual_len == capacity && seg.downloaded_bytes == capacity {
+                        initial_verified_bytes = initial_verified_bytes.saturating_add(actual_len);
+                    } else {
+                        let _ = fs::remove_file(&seg_path).await;
+                        seg.downloaded_bytes = 0;
+                        seg.completed = false;
+                    }
+                } else if seg.downloaded_bytes > 0
+                    && actual_len == seg.downloaded_bytes
+                    && actual_len <= capacity
+                {
+                    initial_verified_bytes = initial_verified_bytes.saturating_add(actual_len);
+                } else if seg.downloaded_bytes > 0
+                    && actual_len > seg.downloaded_bytes
+                    && actual_len <= capacity
+                {
+                    if let Ok(file) = OpenOptions::new().write(true).open(&seg_path).await {
+                        if file.set_len(seg.downloaded_bytes).await.is_ok() {
+                            initial_verified_bytes =
+                                initial_verified_bytes.saturating_add(seg.downloaded_bytes);
+                        } else {
+                            drop(file);
+                            let _ = fs::remove_file(&seg_path).await;
+                            seg.downloaded_bytes = 0;
+                            seg.completed = false;
+                        }
+                    } else {
+                        let _ = fs::remove_file(&seg_path).await;
+                        seg.downloaded_bytes = 0;
+                        seg.completed = false;
+                    }
+                } else {
+                    let _ = fs::remove_file(&seg_path).await;
+                    seg.downloaded_bytes = 0;
+                    seg.completed = false;
+                }
+            }
+            _ => {
+                let _ = fs::remove_file(&seg_path).await;
+                seg.downloaded_bytes = 0;
+                seg.completed = false;
+            }
+        }
+    }
+
+    let initial_segments_snapshot = segments.clone();
+    update_entry_optional(app, state, id, |entry| {
+        entry.total_bytes = Some(total_bytes);
+        entry.downloaded_bytes = initial_verified_bytes;
+        entry.segments = initial_segments_snapshot;
+        if etag.is_some() {
+            entry.etag = etag.clone();
+        }
+        if last_modified.is_some() {
+            entry.last_modified = last_modified.clone();
+        }
+        entry.error = None;
+        Ok(())
+    })?;
+
+    let start_instant = Instant::now();
+    let incomplete_indices: Vec<usize> = segments
+        .iter()
+        .filter(|s| !s.completed)
+        .map(|s| s.index)
+        .collect();
+
+    let shared_segments = Arc::new(Mutex::new(segments));
+    let shared_content_type = Arc::new(Mutex::new(response_content_type));
+    let shared_validator = Arc::new(Mutex::new(
+        resume_validator(etag.as_deref(), last_modified.as_deref()).map(str::to_owned),
+    ));
+    let progress_tracker = Arc::new(Mutex::new(ParallelProgressTracker {
+        last_update: Instant::now(),
+        last_bytes: initial_verified_bytes,
+    }));
+    let connection_limit = max_connections.clamp(1, MAX_CONNECTIONS_PER_DOWNLOAD);
+    let semaphore = Arc::new(Semaphore::new(connection_limit));
+    let abort_all = Arc::new(AtomicBool::new(false));
+
+    let mut tasks = Vec::with_capacity(incomplete_indices.len());
+    for seg_idx in incomplete_indices {
+        let sem = Arc::clone(&semaphore);
+        let segs_lock = Arc::clone(&shared_segments);
+        let ct_lock = Arc::clone(&shared_content_type);
+        let val_lock = Arc::clone(&shared_validator);
+        let prog_lock = Arc::clone(&progress_tracker);
+        let abort_flag = Arc::clone(&abort_all);
+        let ctrl = Arc::clone(control);
+        let bw = Arc::clone(bandwidth);
+        let http = client.clone();
+        let req_url = url.to_owned();
+        let dest_path = destination.to_path_buf();
+        let entry_id = id.to_owned();
+
+        tasks.push(async move {
+            let stop_check = || {
+                if ctrl.is_cancelled() {
+                    Some(ParallelSegmentResult::Cancelled)
+                } else if ctrl.is_pause_requested() {
+                    Some(ParallelSegmentResult::Paused)
+                } else if ctrl.is_shutdown_requested() {
+                    Some(ParallelSegmentResult::Shutdown)
+                } else if abort_flag.load(Ordering::Acquire) {
+                    Some(ParallelSegmentResult::Cancelled)
+                } else {
+                    None
+                }
+            };
+            if let Some(early) = stop_check() {
+                return early;
+            }
+            let permit = loop {
+                let notified = ctrl.wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(early) = stop_check() {
+                    return early;
+                }
+                tokio::select! {
+                    permit = sem.clone().acquire_owned() => match permit {
+                        Ok(p) => break p,
+                        Err(_) => return ParallelSegmentResult::FatalError("Parallel connection limiter closed.".into()),
+                    },
+                    _ = &mut notified => {
+                        if let Some(early) = stop_check() {
+                            return early;
+                        }
+                    }
+                }
+            };
+            let _permit = permit;
+
+            for attempt in 0..MAX_SEGMENT_ATTEMPTS {
+                if let Some(early) = stop_check() {
+                    return early;
+                }
+
+                let (seg_start, seg_end, already_downloaded) = {
+                    let locked = segs_lock.lock().unwrap();
+                    let s = &locked[seg_idx];
+                    (s.start, s.end, s.downloaded_bytes)
+                };
+                let capacity = seg_end - seg_start + 1;
+                if already_downloaded >= capacity {
+                    let mut locked = segs_lock.lock().unwrap();
+                    locked[seg_idx].downloaded_bytes = capacity;
+                    locked[seg_idx].completed = true;
+                    return ParallelSegmentResult::Completed;
+                }
+
+                let req_start = seg_start + already_downloaded;
+                let expected_remaining = seg_end - req_start + 1;
+                let seg_path = segment_part_path(&dest_path, &entry_id, seg_idx);
+
+                let mut seg_file = match OpenOptions::new()
+                    .create(already_downloaded == 0)
+                    .write(true)
+                    .append(already_downloaded > 0)
+                    .truncate(already_downloaded == 0)
+                    .open(&seg_path)
+                    .await
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        abort_flag.store(true, Ordering::Release);
+                        ctrl.wake.notify_waiters();
+                        return ParallelSegmentResult::FatalError(filesystem_error(
+                            "could not open temporary parallel segment file",
+                            e,
+                        ));
+                    }
+                };
+                if let Ok(meta) = seg_file.metadata().await {
+                    if meta.len() != already_downloaded {
+                        drop(seg_file);
+                        let _ = fs::remove_file(&seg_path).await;
+                        {
+                            let mut locked = segs_lock.lock().unwrap();
+                            locked[seg_idx].downloaded_bytes = 0;
+                            locked[seg_idx].completed = false;
+                        }
+                        continue;
+                    }
+                }
+
+                let request = http
+                    .get(&req_url)
+                    .header(RANGE, format!("bytes={req_start}-{seg_end}"));
+                let notified = ctrl.wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(early) = stop_check() {
+                    let _ = seg_file.flush().await;
+                    return early;
+                }
+                let response = tokio::select! {
+                    res = request.send() => match res {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = seg_file.flush().await;
+                            if attempt + 1 < MAX_SEGMENT_ATTEMPTS && stop_check().is_none() {
+                                sleep(Duration::from_millis(40)).await;
+                                continue;
+                            }
+                            abort_flag.store(true, Ordering::Release);
+                            ctrl.wake.notify_waiters();
+                            return ParallelSegmentResult::FatalError(describe_reqwest_error(&e, &req_url));
+                        }
+                    },
+                    _ = &mut notified => {
+                        let _ = seg_file.flush().await;
+                        if let Some(early) = stop_check() {
+                            return early;
+                        }
+                        return ParallelSegmentResult::FatalError("Parallel segment request was interrupted.".into());
+                    }
+                };
+
+                let final_url = response.url();
+                if !matches!(final_url.scheme(), "http" | "https")
+                    || final_url.host_str().is_none()
+                    || !final_url.username().is_empty()
+                    || final_url.password().is_some()
+                {
+                    abort_flag.store(true, Ordering::Release);
+                    ctrl.wake.notify_waiters();
+                    return ParallelSegmentResult::FatalError(
+                        "The download redirected to an unsupported or credential-bearing URL."
+                            .into(),
+                    );
+                }
+
+                let status = response.status();
+                if status == StatusCode::OK
+                    || status == StatusCode::RANGE_NOT_SATISFIABLE
+                    || status == StatusCode::NOT_IMPLEMENTED
+                {
+                    abort_flag.store(true, Ordering::Release);
+                    ctrl.wake.notify_waiters();
+                    return ParallelSegmentResult::RangeUnsupported(format!(
+                        "The server did not honor parallel Range request bytes={req_start}-{seg_end} (returned {status})."
+                    ));
+                }
+                if matches!(
+                    status,
+                    StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED | StatusCode::GONE
+                ) {
+                    abort_flag.store(true, Ordering::Release);
+                    ctrl.wake.notify_waiters();
+                    return ParallelSegmentResult::FatalError(format!(
+                        "HTTP status error: the server returned {status} (the video source URL is expired, unauthorized, or no longer available)."
+                    ));
+                }
+                if status != StatusCode::PARTIAL_CONTENT {
+                    if status.is_server_error()
+                        && attempt + 1 < MAX_SEGMENT_ATTEMPTS
+                        && stop_check().is_none()
+                    {
+                        sleep(Duration::from_millis(40)).await;
+                        continue;
+                    }
+                    abort_flag.store(true, Ordering::Release);
+                    ctrl.wake.notify_waiters();
+                    return ParallelSegmentResult::FatalError(format!(
+                        "HTTP status error: parallel segment {seg_idx} expected HTTP 206 Partial Content but received {status}."
+                    ));
+                }
+
+                if let Some(ct) = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                {
+                    let mut ct_guard = ct_lock.lock().unwrap();
+                    if ct_guard.is_none() {
+                        *ct_guard = Some(ct.to_owned());
+                    }
+                }
+
+                let raw_cr = response
+                    .headers()
+                    .get(CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok());
+                let Some(raw_cr) = raw_cr else {
+                    abort_flag.store(true, Ordering::Release);
+                    ctrl.wake.notify_waiters();
+                    return ParallelSegmentResult::FatalError(format!(
+                        "Parallel segment {seg_idx} received HTTP 206 Partial Content without a Content-Range header."
+                    ));
+                };
+                let Some((cr_start, cr_end, cr_total)) = parse_content_range(raw_cr) else {
+                    abort_flag.store(true, Ordering::Release);
+                    ctrl.wake.notify_waiters();
+                    return ParallelSegmentResult::FatalError(format!(
+                        "Parallel segment {seg_idx} received an invalid Content-Range header ({raw_cr})."
+                    ));
+                };
+                if cr_start != req_start || cr_end != seg_end || cr_total != total_bytes {
+                    abort_flag.store(true, Ordering::Release);
+                    ctrl.wake.notify_waiters();
+                    return ParallelSegmentResult::FatalError(format!(
+                        "Parallel segment {seg_idx} received mismatched Content-Range (expected bytes {req_start}-{seg_end}/{total_bytes}, received {raw_cr})."
+                    ));
+                }
+                if let Some(raw_cl) = response.headers().get(reqwest::header::CONTENT_LENGTH) {
+                    let parsed_cl = raw_cl
+                        .to_str()
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok());
+                    if parsed_cl != Some(expected_remaining) {
+                        abort_flag.store(true, Ordering::Release);
+                        ctrl.wake.notify_waiters();
+                        return ParallelSegmentResult::FatalError(format!(
+                            "Parallel segment {seg_idx} Content-Length ({:?}) does not match expected byte count ({expected_remaining}).",
+                            raw_cl
+                        ));
+                    }
+                }
+
+                let resp_etag = response
+                    .headers()
+                    .get(ETAG)
+                    .and_then(|v| v.to_str().ok());
+                let resp_lm = response
+                    .headers()
+                    .get(LAST_MODIFIED)
+                    .and_then(|v| v.to_str().ok());
+                let has_weak_etag = resp_etag.is_some_and(|v| v.trim_start().starts_with("W/"));
+                let resp_val = resume_validator(resp_etag, resp_lm);
+                {
+                    let mut val_guard = val_lock.lock().unwrap();
+                    if has_weak_etag
+                        && resp_val.is_none()
+                        && (val_guard.is_some()
+                            || !initial_fresh_download
+                            || already_downloaded > 0)
+                    {
+                        abort_flag.store(true, Ordering::Release);
+                        ctrl.wake.notify_waiters();
+                        return ParallelSegmentResult::FatalError(
+                            "The server returned a weak file validator during the parallel range transfer."
+                                .into(),
+                        );
+                    }
+                    if let Some(actual_val) = resp_val {
+                        if let Some(expected_val) = val_guard.as_deref() {
+                            if expected_val != actual_val {
+                                abort_flag.store(true, Ordering::Release);
+                                ctrl.wake.notify_waiters();
+                                return ParallelSegmentResult::FatalError(
+                                    "The server's file validator changed during the parallel range transfer."
+                                        .into(),
+                                );
+                            }
+                        } else {
+                            *val_guard = Some(actual_val.to_owned());
+                        }
+                    }
+                }
+
+                let mut stream = response.bytes_stream();
+                let mut attempt_received = 0_u64;
+                let mut stream_interrupted_error: Option<String> = None;
+
+                loop {
+                    if let Some(early) = stop_check() {
+                        let _ = seg_file.flush().await;
+                        return early;
+                    }
+                    let notified = ctrl.wake.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if let Some(early) = stop_check() {
+                        let _ = seg_file.flush().await;
+                        return early;
+                    }
+                    let next = tokio::select! {
+                        _ = &mut notified => continue,
+                        chunk = stream.next() => chunk,
+                    };
+                    let Some(chunk) = next else {
+                        break;
+                    };
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(e) => {
+                            stream_interrupted_error =
+                                Some(format!("Transfer body error: {}", describe_reqwest_error(&e, &req_url)));
+                            break;
+                        }
+                    };
+                    let chunk_len = chunk.len() as u64;
+                    if attempt_received.saturating_add(chunk_len) > expected_remaining {
+                        let _ = seg_file.flush().await;
+                        abort_flag.store(true, Ordering::Release);
+                        ctrl.wake.notify_waiters();
+                        return ParallelSegmentResult::FatalError(format!(
+                            "Parallel segment {seg_idx} sent more data than its declared Content-Range."
+                        ));
+                    }
+                    let limit = state
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.bandwidth_limit_bytes_per_second);
+                    if let Err(e) = bw.wait_for_turn(chunk.len(), limit).await {
+                        abort_flag.store(true, Ordering::Release);
+                        ctrl.wake.notify_waiters();
+                        return ParallelSegmentResult::FatalError(e);
+                    }
+                    if let Err(e) = seg_file.write_all(&chunk).await {
+                        abort_flag.store(true, Ordering::Release);
+                        ctrl.wake.notify_waiters();
+                        return ParallelSegmentResult::FatalError(filesystem_error(
+                            "could not write parallel segment data",
+                            e,
+                        ));
+                    }
+                    attempt_received = attempt_received.saturating_add(chunk_len);
+                    let maybe_progress_update = {
+                        let (snapshot_segs, sum_bytes) = {
+                            let mut locked = segs_lock.lock().unwrap();
+                            locked[seg_idx].downloaded_bytes =
+                                already_downloaded.saturating_add(attempt_received);
+                            let sum: u64 = locked.iter().map(|s| s.downloaded_bytes).sum();
+                            (locked.clone(), sum)
+                        };
+                        let mut prog = prog_lock.lock().unwrap();
+                        let dt = prog.last_update.elapsed();
+                        if dt >= PROGRESS_INTERVAL {
+                            let speed = sum_bytes.saturating_sub(prog.last_bytes) as f64
+                                / dt.as_secs_f64().max(0.001);
+                            prog.last_bytes = sum_bytes;
+                            prog.last_update = Instant::now();
+                            let elapsed_ms = base_elapsed_ms.saturating_add(
+                                start_instant.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                            );
+                            let remaining_seconds = (speed > 0.0)
+                                .then(|| total_bytes.saturating_sub(sum_bytes) as f64 / speed);
+                            Some((snapshot_segs, sum_bytes, speed, elapsed_ms, remaining_seconds))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((snapshot_segs, sum_bytes, speed, elapsed_ms, remaining_seconds)) =
+                        maybe_progress_update
+                    {
+                        let _ = update_entry_optional(app, state, &entry_id, |entry| {
+                            if entry.status == DownloadStatus::Downloading {
+                                entry.downloaded_bytes = sum_bytes;
+                                entry.segments = snapshot_segs;
+                                entry.speed_bytes_per_second = speed;
+                                entry.elapsed_ms = elapsed_ms;
+                                entry.remaining_seconds = remaining_seconds;
+                            }
+                            Ok(())
+                        });
+                    }
+                }
+
+                let _ = seg_file.flush().await;
+                let _ = seg_file.sync_data().await;
+                drop(seg_file);
+
+                if ctrl.is_cancelled() {
+                    return ParallelSegmentResult::Cancelled;
+                }
+                if ctrl.is_pause_requested() {
+                    return ParallelSegmentResult::Paused;
+                }
+                if ctrl.is_shutdown_requested() {
+                    return ParallelSegmentResult::Shutdown;
+                }
+
+                if let Some(err) = stream_interrupted_error {
+                    if attempt + 1 < MAX_SEGMENT_ATTEMPTS && stop_check().is_none() {
+                        sleep(Duration::from_millis(40)).await;
+                        continue;
+                    }
+                    abort_flag.store(true, Ordering::Release);
+                    ctrl.wake.notify_waiters();
+                    return ParallelSegmentResult::FatalError(err);
+                }
+
+                if attempt_received != expected_remaining {
+                    if attempt + 1 < MAX_SEGMENT_ATTEMPTS && stop_check().is_none() {
+                        sleep(Duration::from_millis(40)).await;
+                        continue;
+                    }
+                    abort_flag.store(true, Ordering::Release);
+                    ctrl.wake.notify_waiters();
+                    return ParallelSegmentResult::FatalError(format!(
+                        "Parallel segment {seg_idx} transfer ended after {attempt_received} bytes, but {expected_remaining} bytes were expected."
+                    ));
+                }
+
+                match fs::metadata(&seg_path).await {
+                    Ok(meta) if meta.len() == capacity => {
+                        let (snapshot_segs, sum_bytes) = {
+                            let mut locked = segs_lock.lock().unwrap();
+                            locked[seg_idx].downloaded_bytes = capacity;
+                            locked[seg_idx].completed = true;
+                            let sum: u64 = locked.iter().map(|s| s.downloaded_bytes).sum();
+                            (locked.clone(), sum)
+                        };
+                        let elapsed_ms = base_elapsed_ms.saturating_add(
+                            start_instant.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        );
+                        let _ = update_entry_optional(app, state, &entry_id, |entry| {
+                            entry.downloaded_bytes = sum_bytes;
+                            entry.segments = snapshot_segs;
+                            entry.elapsed_ms = elapsed_ms;
+                            Ok(())
+                        });
+                        return ParallelSegmentResult::Completed;
+                    }
+                    _ => {
+                        abort_flag.store(true, Ordering::Release);
+                        ctrl.wake.notify_waiters();
+                        return ParallelSegmentResult::FatalError(format!(
+                            "Parallel segment {seg_idx} size on disk did not match expected capacity ({capacity} bytes)."
+                        ));
+                    }
+                }
+            }
+
+            ParallelSegmentResult::FatalError(format!(
+                "Parallel segment {seg_idx} exhausted its retry attempts."
+            ))
+        });
+    }
+
+    let results = futures_util::future::join_all(tasks).await;
+    let elapsed_ms = base_elapsed_ms
+        .saturating_add(start_instant.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    let (latest_segments, total_downloaded_now) = {
+        let locked = shared_segments.lock().unwrap();
+        let sum: u64 = locked.iter().map(|s| s.downloaded_bytes).sum();
+        (locked.clone(), sum)
+    };
+
+    if control.is_cancelled()
+        || (results
+            .iter()
+            .any(|r| matches!(r, ParallelSegmentResult::Cancelled))
+            && !results.iter().any(|r| {
+                matches!(
+                    r,
+                    ParallelSegmentResult::FatalError(_)
+                        | ParallelSegmentResult::RangeUnsupported(_)
+                )
+            })
+            && !control.is_pause_requested()
+            && !control.is_shutdown_requested())
+    {
+        remove_all_segment_parts(destination, id).await;
+        let _ = fs::remove_file(partial_path(destination)).await;
+        update_entry_optional(app, state, id, |entry| {
+            entry.downloaded_bytes = total_downloaded_now;
+            entry.segments.clear();
+            entry.elapsed_ms = elapsed_ms;
+            Ok(())
+        })?;
+        finish_cancelled_optional(app, state, id)?;
+        return Ok(ParallelDownloadOutcome::Handled);
+    }
+
+    if control.is_shutdown_requested()
+        || results
+            .iter()
+            .any(|r| matches!(r, ParallelSegmentResult::Shutdown))
+    {
+        finish_shutdown_optional(state, id, |entry| {
+            entry.downloaded_bytes = total_downloaded_now;
+            entry.segments = latest_segments;
+            entry.elapsed_ms = elapsed_ms;
+            entry.speed_bytes_per_second = 0.0;
+            entry.remaining_seconds = None;
+        })?;
+        return Ok(ParallelDownloadOutcome::Handled);
+    }
+
+    if control.is_pause_requested()
+        || results
+            .iter()
+            .any(|r| matches!(r, ParallelSegmentResult::Paused))
+    {
+        update_entry_optional(app, state, id, |entry| {
+            transition(entry, DownloadStatus::Paused)?;
+            entry.downloaded_bytes = total_downloaded_now;
+            entry.segments = latest_segments;
+            entry.elapsed_ms = elapsed_ms;
+            entry.speed_bytes_per_second = 0.0;
+            entry.remaining_seconds = None;
+            Ok(())
+        })?;
+        return Ok(ParallelDownloadOutcome::Handled);
+    }
+
+    if let Some(ParallelSegmentResult::RangeUnsupported(reason)) = results
+        .iter()
+        .find(|r| matches!(r, ParallelSegmentResult::RangeUnsupported(_)))
+    {
+        if initial_verified_bytes == 0 {
+            remove_all_segment_parts(destination, id).await;
+            let _ = fs::remove_file(partial_path(destination)).await;
+            update_entry_optional(app, state, id, |entry| {
+                entry.downloaded_bytes = 0;
+                entry.segments.clear();
+                Ok(())
+            })?;
+            return Ok(ParallelDownloadOutcome::FallbackToSequential);
+        }
+        update_entry_optional(app, state, id, |entry| {
+            entry.downloaded_bytes = total_downloaded_now;
+            entry.segments = latest_segments;
+            entry.elapsed_ms = elapsed_ms;
+            Ok(())
+        })?;
+        fail_entry_optional(app, state, id, reason.clone()).await?;
+        return Ok(ParallelDownloadOutcome::Handled);
+    }
+
+    if let Some(ParallelSegmentResult::FatalError(error)) = results
+        .iter()
+        .find(|r| matches!(r, ParallelSegmentResult::FatalError(_)))
+    {
+        update_entry_optional(app, state, id, |entry| {
+            entry.downloaded_bytes = total_downloaded_now;
+            entry.segments = latest_segments;
+            entry.elapsed_ms = elapsed_ms;
+            Ok(())
+        })?;
+        fail_entry_optional(app, state, id, error.clone()).await?;
+        return Ok(ParallelDownloadOutcome::Handled);
+    }
+
+    if let Err(error) = validate_segment_plan(&latest_segments, total_bytes) {
+        fail_entry_optional(app, state, id, error).await?;
+        return Ok(ParallelDownloadOutcome::Handled);
+    }
+    if latest_segments.iter().any(|s| !s.completed) || total_downloaded_now != total_bytes {
+        fail_entry_optional(
+            app,
+            state,
+            id,
+            format!(
+                "Parallel segment transfer incomplete: received {total_downloaded_now} of {total_bytes} bytes."
+            ),
+        )
+        .await?;
+        return Ok(ParallelDownloadOutcome::Handled);
+    }
+
+    let partial = partial_path(destination);
+    let mut assembled = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&partial)
+        .await
+        .map_err(|e| filesystem_error("could not create assembled partial download file", e))?;
+
+    let mut write_cursor = 0_u64;
+    for seg in &latest_segments {
+        if seg.start != write_cursor {
+            drop(assembled);
+            let _ = fs::remove_file(&partial).await;
+            fail_entry_optional(
+                app,
+                state,
+                id,
+                format!(
+                    "Parallel segment assembly offset mismatch at segment {} (expected {}, got {}).",
+                    seg.index, write_cursor, seg.start
+                ),
+            )
+            .await?;
+            return Ok(ParallelDownloadOutcome::Handled);
+        }
+        let seg_path = segment_part_path(destination, id, seg.index);
+        let expected_seg_len = seg.end - seg.start + 1;
+        let meta = match fs::metadata(&seg_path).await {
+            Ok(m) => m,
+            Err(e) => {
+                drop(assembled);
+                let _ = fs::remove_file(&partial).await;
+                return Err(filesystem_error(
+                    "could not inspect completed parallel segment file",
+                    e,
+                ));
+            }
+        };
+        if meta.len() != expected_seg_len {
+            drop(assembled);
+            let _ = fs::remove_file(&partial).await;
+            fail_entry_optional(
+                app,
+                state,
+                id,
+                format!(
+                    "Parallel segment {} file size ({}) does not match expected length ({expected_seg_len}).",
+                    seg.index,
+                    meta.len()
+                ),
+            )
+            .await?;
+            return Ok(ParallelDownloadOutcome::Handled);
+        }
+        let mut seg_reader = match fs::File::open(&seg_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                drop(assembled);
+                let _ = fs::remove_file(&partial).await;
+                return Err(filesystem_error(
+                    "could not open completed parallel segment file",
+                    e,
+                ));
+            }
+        };
+        let copied = match tokio::io::copy(&mut seg_reader, &mut assembled).await {
+            Ok(c) => c,
+            Err(e) => {
+                drop(assembled);
+                let _ = fs::remove_file(&partial).await;
+                return Err(filesystem_error(
+                    "could not assemble parallel segment data",
+                    e,
+                ));
+            }
+        };
+        if copied != expected_seg_len {
+            drop(assembled);
+            let _ = fs::remove_file(&partial).await;
+            fail_entry_optional(
+                app,
+                state,
+                id,
+                format!(
+                    "Parallel segment {} copied {copied} bytes instead of {expected_seg_len} bytes.",
+                    seg.index
+                ),
+            )
+            .await?;
+            return Ok(ParallelDownloadOutcome::Handled);
+        }
+        write_cursor = write_cursor.saturating_add(copied);
+    }
+
+    assembled
+        .flush()
+        .await
+        .map_err(|e| filesystem_error("could not flush assembled download file", e))?;
+    assembled
+        .sync_data()
+        .await
+        .map_err(|e| filesystem_error("could not sync assembled download file", e))?;
+    drop(assembled);
+
+    if write_cursor != total_bytes {
+        let _ = fs::remove_file(&partial).await;
+        fail_entry_optional(
+            app,
+            state,
+            id,
+            format!(
+                "Assembled parallel download size ({write_cursor}) does not match {total_bytes}."
+            ),
+        )
+        .await?;
+        return Ok(ParallelDownloadOutcome::Handled);
+    }
+
+    let validation_path = partial.clone();
+    let validation_destination = destination.to_path_buf();
+    let validation_url = url.to_owned();
+    let validation_content_type = shared_content_type.lock().unwrap().clone();
+    if let Err(validation_error) = tokio::task::spawn_blocking(move || {
+        validate_mp4_completion(
+            &validation_path,
+            &validation_destination,
+            &validation_url,
+            validation_content_type.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("The media validation worker could not finish: {error}"))?
+    {
+        remove_all_segment_parts(destination, id).await;
+        let _ = update_entry_optional(app, state, id, |entry| {
+            entry.segments.clear();
+            Ok(())
+        });
+        return Err(format!(
+            "{validation_error} The downloaded bytes remain in the temporary partial file; retry or remove the failed item."
+        ));
+    }
+
+    remove_all_segment_parts(destination, id).await;
+    #[cfg(test)]
+    invoke_test_commit_hook("parallel_after_validation", id, control);
+    if control.is_cancelled() {
+        let _ = fs::remove_file(&partial).await;
+        update_entry_optional(app, state, id, |entry| {
+            entry.segments.clear();
+            entry.elapsed_ms = elapsed_ms;
+            Ok(())
+        })?;
+        finish_cancelled_optional(app, state, id)?;
+        return Ok(ParallelDownloadOutcome::Handled);
+    }
+    if destination.exists() {
+        fail_entry_optional(
+            app,
+            state,
+            id,
+            "The destination file appeared during the download; it was not overwritten.".into(),
+        )
+        .await?;
+        return Ok(ParallelDownloadOutcome::Handled);
+    }
+    fs::rename(&partial, destination)
+        .await
+        .map_err(|error| filesystem_error("could not commit the completed download", error))?;
+    #[cfg(test)]
+    invoke_test_commit_hook("parallel_after_rename", id, control);
+    let average_speed = if elapsed_ms > 0 {
+        total_bytes as f64 / (elapsed_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    let completed = update_entry_optional(app, state, id, |entry| {
+        if control.is_cancelled() || entry.status == DownloadStatus::Cancelled {
+            return Err("The download was cancelled.".into());
+        }
+        transition(entry, DownloadStatus::Completed)?;
+        entry.downloaded_bytes = total_bytes;
+        entry.total_bytes = Some(total_bytes);
+        entry.segments.clear();
+        entry.speed_bytes_per_second = average_speed;
+        entry.elapsed_ms = elapsed_ms;
+        entry.remaining_seconds = Some(0.0);
+        entry.error = None;
+        Ok(())
+    });
+    match completed {
+        Ok(completed) => {
+            if completed.notify_on_complete {
+                send_download_notification_optional(app, &completed, true);
+            }
+            Ok(ParallelDownloadOutcome::Handled)
+        }
+        Err(_) if control.is_cancelled() => {
+            let _ = fs::remove_file(destination).await;
+            finish_cancelled_optional(app, state, id)?;
+            Ok(ParallelDownloadOutcome::Handled)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 struct WorkerGuard(Arc<AtomicUsize>);
@@ -2840,7 +4737,7 @@ impl Drop for WorkerGuard {
 }
 
 async fn download_worker(
-    app: &tauri::AppHandle,
+    app: Option<&tauri::AppHandle>,
     state: &Mutex<DownloadState>,
     concurrency: &Arc<ConcurrencyLimiter>,
     bandwidth: &Arc<BandwidthLimiter>,
@@ -2849,23 +4746,29 @@ async fn download_worker(
     restart: bool,
 ) -> Result<(), String> {
     let Some(_slot) = concurrency.acquire(state, control).await? else {
-        return finish_cancelled(app, state, id);
+        if control.is_shutdown_requested() && !control.is_cancelled() {
+            return finish_shutdown_optional(state, id, |_| {});
+        }
+        return finish_cancelled_optional(app, state, id);
     };
-    update_entry(app, state, id, |entry| {
+    update_entry_optional(app, state, id, |entry| {
         if entry.status == DownloadStatus::Queued || entry.status == DownloadStatus::Paused {
             transition(entry, DownloadStatus::Downloading)?;
         }
         Ok(())
     })?;
     let (
-        url,
+        mut url,
         destination,
         mut offset,
-        etag,
-        last_modified,
+        mut total_bytes,
+        mut etag,
+        mut last_modified,
         base_elapsed_ms,
         hls_playlist,
         hls_completed_parts,
+        mut persisted_segments,
+        max_connections_per_download,
     ) = {
         let state = state
             .lock()
@@ -2879,8 +4782,13 @@ async fn download_worker(
             entry.url.clone(),
             PathBuf::from(&entry.destination),
             if restart { 0 } else { entry.downloaded_bytes },
-            entry.etag.clone(),
-            entry.last_modified.clone(),
+            if restart { None } else { entry.total_bytes },
+            if restart { None } else { entry.etag.clone() },
+            if restart {
+                None
+            } else {
+                entry.last_modified.clone()
+            },
             if restart { 0 } else { entry.elapsed_ms },
             entry.hls_playlist.clone(),
             if restart {
@@ -2888,6 +4796,14 @@ async fn download_worker(
             } else {
                 entry.hls_completed_parts.unwrap_or(0)
             },
+            if restart {
+                Vec::new()
+            } else {
+                entry.segments.clone()
+            },
+            state
+                .max_connections_per_download
+                .clamp(1, MAX_CONNECTIONS_PER_DOWNLOAD),
         )
     };
     if let Some(playlist) = hls_playlist {
@@ -2907,8 +4823,31 @@ async fn download_worker(
         )
         .await;
     }
+    let parsed_url = match validated_download_url(&url).and_then(|u| normalize_instagram_media_url(&u)) {
+        Ok(normalized) => normalized,
+        Err(message) => return fail_entry_optional(app, state, id, message).await,
+    };
+    if is_signed_url_expired(&parsed_url) {
+        return fail_entry_optional(
+            app,
+            state,
+            id,
+            "The signed download URL has expired and cannot be resumed. Obtain a fresh download link to retry.".into(),
+        )
+        .await;
+    }
+    if parsed_url.as_str() != url {
+        url = parsed_url.to_string();
+        update_entry_optional(app, state, id, |entry| {
+            entry.url = url.clone();
+            Ok(())
+        })?;
+    }
+    let is_instagram_cdn = is_instagram_cdn_url(&parsed_url);
     let partial = partial_path(&destination);
     if restart {
+        remove_all_segment_parts(&destination, id).await;
+        persisted_segments.clear();
         match fs::metadata(&partial).await {
             Ok(_) => fs::remove_file(&partial).await.map_err(|error| {
                 filesystem_error("could not remove the previous partial file", error)
@@ -2922,8 +4861,8 @@ async fn download_worker(
             }
         }
     }
-    if offset == 0 && destination.exists() {
-        return fail_entry(
+    if destination.exists() {
+        return fail_entry_optional(
             app,
             state,
             id,
@@ -2931,11 +4870,53 @@ async fn download_worker(
         )
         .await;
     }
+
+    let client = build_http_client()?;
+    let mut allow_parallel_upgrade =
+        !is_instagram_cdn && max_connections_per_download > 1 && offset == 0;
+
+    // If resuming an already-segmented parallel download, dispatch directly to parallel segment worker
+    if !persisted_segments.is_empty() {
+        if let Some(total) = total_bytes {
+            match download_parallel_segments_worker(
+                app,
+                state,
+                bandwidth,
+                &client,
+                id,
+                control,
+                &url,
+                &destination,
+                total,
+                persisted_segments,
+                etag.clone(),
+                last_modified.clone(),
+                None,
+                base_elapsed_ms,
+                max_connections_per_download,
+                false,
+            )
+            .await?
+            {
+                ParallelDownloadOutcome::Handled => return Ok(()),
+                ParallelDownloadOutcome::FallbackToSequential => {
+                    allow_parallel_upgrade = false;
+                    offset = 0;
+                    total_bytes = None;
+                }
+            }
+        } else {
+            remove_all_segment_parts(&destination, id).await;
+            persisted_segments.clear();
+            offset = 0;
+        }
+    }
+
     if offset > 0 {
         match fs::symlink_metadata(&partial).await {
             Ok(metadata) if metadata.file_type().is_file() && metadata.len() == offset => {}
             Ok(_) => {
-                return fail_entry(
+                return fail_entry_optional(
                     app,
                     state,
                     id,
@@ -2944,7 +4925,7 @@ async fn download_worker(
                 .await;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return fail_entry(
+                return fail_entry_optional(
                     app,
                     state,
                     id,
@@ -2959,135 +4940,17 @@ async fn download_worker(
                 ));
             }
         }
-    }
-
-    let client = build_http_client()?;
-    let mut request = client.get(&url);
-    if offset > 0 {
-        let validator = resume_validator(etag.as_deref(), last_modified.as_deref());
-        if validator.is_none() {
-            return fail_entry(
+        if total_bytes.is_some_and(|total| offset > total) {
+            return fail_entry_optional(
                 app,
                 state,
                 id,
-                "The server did not provide a validator for safe resume. Use Retry to restart from zero.".into(),
+                "The server's range metadata conflicts with the partial file. Use Retry to restart safely.".into(),
             )
             .await;
         }
-        request = request.header(RANGE, format!("bytes={offset}-"));
-        if let Some(validator) = validator {
-            request = request.header(IF_RANGE, validator);
-        }
-    }
-    let response = tokio::select! {
-        response = request.send() => response
-            .map_err(|error| describe_reqwest_error(&error, &url))?,
-        _ = control.wake.notified() => {
-            if control.cancelled.load(Ordering::Acquire) {
-                return finish_cancelled(app, state, id);
-            }
-            if control.pause_requested.load(Ordering::Acquire) {
-                update_entry(app, state, id, |entry| {
-                    transition(entry, DownloadStatus::Paused)?;
-                    entry.speed_bytes_per_second = 0.0;
-                    entry.remaining_seconds = None;
-                    Ok(())
-                })?;
-                return Ok(());
-            }
-            return Err("The download worker was interrupted before the request started.".into());
-        }
-    };
-    let status = response.status();
-    let content_range = response
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok());
-    let mut total_bytes = response.content_length();
-    if offset == 0 {
-        if let Err(message) = validate_unranged_media_response(status, content_range, total_bytes) {
-            return fail_entry(app, state, id, message).await;
-        }
-    }
-    if !status.is_success() {
-        return fail_entry(
-            app,
-            state,
-            id,
-            format!("HTTP status error: the server returned {status}."),
-        )
-        .await;
     }
 
-    let response_content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    if offset > 0 {
-        let range_header = response
-            .headers()
-            .get(CONTENT_RANGE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let response_etag = response
-            .headers()
-            .get(ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let response_last_modified = response
-            .headers()
-            .get(LAST_MODIFIED)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let expected_validator = resume_validator(etag.as_deref(), last_modified.as_deref());
-        let response_validator = if response_etag.as_deref() == expected_validator {
-            response_etag.as_deref()
-        } else {
-            response_last_modified.as_deref()
-        };
-        let total = match validate_range_response(
-            status,
-            range_header.as_deref(),
-            offset,
-            expected_validator,
-            response_validator,
-        ) {
-            Ok(total) => total,
-            Err(message) => return fail_entry(app, state, id, message).await,
-        };
-        total_bytes = Some(total);
-    } else if status != StatusCode::OK {
-        return fail_entry(
-            app,
-            state,
-            id,
-            format!(
-                "HTTP status error: expected HTTP 200 for a new download but received {status}."
-            ),
-        )
-        .await;
-    }
-
-    let response_etag = response
-        .headers()
-        .get(ETAG)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let response_last_modified = response
-        .headers()
-        .get(LAST_MODIFIED)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    if offset > 0 && total_bytes.is_some_and(|total| offset > total) {
-        return fail_entry(
-            app,
-            state,
-            id,
-            "The server's range metadata conflicts with the partial file. Use Retry to restart safely.".into(),
-        )
-        .await;
-    }
     let mut output = OpenOptions::new()
         .create(offset == 0)
         .create_new(offset == 0)
@@ -3103,7 +4966,7 @@ async fn download_worker(
         .map_err(|error| filesystem_error("could not inspect the partial download file", error))?
         .len();
     if file_length != offset {
-        return fail_entry(
+        return fail_entry_optional(
             app,
             state,
             id,
@@ -3112,21 +4975,18 @@ async fn download_worker(
         )
         .await;
     }
+
     let start = Instant::now();
     let mut last_update = Instant::now();
     let mut last_bytes = offset;
     let mut speed = 0.0;
-    let mut stream = response.bytes_stream();
+    let mut response_content_type: Option<String> = None;
+    let mut force_range_request = offset > 0;
+    let mut explicit_range_end: Option<u64> = None;
+    let mut range_requests_count = 0_usize;
+    const MAX_RANGE_REQUESTS: usize = 4096;
 
-    update_entry(app, state, id, |entry| {
-        entry.total_bytes = total_bytes;
-        entry.error = None;
-        entry.etag = response_etag;
-        entry.last_modified = response_last_modified;
-        Ok(())
-    })?;
-
-    loop {
+    while total_bytes.is_none() || offset < total_bytes.unwrap_or(0) {
         if control.cancelled.load(Ordering::Acquire) {
             output
                 .flush()
@@ -3134,12 +4994,26 @@ async fn download_worker(
                 .map_err(|error| filesystem_error("could not flush the partial file", error))?;
             let elapsed_ms = base_elapsed_ms
                 .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
-            update_entry(app, state, id, |entry| {
+            update_entry_optional(app, state, id, |entry| {
                 entry.downloaded_bytes = offset;
                 entry.elapsed_ms = elapsed_ms;
                 Ok(())
             })?;
-            return finish_cancelled(app, state, id);
+            return finish_cancelled_optional(app, state, id);
+        }
+        if control.shutdown_requested.load(Ordering::Acquire) {
+            output
+                .flush()
+                .await
+                .map_err(|error| filesystem_error("could not flush the partial file", error))?;
+            let elapsed_ms = base_elapsed_ms
+                .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            return finish_shutdown_optional(state, id, |entry| {
+                entry.downloaded_bytes = offset;
+                entry.elapsed_ms = elapsed_ms;
+                entry.speed_bytes_per_second = 0.0;
+                entry.remaining_seconds = None;
+            });
         }
         if control.pause_requested.load(Ordering::Acquire) {
             output
@@ -3148,7 +5022,7 @@ async fn download_worker(
                 .map_err(|error| filesystem_error("could not flush the partial file", error))?;
             let elapsed_ms = base_elapsed_ms
                 .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
-            update_entry(app, state, id, |entry| {
+            update_entry_optional(app, state, id, |entry| {
                 transition(entry, DownloadStatus::Paused)?;
                 entry.downloaded_bytes = offset;
                 entry.elapsed_ms = elapsed_ms;
@@ -3158,97 +5032,584 @@ async fn download_worker(
             })?;
             return Ok(());
         }
-        let next = tokio::select! {
-            _ = control.wake.notified() => continue,
-            chunk = stream.next() => chunk,
-        };
-        let Some(chunk) = next else {
-            break;
-        };
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => {
+        range_requests_count = range_requests_count.saturating_add(1);
+        if range_requests_count > MAX_RANGE_REQUESTS {
+            return fail_entry_optional(
+                app,
+                state,
+                id,
+                "The download required too many sequential byte-range requests to complete safely.".into(),
+            )
+            .await;
+        }
+
+        let mut request = client.get(&url);
+        if is_instagram_cdn {
+            request = request
+                .header(reqwest::header::REFERER, "https://www.instagram.com/")
+                .header(reqwest::header::ORIGIN, "https://www.instagram.com");
+        }
+        let requested_range = offset > 0 || force_range_request;
+        if requested_range {
+            let range_header_value = match explicit_range_end {
+                Some(end) if end >= offset => format!("bytes={offset}-{end}"),
+                _ => format!("bytes={offset}-"),
+            };
+            request = request.header(RANGE, range_header_value);
+        }
+
+        let response = tokio::select! {
+            response = request.send() => response
+                .map_err(|error| describe_reqwest_error(&error, &url))?,
+            _ = control.wake.notified() => {
+                output
+                    .flush()
+                    .await
+                    .map_err(|error| filesystem_error("could not flush the partial file", error))?;
                 let elapsed_ms = base_elapsed_ms
                     .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
-                update_entry(app, state, id, |entry| {
+                if control.cancelled.load(Ordering::Acquire) {
+                    update_entry_optional(app, state, id, |entry| {
+                        entry.downloaded_bytes = offset;
+                        entry.elapsed_ms = elapsed_ms;
+                        Ok(())
+                    })?;
+                    return finish_cancelled_optional(app, state, id);
+                }
+                if control.shutdown_requested.load(Ordering::Acquire) {
+                    return finish_shutdown_optional(state, id, |entry| {
+                        entry.downloaded_bytes = offset;
+                        entry.elapsed_ms = elapsed_ms;
+                        entry.speed_bytes_per_second = 0.0;
+                        entry.remaining_seconds = None;
+                    });
+                }
+                if control.pause_requested.load(Ordering::Acquire) {
+                    update_entry_optional(app, state, id, |entry| {
+                        transition(entry, DownloadStatus::Paused)?;
+                        entry.downloaded_bytes = offset;
+                        entry.elapsed_ms = elapsed_ms;
+                        entry.speed_bytes_per_second = 0.0;
+                        entry.remaining_seconds = None;
+                        Ok(())
+                    })?;
+                    return Ok(());
+                }
+                return Err("The download worker was interrupted before the request completed.".into());
+            }
+        };
+
+        let final_url = response.url();
+        if !matches!(final_url.scheme(), "http" | "https")
+            || final_url.host_str().is_none()
+            || !final_url.username().is_empty()
+            || final_url.password().is_some()
+        {
+            return fail_entry_optional(
+                app,
+                state,
+                id,
+                "The download redirected to an unsupported or credential-bearing URL.".into(),
+            )
+            .await;
+        }
+
+        let status = response.status();
+        if matches!(
+            status,
+            StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED | StatusCode::GONE
+        ) {
+            return fail_entry_optional(
+                app,
+                state,
+                id,
+                format!(
+                    "HTTP status error: the server returned {status} (the video source URL is expired, unauthorized, or no longer available)."
+                ),
+            )
+            .await;
+        }
+        if !status.is_success() {
+            return fail_entry_optional(
+                app,
+                state,
+                id,
+                format!("HTTP status error: the server returned {status}."),
+            )
+            .await;
+        }
+
+        let content_range_header = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let response_content_length = response.content_length();
+        if let Some(ct) = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+        {
+            response_content_type = Some(ct.to_owned());
+        }
+        let response_etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let response_last_modified = response
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
+        let advertises_ranges = response_advertises_byte_ranges(response.headers());
+        let expected_chunk_bytes: Option<u64>;
+        if status == StatusCode::OK {
+            if requested_range {
+                return fail_entry_optional(
+                    app,
+                    state,
+                    id,
+                    "The server did not honor the Range request (returned HTTP 200 instead of HTTP 206 Partial Content). The partial file was not appended; use Retry to safely restart from zero.".into(),
+                )
+                .await;
+            }
+            if content_range_header.is_some() {
+                return fail_entry_optional(
+                    app,
+                    state,
+                    id,
+                    "The server returned only a partial byte-range response with HTTP 200. FluxNet cannot save it as a complete media file.".into(),
+                )
+                .await;
+            }
+            expected_chunk_bytes = response_content_length;
+            total_bytes = response_content_length;
+            if etag.is_none() {
+                etag = response_etag.clone();
+            }
+            if last_modified.is_none() {
+                last_modified = response_last_modified.clone();
+            }
+            if allow_parallel_upgrade && advertises_ranges {
+                if let Some(total) = total_bytes.filter(|t| *t >= MIN_PARALLEL_FILE_BYTES) {
+                    let planned = plan_parallel_segments(total, max_connections_per_download);
+                    if !planned.is_empty() {
+                        drop(response);
+                        drop(output);
+                        let _ = fs::remove_file(&partial).await;
+                        match download_parallel_segments_worker(
+                            app,
+                            state,
+                            bandwidth,
+                            &client,
+                            id,
+                            control,
+                            &url,
+                            &destination,
+                            total,
+                            planned,
+                            etag.clone(),
+                            last_modified.clone(),
+                            response_content_type.clone(),
+                            base_elapsed_ms,
+                            max_connections_per_download,
+                            true,
+                        )
+                        .await?
+                        {
+                            ParallelDownloadOutcome::Handled => return Ok(()),
+                            ParallelDownloadOutcome::FallbackToSequential => {
+                                allow_parallel_upgrade = false;
+                                offset = 0;
+                                total_bytes = None;
+                                output = OpenOptions::new()
+                                    .create(true)
+                                    .write(true)
+                                    .truncate(true)
+                                    .open(&partial)
+                                    .await
+                                    .map_err(|error| {
+                                        filesystem_error(
+                                            "could not reopen partial download file after parallel fallback",
+                                            error,
+                                        )
+                                    })?;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if status == StatusCode::PARTIAL_CONTENT {
+            let Some(raw_cr) = content_range_header.as_deref() else {
+                return fail_entry_optional(
+                    app,
+                    state,
+                    id,
+                    "The server returned HTTP 206 Partial Content without a Content-Range header.".into(),
+                )
+                .await;
+            };
+            let Some((range_start, range_end, range_total)) = parse_content_range(raw_cr) else {
+                return fail_entry_optional(
+                    app,
+                    state,
+                    id,
+                    "The server returned HTTP 206 Partial Content with an invalid Content-Range header.".into(),
+                )
+                .await;
+            };
+            if range_start != offset {
+                return fail_entry_optional(
+                    app,
+                    state,
+                    id,
+                    format!(
+                        "The server returned a Content-Range with the wrong starting offset (expected byte {offset}, received byte {range_start})."
+                    ),
+                )
+                .await;
+            }
+            if let Some(expected_total) = total_bytes {
+                if range_total != expected_total {
+                    return fail_entry_optional(
+                        app,
+                        state,
+                        id,
+                        format!(
+                            "The server's Content-Range total size ({range_total}) conflicts with the previously declared size ({expected_total})."
+                        ),
+                    )
+                    .await;
+                }
+            }
+            let expected_validator = resume_validator(etag.as_deref(), last_modified.as_deref());
+            let response_validator = resume_validator(
+                response_etag.as_deref(),
+                response_last_modified.as_deref(),
+            );
+            if offset > 0
+                && expected_validator.is_some()
+                && response_validator.is_some()
+                && expected_validator != response_validator
+            {
+                return fail_entry_optional(
+                    app,
+                    state,
+                    id,
+                    "The server's file validator changed during the range transfer. The partial file was not appended; use Retry to restart safely.".into(),
+                )
+                .await;
+            }
+            let chunk_len = range_end - range_start + 1;
+            if let Some(declared_len) = response_content_length {
+                if declared_len != chunk_len {
+                    return fail_entry_optional(
+                        app,
+                        state,
+                        id,
+                        format!(
+                            "The server's Content-Length ({declared_len}) does not match the Content-Range byte count ({chunk_len})."
+                        ),
+                    )
+                    .await;
+                }
+            }
+            total_bytes = Some(range_total);
+            expected_chunk_bytes = Some(chunk_len);
+            if etag.is_none() {
+                etag = response_etag.clone();
+            }
+            if last_modified.is_none() {
+                last_modified = response_last_modified.clone();
+            }
+        } else {
+            return fail_entry_optional(
+                app,
+                state,
+                id,
+                format!(
+                    "HTTP status error: expected HTTP 200 or 206 Partial Content but received {status}."
+                ),
+            )
+            .await;
+        }
+
+        let current_etag = etag.clone();
+        let current_last_modified = last_modified.clone();
+        update_entry_optional(app, state, id, |entry| {
+            entry.total_bytes = total_bytes;
+            entry.error = None;
+            entry.etag = current_etag;
+            entry.last_modified = current_last_modified;
+            Ok(())
+        })?;
+
+        let mut stream = response.bytes_stream();
+        let mut chunk_received = 0_u64;
+
+        loop {
+            if control.cancelled.load(Ordering::Acquire) {
+                output
+                    .flush()
+                    .await
+                    .map_err(|error| filesystem_error("could not flush the partial file", error))?;
+                let elapsed_ms = base_elapsed_ms
+                    .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                update_entry_optional(app, state, id, |entry| {
                     entry.downloaded_bytes = offset;
                     entry.elapsed_ms = elapsed_ms;
                     Ok(())
                 })?;
-                return Err(format!(
-                    "Transfer body error: {}",
-                    describe_reqwest_error(&error, &url)
-                ));
+                return finish_cancelled_optional(app, state, id);
             }
-        };
-        let limit = state
-            .lock()
-            .map_err(|_| "Download manager state lock was poisoned.".to_owned())?
-            .bandwidth_limit_bytes_per_second;
-        bandwidth.wait_for_turn(chunk.len(), limit).await?;
-        if let Err(error) = output.write_all(&chunk).await {
+            if control.shutdown_requested.load(Ordering::Acquire) {
+                output
+                    .flush()
+                    .await
+                    .map_err(|error| filesystem_error("could not flush the partial file", error))?;
+                let elapsed_ms = base_elapsed_ms
+                    .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                return finish_shutdown_optional(state, id, |entry| {
+                    entry.downloaded_bytes = offset;
+                    entry.elapsed_ms = elapsed_ms;
+                    entry.speed_bytes_per_second = 0.0;
+                    entry.remaining_seconds = None;
+                });
+            }
+            if control.pause_requested.load(Ordering::Acquire) {
+                output
+                    .flush()
+                    .await
+                    .map_err(|error| filesystem_error("could not flush the partial file", error))?;
+                let elapsed_ms = base_elapsed_ms
+                    .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                update_entry_optional(app, state, id, |entry| {
+                    transition(entry, DownloadStatus::Paused)?;
+                    entry.downloaded_bytes = offset;
+                    entry.elapsed_ms = elapsed_ms;
+                    entry.speed_bytes_per_second = 0.0;
+                    entry.remaining_seconds = None;
+                    Ok(())
+                })?;
+                return Ok(());
+            }
+            let next = tokio::select! {
+                _ = control.wake.notified() => continue,
+                chunk = stream.next() => chunk,
+            };
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = output.flush().await;
+                    let elapsed_ms = base_elapsed_ms
+                        .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                    update_entry_optional(app, state, id, |entry| {
+                        entry.downloaded_bytes = offset;
+                        entry.elapsed_ms = elapsed_ms;
+                        Ok(())
+                    })?;
+                    return Err(format!(
+                        "Transfer body error: {}",
+                        describe_reqwest_error(&error, &url)
+                    ));
+                }
+            };
+            let chunk_len = chunk.len() as u64;
+            let next_chunk_received = chunk_received.saturating_add(chunk_len);
+            let next_offset = offset.saturating_add(chunk_len);
+            if expected_chunk_bytes.is_some_and(|expected| next_chunk_received > expected)
+                || total_bytes.is_some_and(|total| next_offset > total)
+            {
+                let _ = output.flush().await;
+                let elapsed_ms = base_elapsed_ms
+                    .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                update_entry_optional(app, state, id, |entry| {
+                    entry.downloaded_bytes = offset;
+                    entry.elapsed_ms = elapsed_ms;
+                    Ok(())
+                })?;
+                return fail_entry_optional(
+                    app,
+                    state,
+                    id,
+                    "The server sent more data than its declared byte range or file size.".into(),
+                )
+                .await;
+            }
+            let limit = state
+                .lock()
+                .map_err(|_| "Download manager state lock was poisoned.".to_owned())?
+                .bandwidth_limit_bytes_per_second;
+            bandwidth.wait_for_turn(chunk.len(), limit).await?;
+            if let Err(error) = output.write_all(&chunk).await {
+                let elapsed_ms = base_elapsed_ms
+                    .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                update_entry_optional(app, state, id, |entry| {
+                    entry.downloaded_bytes = offset;
+                    entry.elapsed_ms = elapsed_ms;
+                    Ok(())
+                })?;
+                return Err(filesystem_error("could not write downloaded data", error));
+            }
+            chunk_received = next_chunk_received;
+            offset = next_offset;
+            if last_update.elapsed() >= PROGRESS_INTERVAL {
+                let elapsed = start.elapsed().as_secs_f64();
+                speed =
+                    offset.saturating_sub(last_bytes) as f64 / last_update.elapsed().as_secs_f64();
+                last_bytes = offset;
+                last_update = Instant::now();
+                let elapsed_ms =
+                    base_elapsed_ms.saturating_add(elapsed.mul_add(1000.0, 0.0) as u64);
+                let remaining_seconds = total_bytes
+                    .filter(|_| speed > 0.0)
+                    .map(|total| total.saturating_sub(offset) as f64 / speed);
+                update_entry_optional(app, state, id, |entry| {
+                    entry.downloaded_bytes = offset;
+                    entry.speed_bytes_per_second = speed;
+                    entry.elapsed_ms = elapsed_ms;
+                    entry.remaining_seconds = remaining_seconds;
+                    entry.total_bytes = total_bytes;
+                    Ok(())
+                })?;
+            }
+        }
+
+        output
+            .flush()
+            .await
+            .map_err(|error| filesystem_error("could not flush the downloaded file", error))?;
+
+        if control.cancelled.load(Ordering::Acquire) {
             let elapsed_ms = base_elapsed_ms
                 .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
-            update_entry(app, state, id, |entry| {
+            update_entry_optional(app, state, id, |entry| {
                 entry.downloaded_bytes = offset;
                 entry.elapsed_ms = elapsed_ms;
                 Ok(())
             })?;
-            return Err(filesystem_error("could not write downloaded data", error));
+            return finish_cancelled_optional(app, state, id);
         }
-        offset = offset.saturating_add(chunk.len() as u64);
-        if total_bytes.is_some_and(|total| offset > total) {
-            return fail_entry(
+        if let Some(expected) = expected_chunk_bytes {
+            if chunk_received != expected {
+                let elapsed_ms = base_elapsed_ms
+                    .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                update_entry_optional(app, state, id, |entry| {
+                    entry.downloaded_bytes = offset;
+                    entry.elapsed_ms = elapsed_ms;
+                    Ok(())
+                })?;
+                return fail_entry_optional(
+                    app,
+                    state,
+                    id,
+                    format!(
+                        "Transfer ended after {chunk_received} bytes, but the server declared {expected} bytes for the current response."
+                    ),
+                )
+                .await;
+            }
+        }
+        if chunk_received == 0 {
+            return fail_entry_optional(
                 app,
                 state,
                 id,
-                "The server sent more data than its declared file size.".into(),
+                "The server returned an empty media response body.".into(),
             )
             .await;
         }
-        if last_update.elapsed() >= PROGRESS_INTERVAL {
-            let elapsed = start.elapsed().as_secs_f64();
-            speed = offset.saturating_sub(last_bytes) as f64 / last_update.elapsed().as_secs_f64();
-            last_bytes = offset;
-            last_update = Instant::now();
-            let elapsed_ms = base_elapsed_ms.saturating_add(elapsed.mul_add(1000.0, 0.0) as u64);
-            let remaining_seconds = total_bytes
-                .filter(|_| speed > 0.0)
-                .map(|total| total.saturating_sub(offset) as f64 / speed);
-            update_entry(app, state, id, |entry| {
-                entry.downloaded_bytes = offset;
-                entry.speed_bytes_per_second = speed;
-                entry.elapsed_ms = elapsed_ms;
-                entry.remaining_seconds = remaining_seconds;
-                entry.total_bytes = total_bytes;
-                Ok(())
-            })?;
+
+        if status == StatusCode::PARTIAL_CONTENT {
+            let declared_total = total_bytes.unwrap_or(offset);
+            if offset < declared_total {
+                force_range_request = true;
+                explicit_range_end = None;
+                update_entry_optional(app, state, id, |entry| {
+                    entry.downloaded_bytes = offset;
+                    entry.total_bytes = total_bytes;
+                    Ok(())
+                })?;
+                continue;
+            }
+            break;
         }
+
+        // HTTP 200 response completed. Do not assume stripping bytestart/byteend always
+        // returned the complete representation: inspect the MP4 segment index (sidx) if present.
+        if let Ok(Some(sidx_total)) = inspect_mp4_sidx_expected_bytes(&partial) {
+            if offset < sidx_total {
+                total_bytes = Some(sidx_total);
+                force_range_request = true;
+                explicit_range_end = Some(sidx_total - 1);
+                update_entry_optional(app, state, id, |entry| {
+                    entry.downloaded_bytes = offset;
+                    entry.total_bytes = total_bytes;
+                    Ok(())
+                })?;
+                continue;
+            }
+        }
+        break;
     }
+
     output
         .flush()
         .await
         .map_err(|error| filesystem_error("could not flush the downloaded file", error))?;
+    output
+        .sync_data()
+        .await
+        .map_err(|error| filesystem_error("could not sync the downloaded file", error))?;
     drop(output);
     if control.cancelled.load(Ordering::Acquire) {
         let elapsed_ms = base_elapsed_ms
             .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
-        update_entry(app, state, id, |entry| {
+        update_entry_optional(app, state, id, |entry| {
             entry.downloaded_bytes = offset;
             entry.elapsed_ms = elapsed_ms;
             Ok(())
         })?;
-        return finish_cancelled(app, state, id);
+        return finish_cancelled_optional(app, state, id);
     }
-    if total_bytes.is_some_and(|total| offset != total) {
+    if control.shutdown_requested.load(Ordering::Acquire) {
         let elapsed_ms = base_elapsed_ms
             .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
-        update_entry(app, state, id, |entry| {
+        return finish_shutdown_optional(state, id, |entry| {
+            entry.downloaded_bytes = offset;
+            entry.elapsed_ms = elapsed_ms;
+            entry.speed_bytes_per_second = 0.0;
+            entry.remaining_seconds = None;
+        });
+    }
+    if control.pause_requested.load(Ordering::Acquire) {
+        let elapsed_ms = base_elapsed_ms
+            .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        update_entry_optional(app, state, id, |entry| {
+            transition(entry, DownloadStatus::Paused)?;
+            entry.downloaded_bytes = offset;
+            entry.elapsed_ms = elapsed_ms;
+            entry.speed_bytes_per_second = 0.0;
+            entry.remaining_seconds = None;
+            Ok(())
+        })?;
+        return Ok(());
+    }
+    if offset == 0 || total_bytes.is_some_and(|total| offset != total) {
+        let elapsed_ms = base_elapsed_ms
+            .saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        update_entry_optional(app, state, id, |entry| {
             entry.downloaded_bytes = offset;
             entry.elapsed_ms = elapsed_ms;
             Ok(())
         })?;
-        return fail_entry(
+        return fail_entry_optional(
             app,
             state,
             id,
@@ -3259,9 +5620,22 @@ async fn download_worker(
         )
         .await;
     }
+    let actual_bytes = fs::metadata(&partial)
+        .await
+        .map_err(|error| filesystem_error("could not inspect the downloaded partial file", error))?
+        .len();
+    if actual_bytes != offset {
+        return fail_entry_optional(
+            app,
+            state,
+            id,
+            "The downloaded file size on disk does not match the verified byte count.".into(),
+        )
+        .await;
+    }
     let elapsed_ms =
         base_elapsed_ms.saturating_add(start.elapsed().as_millis().min(u64::MAX as u128) as u64);
-    update_entry(app, state, id, |entry| {
+    update_entry_optional(app, state, id, |entry| {
         entry.downloaded_bytes = offset;
         entry.elapsed_ms = elapsed_ms;
         Ok(())
@@ -3285,8 +5659,13 @@ async fn download_worker(
             "{error} The downloaded bytes remain in the temporary partial file; retry or remove the failed item."
         )
     })?;
+    #[cfg(test)]
+    invoke_test_commit_hook("sequential_after_validation", id, control);
+    if control.cancelled.load(Ordering::Acquire) {
+        return finish_cancelled_optional(app, state, id);
+    }
     if destination.exists() {
-        return fail_entry(
+        return fail_entry_optional(
             app,
             state,
             id,
@@ -3297,12 +5676,17 @@ async fn download_worker(
     fs::rename(&partial, &destination)
         .await
         .map_err(|error| filesystem_error("could not commit the completed download", error))?;
+    #[cfg(test)]
+    invoke_test_commit_hook("sequential_after_rename", id, control);
     let average_speed = if elapsed_ms > 0 {
         offset as f64 / (elapsed_ms as f64 / 1000.0)
     } else {
         speed
     };
-    let completed = update_entry(app, state, id, |entry| {
+    let completed = update_entry_optional(app, state, id, |entry| {
+        if control.cancelled.load(Ordering::Acquire) || entry.status == DownloadStatus::Cancelled {
+            return Err("The download was cancelled.".into());
+        }
         transition(entry, DownloadStatus::Completed)?;
         entry.downloaded_bytes = offset;
         entry.total_bytes = Some(offset);
@@ -3311,16 +5695,26 @@ async fn download_worker(
         entry.remaining_seconds = Some(0.0);
         entry.error = None;
         Ok(())
-    })?;
-    if completed.notify_on_complete {
-        send_download_notification(app, &completed, true);
+    });
+    match completed {
+        Ok(completed) => {
+            if completed.notify_on_complete {
+                send_download_notification_optional(app, &completed, true);
+            }
+            Ok(())
+        }
+        Err(_) if control.cancelled.load(Ordering::Acquire) => {
+            let _ = fs::remove_file(&destination).await;
+            finish_cancelled_optional(app, state, id)
+        }
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 enum HlsPartOutcome {
     Complete(u64),
     Paused,
+    Shutdown,
     Cancelled,
 }
 
@@ -3329,6 +5723,8 @@ fn hls_stop_reason(control: &DownloadTaskControl) -> Option<HlsPartOutcome> {
         Some(HlsPartOutcome::Cancelled)
     } else if control.pause_requested.load(Ordering::Acquire) {
         Some(HlsPartOutcome::Paused)
+    } else if control.shutdown_requested.load(Ordering::Acquire) {
+        Some(HlsPartOutcome::Shutdown)
     } else {
         None
     }
@@ -3432,7 +5828,7 @@ async fn remove_hls_staging(path: &Path) -> Result<(), String> {
 }
 
 async fn download_hls_part(
-    app: &tauri::AppHandle,
+    app: Option<&tauri::AppHandle>,
     state: &Mutex<DownloadState>,
     bandwidth: &BandwidthLimiter,
     client: &Client,
@@ -3498,21 +5894,13 @@ async fn download_hls_part(
     let mut stream = response.bytes_stream();
     let mut last_update = Instant::now();
     loop {
-        if matches!(hls_stop_reason(control), Some(HlsPartOutcome::Cancelled)) {
+        if let Some(reason) = hls_stop_reason(control) {
             output.flush().await.map_err(|error| {
                 filesystem_error("could not flush the temporary HLS segment", error)
             })?;
             drop(output);
             remove_hls_staging(staging).await?;
-            return Ok(HlsPartOutcome::Cancelled);
-        }
-        if matches!(hls_stop_reason(control), Some(HlsPartOutcome::Paused)) {
-            output.flush().await.map_err(|error| {
-                filesystem_error("could not flush the temporary HLS segment", error)
-            })?;
-            drop(output);
-            remove_hls_staging(staging).await?;
-            return Ok(HlsPartOutcome::Paused);
+            return Ok(reason);
         }
         let next = tokio::select! {
             _ = control.wake.notified() => continue,
@@ -3554,7 +5942,7 @@ async fn download_hls_part(
                 base_elapsed_ms.saturating_add(
                     transfer_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 );
-            update_entry(app, state, id, |entry| {
+            update_entry_optional(app, state, id, |entry| {
                 entry.downloaded_bytes = committed_bytes;
                 entry.total_bytes = total_bytes;
                 entry.elapsed_ms = elapsed_ms;
@@ -3576,7 +5964,7 @@ async fn download_hls_part(
 }
 
 async fn download_hls_worker(
-    app: &tauri::AppHandle,
+    app: Option<&tauri::AppHandle>,
     state: &Mutex<DownloadState>,
     bandwidth: &Arc<BandwidthLimiter>,
     id: &str,
@@ -3617,7 +6005,7 @@ async fn download_hls_worker(
         remove_hls_staging(&staging).await?;
     }
     if destination.exists() {
-        return fail_entry(
+        return fail_entry_optional(
             app,
             state,
             id,
@@ -3628,7 +6016,7 @@ async fn download_hls_worker(
 
     let resources = ordered_hls_resources(&playlist);
     if completed_parts > resources.len() || committed_bytes > MAX_HLS_EXPECTED_BYTES {
-        return fail_entry(
+        return fail_entry_optional(
             app,
             state,
             id,
@@ -3639,7 +6027,7 @@ async fn download_hls_worker(
     match fs::symlink_metadata(&partial).await {
         Ok(metadata) if metadata.file_type().is_file() => {
             if metadata.len() < committed_bytes {
-                return fail_entry(
+                return fail_entry_optional(
                     app,
                     state,
                     id,
@@ -3661,7 +6049,7 @@ async fn download_hls_worker(
             }
         }
         Ok(_) => {
-            return fail_entry(
+            return fail_entry_optional(
                 app,
                 state,
                 id,
@@ -3680,7 +6068,7 @@ async fn download_hls_worker(
                 })?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return fail_entry(
+            return fail_entry_optional(
                 app,
                 state,
                 id,
@@ -3700,17 +6088,27 @@ async fn download_hls_worker(
     let started = Instant::now();
     for (index, resource) in resources.iter().enumerate().skip(completed_parts) {
         if let Some(reason) = hls_stop_reason(control) {
-            if matches!(reason, HlsPartOutcome::Cancelled) {
-                return finish_cancelled(app, state, id);
+            match reason {
+                HlsPartOutcome::Cancelled => return finish_cancelled_optional(app, state, id),
+                HlsPartOutcome::Shutdown => {
+                    return finish_shutdown_optional(state, id, |entry| {
+                        entry.downloaded_bytes = committed_bytes;
+                        entry.hls_completed_parts = Some(completed_parts);
+                        entry.speed_bytes_per_second = 0.0;
+                        entry.remaining_seconds = None;
+                    });
+                }
+                HlsPartOutcome::Paused | HlsPartOutcome::Complete(_) => {
+                    update_entry_optional(app, state, id, |entry| {
+                        transition(entry, DownloadStatus::Paused)?;
+                        entry.downloaded_bytes = committed_bytes;
+                        entry.speed_bytes_per_second = 0.0;
+                        entry.remaining_seconds = None;
+                        Ok(())
+                    })?;
+                    return Ok(());
+                }
             }
-            update_entry(app, state, id, |entry| {
-                transition(entry, DownloadStatus::Paused)?;
-                entry.downloaded_bytes = committed_bytes;
-                entry.speed_bytes_per_second = 0.0;
-                entry.remaining_seconds = None;
-                Ok(())
-            })?;
-            return Ok(());
         }
         let outcome = download_hls_part(
             app,
@@ -3729,9 +6127,20 @@ async fn download_hls_worker(
         .await?;
         let received = match outcome {
             HlsPartOutcome::Complete(received) => received,
-            HlsPartOutcome::Cancelled => return finish_cancelled(app, state, id),
+            HlsPartOutcome::Cancelled => return finish_cancelled_optional(app, state, id),
+            HlsPartOutcome::Shutdown => {
+                let elapsed_ms = base_elapsed_ms
+                    .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                return finish_shutdown_optional(state, id, |entry| {
+                    entry.downloaded_bytes = committed_bytes;
+                    entry.hls_completed_parts = Some(completed_parts);
+                    entry.elapsed_ms = elapsed_ms;
+                    entry.speed_bytes_per_second = 0.0;
+                    entry.remaining_seconds = None;
+                });
+            }
             HlsPartOutcome::Paused => {
-                update_entry(app, state, id, |entry| {
+                update_entry_optional(app, state, id, |entry| {
                     transition(entry, DownloadStatus::Paused)?;
                     entry.downloaded_bytes = committed_bytes;
                     entry.elapsed_ms = base_elapsed_ms
@@ -3779,7 +6188,7 @@ async fn download_hls_worker(
         completed_parts = index + 1;
         let elapsed_ms = base_elapsed_ms
             .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
-        update_entry(app, state, id, |entry| {
+        update_entry_optional(app, state, id, |entry| {
             entry.downloaded_bytes = committed_bytes;
             entry.hls_completed_parts = Some(completed_parts);
             entry.total_bytes = playlist.expected_bytes;
@@ -3824,20 +6233,35 @@ async fn download_hls_worker(
             "The assembled HLS data is incomplete or invalid and was not saved as a completed MP4. {error} The bytes remain in the temporary partial file; retry from the beginning or remove the failed item."
         )
     })?;
+    #[cfg(test)]
+    invoke_test_commit_hook("hls_after_validation", id, control);
     if let Some(reason) = hls_stop_reason(control) {
-        if matches!(reason, HlsPartOutcome::Cancelled) {
-            return finish_cancelled(app, state, id);
+        match reason {
+            HlsPartOutcome::Cancelled => return finish_cancelled_optional(app, state, id),
+            HlsPartOutcome::Shutdown => {
+                let elapsed_ms = base_elapsed_ms
+                    .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                return finish_shutdown_optional(state, id, |entry| {
+                    entry.downloaded_bytes = committed_bytes;
+                    entry.hls_completed_parts = Some(completed_parts);
+                    entry.elapsed_ms = elapsed_ms;
+                    entry.speed_bytes_per_second = 0.0;
+                    entry.remaining_seconds = None;
+                });
+            }
+            HlsPartOutcome::Paused | HlsPartOutcome::Complete(_) => {
+                update_entry_optional(app, state, id, |entry| {
+                    transition(entry, DownloadStatus::Paused)?;
+                    entry.speed_bytes_per_second = 0.0;
+                    entry.remaining_seconds = None;
+                    Ok(())
+                })?;
+                return Ok(());
+            }
         }
-        update_entry(app, state, id, |entry| {
-            transition(entry, DownloadStatus::Paused)?;
-            entry.speed_bytes_per_second = 0.0;
-            entry.remaining_seconds = None;
-            Ok(())
-        })?;
-        return Ok(());
     }
     if destination.exists() {
-        return fail_entry(
+        return fail_entry_optional(
             app,
             state,
             id,
@@ -3848,6 +6272,8 @@ async fn download_hls_worker(
     fs::rename(&partial, &destination)
         .await
         .map_err(|error| filesystem_error("could not commit the completed HLS download", error))?;
+    #[cfg(test)]
+    invoke_test_commit_hook("hls_after_rename", id, control);
     let elapsed_ms =
         base_elapsed_ms.saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
     let average_speed = if elapsed_ms > 0 {
@@ -3855,7 +6281,10 @@ async fn download_hls_worker(
     } else {
         0.0
     };
-    let completed = update_entry(app, state, id, |entry| {
+    let completed = update_entry_optional(app, state, id, |entry| {
+        if control.is_cancelled() || entry.status == DownloadStatus::Cancelled {
+            return Err("The HLS download was cancelled.".into());
+        }
         transition(entry, DownloadStatus::Completed)?;
         entry.downloaded_bytes = committed_bytes;
         entry.total_bytes = Some(committed_bytes);
@@ -3865,11 +6294,20 @@ async fn download_hls_worker(
         entry.remaining_seconds = Some(0.0);
         entry.error = None;
         Ok(())
-    })?;
-    if completed.notify_on_complete {
-        send_download_notification(app, &completed, true);
+    });
+    match completed {
+        Ok(completed) => {
+            if completed.notify_on_complete {
+                send_download_notification_optional(app, &completed, true);
+            }
+            Ok(())
+        }
+        Err(_) if control.is_cancelled() => {
+            let _ = fs::remove_file(&destination).await;
+            finish_cancelled_optional(app, state, id)
+        }
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 pub(crate) fn partial_path(destination: &Path) -> PathBuf {
@@ -3878,6 +6316,7 @@ pub(crate) fn partial_path(destination: &Path) -> PathBuf {
     destination.with_file_name(name)
 }
 
+#[allow(dead_code)]
 fn send_download_notification(app: &tauri::AppHandle, entry: &DownloadEntry, completed: bool) {
     send_download_notification_optional(Some(app), entry, completed);
 }
@@ -3910,6 +6349,7 @@ fn send_download_notification_optional(
     }
 }
 
+#[allow(dead_code)]
 async fn fail_entry(
     app: &tauri::AppHandle,
     state: &Mutex<DownloadState>,
@@ -3941,6 +6381,7 @@ async fn fail_entry_optional(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn finish_cancelled(
     app: &tauri::AppHandle,
     state: &Mutex<DownloadState>,
@@ -3963,6 +6404,25 @@ fn finish_cancelled_optional(
         Ok(())
     })?;
     Ok(())
+}
+
+fn finish_shutdown_optional<F>(
+    state: &Mutex<DownloadState>,
+    id: &str,
+    update: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&mut DownloadEntry),
+{
+    let mut state = state
+        .lock()
+        .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
+    if let Some(entry) = state.entries.iter_mut().find(|entry| entry.id == id) {
+        update(entry);
+        entry.updated_at_ms = current_timestamp_ms();
+    }
+    state.controls.remove(id);
+    persist_locked(&state)
 }
 
 #[tauri::command]
@@ -3998,61 +6458,7 @@ pub fn retry_download(
     id: String,
     restart: bool,
 ) -> Result<(), String> {
-    let control = Arc::new(DownloadTaskControl::default());
-    {
-        let mut state = manager
-            .state
-            .lock()
-            .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
-        let index = state
-            .entries
-            .iter()
-            .position(|entry| entry.id == id)
-            .ok_or_else(|| "Download record was not found.".to_owned())?;
-        let original = state.entries[index].clone();
-        if original.website_media.is_some() {
-            return Err("Website video downloads must be re-queued with a format selection; start a new download to retry.".into());
-        }
-        let mut entry = original.clone();
-        if !entry.status.can_retry() {
-            return Err("Only failed or cancelled downloads can be retried.".into());
-        }
-        transition(&mut entry, DownloadStatus::Queued)?;
-        entry.attempts = entry.attempts.saturating_add(1);
-        entry.error = None;
-        if restart {
-            entry.downloaded_bytes = 0;
-            entry.total_bytes = None;
-            entry.speed_bytes_per_second = 0.0;
-            entry.elapsed_ms = 0;
-            entry.remaining_seconds = None;
-            if entry.hls_playlist.is_some() {
-                entry.hls_completed_parts = Some(0);
-            }
-        }
-        state.entries[index] = entry;
-        let old_control = state.controls.insert(id.clone(), Arc::clone(&control));
-        if let Err(error) = persist_locked(&state) {
-            state.entries[index] = original;
-            if let Some(old_control) = old_control {
-                state.controls.insert(id.clone(), old_control);
-            } else {
-                state.controls.remove(&id);
-            }
-            return Err(error);
-        }
-    }
-    spawn_worker(
-        app,
-        Arc::clone(&manager.state),
-        Arc::clone(&manager.concurrency),
-        Arc::clone(&manager.bandwidth),
-        Arc::clone(&manager.worker_count),
-        id,
-        control,
-        restart,
-    );
-    Ok(())
+    manager.retry_download_internal(Some(&app), id, restart)
 }
 
 #[tauri::command]
@@ -4106,19 +6512,29 @@ pub fn cancel_all_downloads(
         .state
         .lock()
         .map_err(|_| "Download manager state lock was poisoned.".to_owned())?;
-    let controls = state.controls.values().cloned().collect::<Vec<_>>();
-    for control in &controls {
-        control.request_cancel();
+    let active_controls: Vec<(String, Arc<DownloadTaskControl>)> = state
+        .controls
+        .iter()
+        .map(|(id, ctrl)| (id.clone(), Arc::clone(ctrl)))
+        .collect();
+    for (id, control) in &active_controls {
+        let is_resumable_http_or_hls = state
+            .entries
+            .iter()
+            .any(|entry| &entry.id == id && entry.website_media.is_none());
+        if is_resumable_http_or_hls {
+            control.request_shutdown();
+        } else {
+            control.request_cancel();
+        }
     }
     let mut website_partials_to_remove = Vec::new();
     let mut cancelled_paused_ids = Vec::new();
     for entry in &mut state.entries {
-        if entry.status == DownloadStatus::Paused {
+        if entry.status == DownloadStatus::Paused && entry.website_media.is_some() {
             transition(entry, DownloadStatus::Cancelled)?;
             cancelled_paused_ids.push(entry.id.clone());
-            if entry.website_media.is_some() {
-                website_partials_to_remove.push(PathBuf::from(&entry.destination));
-            }
+            website_partials_to_remove.push(PathBuf::from(&entry.destination));
         }
     }
     for id in &cancelled_paused_ids {
@@ -4135,7 +6551,7 @@ pub fn cancel_all_downloads(
     for destination in website_partials_to_remove {
         let _ = std::fs::remove_file(partial_path(&destination));
     }
-    Ok((Arc::clone(&manager.worker_count), controls.len()))
+    Ok((Arc::clone(&manager.worker_count), active_controls.len()))
 }
 
 #[cfg(all(test, windows))]
@@ -4327,6 +6743,7 @@ mod tests {
             hls_playlist: None,
             hls_completed_parts: None,
             website_media: None,
+            segments: Vec::new(),
             etag: None,
             last_modified: None,
             notifications_enabled: false,
@@ -4424,14 +6841,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_instagram_reel_and_story_byte_range_urls_before_queueing() {
-        for url in [
-            "https://scontent.cdninstagram.com/v/t51/reel.mp4?bytestart=0&byteend=10399&token=private",
-            "https://instagram.fdac5-1.fna.fbcdn.net/v/t51/story.mp4?signature=private&bytestart=0&byteend=10399",
+    fn normalizes_instagram_byte_range_urls_and_prevents_audio_video_dash_track_collision() {
+        for (raw, expected) in [
+            (
+                "https://scontent.cdninstagram.com/v/t51/reel.mp4?bytestart=0&byteend=10399&token=private",
+                "https://scontent.cdninstagram.com/v/t51/reel.mp4?token=private",
+            ),
+            (
+                "https://instagram.fdac5-1.fna.fbcdn.net/v/t51/story.mp4?signature=private&bytestart=0&byteend=10399",
+                "https://instagram.fdac5-1.fna.fbcdn.net/v/t51/story.mp4?signature=private",
+            ),
+            (
+                "https://instagram.fdac5-2.fna.fbcdn.net/o1/v/t2/f2/m367/clip.mp4?_nc_cat=110&efg=eyJ2ZW5jb2RlX3RhZyI6ImlnLXhwdmRzLmNsaXBzLmMyLUMzLmRhc2hfdnA5LWJhc2ljLWdlbjItaGZyXzEwODBwIiwieHB2X2Fzc2V0X2lkIjoxODE3Mjk3NzUyODAzMzU3fQ%3D%3D&ccb=17-1&oh=00_AQR_sig&oe=6AF5453F&bytestart=5248832&byteend=8727821",
+                "https://instagram.fdac5-2.fna.fbcdn.net/o1/v/t2/f2/m367/clip.mp4?_nc_cat=110&efg=eyJ2ZW5jb2RlX3RhZyI6ImlnLXhwdmRzLmNsaXBzLmMyLUMzLmRhc2hfdnA5LWJhc2ljLWdlbjItaGZyXzEwODBwIiwieHB2X2Fzc2V0X2lkIjoxODE3Mjk3NzUyODAzMzU3fQ%3D%3D&ccb=17-1&oh=00_AQR_sig&oe=6AF5453F",
+            ),
         ] {
-            let parsed = validated_download_url(url).unwrap();
+            let parsed = validated_download_url(raw).unwrap();
             assert!(is_instagram_byte_range_url(&parsed));
+            assert!(!is_instagram_audio_only_url(&parsed));
+            let normalized = normalize_instagram_media_url(&parsed).unwrap();
+            assert_eq!(normalized.as_str(), expected);
+            assert!(!is_instagram_byte_range_url(&normalized));
         }
+
+        // Audio-only DASH track with same xpv_asset_id must be distinguished and rejected
+        for audio_url in [
+            "https://instagram.fdac5-1.fna.fbcdn.net/o1/v/t2/f2/m78/audio.mp4?_nc_cat=1&efg=eyJ2ZW5jb2RlX3RhZyI6ImlnLXhwdmRzLmNsaXBzLmMxLUMzLmRhc2hfbG5faGVhYWNfdmJyM19hdWRpbyIsInhwdl9hc3NldF9pZCI6MTgxNzI5Nzc1MjgwMzM1N30%3D&oh=00_AQT_sig&oe=6AF1457A&bytestart=179584&byteend=198777",
+            "https://instagram.fdac5-1.fna.fbcdn.net/o1/v/t2/f2/m78/audio_no_efg.mp4?oh=00_AQT_sig&oe=6AF1457A&bytestart=0&byteend=1024",
+        ] {
+            let parsed = validated_download_url(audio_url).unwrap();
+            assert!(is_instagram_audio_only_url(&parsed));
+            let err = normalize_instagram_media_url(&parsed).unwrap_err();
+            assert!(err.contains("audio-only DASH track"));
+        }
+
+        // Malformed byte-range parameters must be rejected
+        for malformed in [
+            "https://scontent.cdninstagram.com/v/t51/reel.mp4?bytestart=500&byteend=100&token=private",
+            "https://scontent.cdninstagram.com/v/t51/reel.mp4?bytestart=abc&byteend=100&token=private",
+            "https://scontent.cdninstagram.com/v/t51/reel.mp4?bytestart=0&bytestart=10&byteend=100",
+        ] {
+            let parsed = validated_download_url(malformed).unwrap();
+            assert!(normalize_instagram_media_url(&parsed).is_err());
+        }
+
         assert!(!is_instagram_byte_range_url(
             &validated_download_url("https://cdn.example/video.mp4?bytestart=0&byteend=10399")
                 .unwrap()
@@ -4480,6 +6933,11 @@ mod tests {
     fn hls_stop_checks_prioritize_cancel_over_pause() {
         let control = DownloadTaskControl::default();
         assert!(hls_stop_reason(&control).is_none());
+        control.request_shutdown();
+        assert!(matches!(
+            hls_stop_reason(&control),
+            Some(HlsPartOutcome::Shutdown)
+        ));
         control.pause_requested.store(true, Ordering::Release);
         assert!(matches!(
             hls_stop_reason(&control),
@@ -4832,28 +7290,49 @@ mod tests {
 
     #[test]
     fn uses_platform_fallbacks_when_the_page_title_is_generic_or_missing() {
-        assert_eq!(
-            suggested_filename_with_metadata(
-                "https://scontent.cdninstagram.com/clip.mp4?token=1",
-                Some("Instagram"),
-                Some("instagram.com"),
-                Some("mp4"),
-                None,
-            )
-            .unwrap(),
-            "Instagram_Video.mp4"
-        );
-        assert_eq!(
-            suggested_filename_with_metadata(
-                "https://scontent.cdninstagram.com/clip.mp4?token=1",
-                Some("https://scontent.cdninstagram.com/very-long-cdn-hash.mp4?token=1"),
-                Some("instagram.com"),
-                Some("mp4"),
-                Some("very-long-cdn-hash.mp4"),
-            )
-            .unwrap(),
-            "Instagram_Video.mp4"
-        );
+        let ig1 = suggested_filename_with_metadata(
+            "https://scontent.cdninstagram.com/clip.mp4?token=1",
+            Some("Instagram"),
+            Some("instagram.com"),
+            Some("mp4"),
+            None,
+        )
+        .unwrap();
+        assert!(ig1.starts_with("Instagram_Video_") && ig1.ends_with(".mp4"));
+        assert!(!ig1.contains("clip"));
+        assert!(!ig1.contains("token"));
+
+        let ig2 = suggested_filename_with_metadata(
+            "https://scontent.cdninstagram.com/clip.mp4?token=1",
+            Some("https://scontent.cdninstagram.com/very-long-cdn-hash.mp4?token=1"),
+            Some("instagram.com"),
+            Some("mp4"),
+            Some("very-long-cdn-hash.mp4"),
+        )
+        .unwrap();
+        assert_eq!(ig2, ig1);
+
+        let ig_other = suggested_filename_with_metadata(
+            "https://scontent.cdninstagram.com/other_clip.mp4?token=2",
+            Some("(3) Instagram"),
+            Some("www.instagram.com"),
+            Some("mp4"),
+            None,
+        )
+        .unwrap();
+        assert!(ig_other.starts_with("Instagram_Video_") && ig_other.ends_with(".mp4"));
+        assert_ne!(ig_other, ig1);
+
+        let preferred = suggested_filename_with_metadata(
+            "https://scontent.cdninstagram.com/v/t50/raw_cdn_999.mp4?token=1",
+            Some("Instagram"),
+            Some("www.instagram.com"),
+            Some("mp4"),
+            Some("creator_C8reelXYZ.mp4"),
+        )
+        .unwrap();
+        assert_eq!(preferred, "creator_C8reelXYZ.mp4");
+
         assert_eq!(
             suggested_filename_with_metadata(
                 "https://video.example/clip.webm",
@@ -4876,6 +7355,56 @@ mod tests {
             .unwrap(),
             "Browser_Video.mp4"
         );
+    }
+
+    #[test]
+    fn instagram_filenames_are_unique_across_videos_and_never_overwrite_existing_files() {
+        let dir = create_test_temp_dir("instagram-unique-filenames");
+        let name_a = suggested_filename_with_metadata(
+            "https://scontent.cdninstagram.com/v/t50.2886-16/video_a.mp4?efg=video_a&oe=1",
+            Some("Instagram"),
+            Some("www.instagram.com"),
+            Some("mp4"),
+            Some("alice_C8reelAAA.mp4"),
+        )
+        .unwrap();
+        let name_b = suggested_filename_with_metadata(
+            "https://scontent.cdninstagram.com/v/t50.2886-16/video_b.mp4?efg=video_b&oe=2",
+            Some("Instagram"),
+            Some("www.instagram.com"),
+            Some("mp4"),
+            Some("bob_C8reelBBB.mp4"),
+        )
+        .unwrap();
+        assert_eq!(name_a, "alice_C8reelAAA.mp4");
+        assert_eq!(name_b, "bob_C8reelBBB.mp4");
+        assert_ne!(name_a, name_b);
+
+        // Simulate Video A already downloaded on disk, then re-downloaded.
+        let path_a = dir.join(&name_a);
+        std::fs::write(&path_a, b"existing-video-a-bytes").unwrap();
+        let redownload_a = unique_destination(&path_a, &[]).unwrap();
+        assert_ne!(redownload_a, path_a);
+        assert_eq!(
+            redownload_a.file_name().unwrap().to_str().unwrap(),
+            "alice_C8reelAAA (1).mp4"
+        );
+        // Existing file is untouched.
+        assert_eq!(std::fs::read(&path_a).unwrap(), b"existing-video-a-bytes");
+
+        // Unicode and Windows-invalid characters are sanitized while preserving extension,
+        // and path traversal prefixes are stripped.
+        let unicode = suggested_filename_with_metadata(
+            "https://scontent.cdninstagram.com/v/t50/clip.mp4?oe=1",
+            Some("Instagram"),
+            Some("www.instagram.com"),
+            Some("mp4"),
+            Some("..\\..\\夏の旅: Final Clip?_C8uni123.mp4"),
+        )
+        .unwrap();
+        assert_eq!(unicode, "夏の旅_ Final Clip__C8uni123.mp4");
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5296,6 +7825,7 @@ mod tests {
             entry.website_media,
             Some(WebsiteMediaInfo {
                 format_id: "best[ext=mp4]".into(),
+                audio_format_id: None,
                 container: "mp4".into(),
                 height: Some(720),
             })
@@ -5499,9 +8029,11 @@ mod tests {
                 hls_completed_parts: None,
                 website_media: Some(WebsiteMediaInfo {
                     format_id: "muxed-mp4".into(),
+                    audio_format_id: None,
                     container: "mp4".into(),
                     height: Some(720),
                 }),
+                segments: Vec::new(),
                 etag: None,
                 last_modified: None,
                 notifications_enabled: false,
@@ -5962,6 +8494,7 @@ mod tests {
 
         let entry_info = WebsiteMediaInfo {
             format_id: "muxed-mp4".into(),
+            audio_format_id: None,
             container: "mp4".into(),
             height: Some(720),
         };
@@ -5971,6 +8504,469 @@ mod tests {
             entry_info
         );
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn website_download_stalled_stream_fails_fast_on_idle_timeout_retains_partial_and_frees_slot() {
+        let manager = DownloadManager::default();
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.max_concurrent = 1;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-website-idle-stall-{}-{}",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest_stalled = dir.join("stalled.mp4");
+        let part_stalled = partial_path(&dest_stalled);
+        let dest_next = dir.join("queued-next.mp4");
+        let exe = std::env::current_exe().unwrap();
+        let catalog = sample_website_catalog();
+
+        let started = Instant::now();
+        let stalled_entry = manager
+            .start_website_download(
+                None,
+                "https://example.test/fixture-stall-idle".into(),
+                dest_stalled.to_string_lossy().into_owned(),
+                exe.clone(),
+                catalog.clone(),
+                crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+            )
+            .unwrap();
+        let next_entry = manager
+            .start_website_download(
+                None,
+                "https://example.test/fixture-fast-complete".into(),
+                dest_next.to_string_lossy().into_owned(),
+                exe,
+                catalog,
+                crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = manager.snapshot().unwrap();
+            let s1 = snap.iter().find(|e| e.id == stalled_entry.id).unwrap();
+            let s2 = snap.iter().find(|e| e.id == next_entry.id).unwrap();
+            if s1.status.is_terminal()
+                && s2.status.is_terminal()
+                && manager.worker_count.load(Ordering::Acquire) == 0
+            {
+                assert_eq!(
+                    s1.status,
+                    DownloadStatus::Failed,
+                    "stalled job must be marked Failed, never Completed"
+                );
+                assert!(
+                    s1.error
+                        .as_deref()
+                        .is_some_and(|msg| msg.contains("stalled without progress and timed out")),
+                    "unexpected idle timeout error: {:?}",
+                    s1.error
+                );
+                assert_eq!(s1.downloaded_bytes, 32);
+                assert_eq!(
+                    s2.status,
+                    DownloadStatus::Completed,
+                    "queued download behind stalled download must acquire freed slot and complete"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stalled download did not fail fast on idle timeout"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "idle timeout must fail fast instead of waiting 45 minutes"
+        );
+        assert!(!dest_stalled.exists());
+        assert!(
+            part_stalled.is_file(),
+            "partial output must be retained per resume policy on idle timeout"
+        );
+        assert_eq!(std::fs::metadata(&part_stalled).unwrap().len(), 32);
+        assert!(dest_next.is_file());
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn website_download_resume_re_verifies_ytdlp_sha256_and_fails_closed_on_tampering() {
+        let manager = DownloadManager::default();
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-website-resume-toctou-{}-{}",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("resume-verify.mp4");
+        let part = partial_path(&dest);
+        let exe = std::env::current_exe().unwrap();
+        let catalog = sample_website_catalog();
+
+        let entry = manager
+            .start_website_download(
+                None,
+                "https://example.test/fixture-pause-resume".into(),
+                dest.to_string_lossy().into_owned(),
+                exe,
+                catalog,
+                crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while manager.snapshot().unwrap()[0].downloaded_bytes != 32 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        manager.pause_download(&entry.id).unwrap();
+        while (manager.snapshot().unwrap()[0].status != DownloadStatus::Paused
+            || manager.worker_count.load(Ordering::Acquire) > 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(part.is_file());
+
+        // Switch URL to non-fixture URL so resume exercises the unconditional production SHA-256 verifier.
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.entries[0].url = "https://example.test/watch?v=resume-verify".into();
+        }
+
+        // 1. Missing executable -> fails closed without spawning.
+        {
+            let mut state = manager.state.lock().unwrap();
+            state
+                .website_executables
+                .insert(entry.id.clone(), dir.join("missing-yt-dlp.exe"));
+        }
+        let missing_err = manager.resume_download(None, &entry.id).unwrap_err();
+        assert_eq!(
+            missing_err,
+            "The verified yt-dlp media engine is not available."
+        );
+        assert_eq!(manager.snapshot().unwrap()[0].status, DownloadStatus::Paused);
+        assert_eq!(manager.snapshot().unwrap()[0].attempts, 1);
+        assert_eq!(manager.worker_count.load(Ordering::Acquire), 0);
+
+        // 2. Non-regular file (directory) -> fails closed without spawning.
+        let fake_dir_exe = dir.join("dir-as-exe.exe");
+        std::fs::create_dir_all(&fake_dir_exe).unwrap();
+        {
+            let mut state = manager.state.lock().unwrap();
+            state
+                .website_executables
+                .insert(entry.id.clone(), fake_dir_exe);
+        }
+        assert!(manager.resume_download(None, &entry.id).is_err());
+        assert_eq!(manager.snapshot().unwrap()[0].status, DownloadStatus::Paused);
+        assert_eq!(manager.worker_count.load(Ordering::Acquire), 0);
+
+        // 3. Wrong-size executable -> fails closed without spawning.
+        let wrong_size_exe = dir.join("wrong-size-yt-dlp.exe");
+        std::fs::write(&wrong_size_exe, b"tampered small binary").unwrap();
+        {
+            let mut state = manager.state.lock().unwrap();
+            state
+                .website_executables
+                .insert(entry.id.clone(), wrong_size_exe);
+        }
+        assert!(manager.resume_download(None, &entry.id).is_err());
+        assert_eq!(manager.snapshot().unwrap()[0].status, DownloadStatus::Paused);
+        assert_eq!(manager.worker_count.load(Ordering::Acquire), 0);
+
+        // 4. Exact pinned size (23,575,744 bytes) but tampered SHA-256 -> fails closed without spawning!
+        let tampered_exact_size_exe = dir.join("tampered-exact-size-yt-dlp.exe");
+        {
+            let f = std::fs::File::create(&tampered_exact_size_exe).unwrap();
+            f.set_len(crate::media::yt_dlp::VERIFIED_YTDLP_SIZE_BYTES)
+                .unwrap();
+        }
+        {
+            let mut state = manager.state.lock().unwrap();
+            state
+                .website_executables
+                .insert(entry.id.clone(), tampered_exact_size_exe.clone());
+        }
+        let hash_mismatch_err = manager.resume_download(None, &entry.id).unwrap_err();
+        assert_eq!(
+            hash_mismatch_err,
+            "The verified yt-dlp media engine is not available."
+        );
+        assert_eq!(manager.snapshot().unwrap()[0].status, DownloadStatus::Paused);
+        assert_eq!(manager.snapshot().unwrap()[0].attempts, 1);
+        assert_eq!(manager.worker_count.load(Ordering::Acquire), 0);
+        let _ = std::fs::remove_file(&tampered_exact_size_exe);
+
+        // 5. Valid pinned yt-dlp executable passes full SHA-256 verification and resumes cleanly!
+        let verified_exe = manager
+            .resolve_verified_ytdlp_executable(None)
+            .expect("pinned yt-dlp-2026.10.26.exe should resolve and pass SHA-256 verification");
+        let hold_control = Arc::new(DownloadTaskControl::default());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.max_concurrent = 1;
+            state
+                .website_executables
+                .insert(entry.id.clone(), verified_exe);
+        }
+        let held_slot = tauri::async_runtime::block_on(async {
+            manager
+                .concurrency
+                .acquire(&manager.state, &hold_control)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        manager
+            .resume_download(None, &entry.id)
+            .expect("valid pinned yt-dlp executable must pass resume SHA-256 verification");
+        let snap = manager.snapshot().unwrap();
+        assert_eq!(snap[0].status, DownloadStatus::Queued);
+        assert_eq!(snap[0].attempts, 2);
+
+        manager.cancel_download(None, &entry.id).unwrap();
+        drop(held_slot);
+        while manager.worker_count.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(manager.snapshot().unwrap()[0].status, DownloadStatus::Cancelled);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn website_download_aggregate_stage_and_runtime_over_1gib_terminates_and_marks_failed() {
+        let manager = DownloadManager::default();
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-website-agg-1gib-{}-{}",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("overflow.mp4");
+        let exe = std::env::current_exe().unwrap();
+        let catalog = sample_website_catalog();
+
+        let entry = manager
+            .start_website_download(
+                None,
+                "https://example.test/fixture-aggregate-overflow".into(),
+                dest.to_string_lossy().into_owned(),
+                exe,
+                catalog,
+                crate::media::yt_dlp::FormatSelection::Exact("muxed-mp4".into()),
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = manager.snapshot().unwrap();
+            if snap[0].status.is_terminal() && manager.worker_count.load(Ordering::Acquire) == 0 {
+                assert_eq!(
+                    snap[0].status,
+                    DownloadStatus::Failed,
+                    "aggregate >1 GiB job must fail, never complete"
+                );
+                assert!(
+                    snap[0]
+                        .error
+                        .as_deref()
+                        .is_some_and(|msg| msg.contains("exceeded the configured size limit")),
+                    "unexpected error: {:?}",
+                    snap[0].error
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "aggregate >1 GiB download did not terminate promptly: {:?}",
+                snap[0]
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!dest.exists());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "stage and runtime files must be completely cleaned up after aggregate 1 GiB breach"
+        );
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 0);
+        let _ = entry;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn website_download_split_streams_merge_validates_and_cleans_up_on_merge_failure() {
+        let manager = DownloadManager::default();
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-website-split-merge-{}-{}",
+            std::process::id(),
+            current_timestamp_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+
+        // Split-only catalog (NO muxed format): video-only 1080p MP4 + audio-only M4A.
+        let split_catalog = crate::media::yt_dlp::VideoDiscovery {
+            title: "Split DASH Video".into(),
+            duration_seconds: Some(0.5),
+            extractor: "FixtureSite".into(),
+            best_available: true,
+            formats: vec![
+                crate::media::yt_dlp::DiscoveredFormat {
+                    format_id: "137".into(),
+                    resolution: Some("1920x1080".into()),
+                    height: Some(1080),
+                    fps: Some(30.0),
+                    video_codec: Some("avc1.640028".into()),
+                    audio_codec: Some("none".into()),
+                    container: Some("mp4".into()),
+                    file_size: Some(8192),
+                    has_video: true,
+                    has_audio: false,
+                    requires_separate_audio: true,
+                },
+                crate::media::yt_dlp::DiscoveredFormat {
+                    format_id: "140".into(),
+                    resolution: None,
+                    height: None,
+                    fps: None,
+                    video_codec: Some("none".into()),
+                    audio_codec: Some("mp4a.40.2".into()),
+                    container: Some("m4a".into()),
+                    file_size: Some(4096),
+                    has_video: false,
+                    has_audio: true,
+                    requires_separate_audio: false,
+                },
+            ],
+        };
+
+        // 1. Success case: downloads split video + audio, merges via real LGPL ffmpeg.exe,
+        // validates with ffprobe (1 video + 1 audio, duration > 0) + full decode, commits single .mp4.
+        let ok_dir = dir.join("ok");
+        std::fs::create_dir_all(&ok_dir).unwrap();
+        let ok_dest = ok_dir.join("split-merged.mp4");
+        let ok_entry = manager
+            .start_website_download(
+                None,
+                "https://example.test/fixture-split-ok".into(),
+                ok_dest.to_string_lossy().into_owned(),
+                exe.clone(),
+                split_catalog.clone(),
+                crate::media::yt_dlp::FormatSelection::BestAvailable,
+            )
+            .expect("split-only catalog should fall back to split video+audio plan");
+        assert_eq!(
+            ok_entry.website_media,
+            Some(WebsiteMediaInfo {
+                format_id: "137".into(),
+                audio_format_id: Some("140".into()),
+                container: "mp4".into(),
+                height: Some(1080),
+            })
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let snap = manager.snapshot().unwrap();
+            let current = snap.iter().find(|e| e.id == ok_entry.id).unwrap();
+            if current.status.is_terminal() && manager.worker_count.load(Ordering::Acquire) == 0 {
+                assert_eq!(
+                    current.status,
+                    DownloadStatus::Completed,
+                    "valid split merge must complete: {:?}",
+                    current.error
+                );
+                assert!(current.downloaded_bytes > 0);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "split merge did not complete (status={:?}, error={:?})",
+                current.status,
+                current.error
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(ok_dest.is_file());
+        let ok_files = std::fs::read_dir(&ok_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ok_files, vec!["split-merged.mp4".to_owned()]);
+
+        // Confirm final committed .mp4 has exactly 1 video + 1 audio stream and duration > 0.
+        let ffprobe = crate::media::ffmpeg::resolve_verified_ffprobe_executable(None).unwrap();
+        let probe_dir = dir.join("probe-check");
+        std::fs::create_dir_all(&probe_dir).unwrap();
+        let probed = crate::media::ffmpeg::probe_local_media(
+            &ffprobe,
+            &ok_dest,
+            &probe_dir,
+            &DownloadTaskControl::default(),
+        )
+        .unwrap();
+        assert_eq!(probed.video_stream_count, 1);
+        assert_eq!(probed.audio_stream_count, 1);
+        assert!(probed.duration_seconds.is_some_and(|d| d > 0.0));
+
+        // 2. Merge-failure case: corrupt audio stream fails merge, marks Failed (never Completed),
+        // cleans up both staged streams and any partial merged output, and frees slot.
+        let fail_dir = dir.join("fail");
+        std::fs::create_dir_all(&fail_dir).unwrap();
+        let fail_dest = fail_dir.join("split-fail.mp4");
+        let fail_entry = manager
+            .start_website_download(
+                None,
+                "https://example.test/fixture-split-merge-fail".into(),
+                fail_dest.to_string_lossy().into_owned(),
+                exe,
+                split_catalog,
+                crate::media::yt_dlp::FormatSelection::BestAvailable,
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let snap = manager.snapshot().unwrap();
+            let current = snap.iter().find(|e| e.id == fail_entry.id).unwrap();
+            if current.status.is_terminal() && manager.worker_count.load(Ordering::Acquire) == 0 {
+                assert_eq!(
+                    current.status,
+                    DownloadStatus::Failed,
+                    "merge failure must mark job Failed, never Completed"
+                );
+                assert!(current.error.is_some());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failed split merge did not terminate (status={:?}, error={:?})",
+                current.status,
+                current.error
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!fail_dest.exists());
+        assert_eq!(
+            std::fs::read_dir(&fail_dir).unwrap().count(),
+            0,
+            "failed split merge must clean up both staged streams and partial merged output"
+        );
+        assert_eq!(manager.concurrency.active.load(Ordering::Acquire), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5985,5 +8981,2687 @@ mod tests {
             Some("Wed, 21 Oct 2015 07:28:00 GMT")
         );
         assert_eq!(resume_validator(Some("W/\"weak\""), None), None);
+    }
+
+    struct SyntheticHttpResponse {
+        status_line: &'static str,
+        headers: Vec<(String, String)>,
+        content_length_override: Option<usize>,
+        body: Vec<u8>,
+        delay_before_body_ms: u64,
+    }
+
+    impl SyntheticHttpResponse {
+        fn ok_mp4(body: Vec<u8>) -> Self {
+            Self {
+                status_line: "200 OK",
+                headers: vec![("Content-Type".into(), "video/mp4".into())],
+                content_length_override: None,
+                body,
+                delay_before_body_ms: 0,
+            }
+        }
+
+        fn partial_mp4(start: usize, end: usize, total: usize, body: Vec<u8>) -> Self {
+            Self {
+                status_line: "206 Partial Content",
+                headers: vec![
+                    ("Content-Type".into(), "video/mp4".into()),
+                    (
+                        "Content-Range".into(),
+                        format!("bytes {start}-{end}/{total}"),
+                    ),
+                    ("ETag".into(), "\"synthetic-v1\"".into()),
+                ],
+                content_length_override: None,
+                body,
+                delay_before_body_ms: 0,
+            }
+        }
+    }
+
+    struct SyntheticServerHandle {
+        stop_flag: Arc<AtomicBool>,
+        join_handle: Option<std::thread::JoinHandle<Vec<Option<String>>>>,
+    }
+
+    impl SyntheticServerHandle {
+        fn join(mut self) -> Vec<Option<String>> {
+            if let Some(handle) = self.join_handle.take() {
+                handle.join().unwrap()
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn stop_and_join(mut self) -> Vec<Option<String>> {
+            self.stop_flag.store(true, Ordering::Release);
+            if let Some(handle) = self.join_handle.take() {
+                handle.join().unwrap()
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    impl Drop for SyntheticServerHandle {
+        fn drop(&mut self) {
+            self.stop_flag.store(true, Ordering::Release);
+            if let Some(handle) = self.join_handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn spawn_synthetic_http_server<F>(
+        expected_requests: usize,
+        handler: F,
+    ) -> (String, SyntheticServerHandle)
+    where
+        F: FnMut(usize, Option<String>) -> SyntheticHttpResponse + Send + 'static,
+    {
+        spawn_synthetic_http_server_with_timeout(
+            expected_requests,
+            Duration::from_secs(5),
+            handler,
+        )
+    }
+
+    fn spawn_synthetic_http_server_with_timeout<F>(
+        expected_requests: usize,
+        accept_timeout: Duration,
+        mut handler: F,
+    ) -> (String, SyntheticServerHandle)
+    where
+        F: FnMut(usize, Option<String>) -> SyntheticHttpResponse + Send + 'static,
+    {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}/video.mp4", addr.port());
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop_flag);
+        let handle = std::thread::spawn(move || {
+            let mut observed_ranges = Vec::new();
+            for req_idx in 0..expected_requests {
+                let accept_deadline = Instant::now() + accept_timeout;
+                let mut stream = loop {
+                    if worker_stop.load(Ordering::Acquire) || Instant::now() >= accept_deadline {
+                        return observed_ranges;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return observed_ranges,
+                    }
+                };
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+                let mut req_buf = Vec::new();
+                let mut temp = [0_u8; 1024];
+                while !req_buf.windows(4).any(|w| w == b"\r\n\r\n") && req_buf.len() < 16_384 {
+                    match stream.read(&mut temp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req_buf.extend_from_slice(&temp[..n]),
+                    }
+                }
+                let req_text = String::from_utf8_lossy(&req_buf);
+                let range_header = req_text.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("range")
+                        .then(|| value.trim().to_owned())
+                });
+                observed_ranges.push(range_header.clone());
+                let response = handler(req_idx, range_header);
+                let declared_len = response
+                    .content_length_override
+                    .unwrap_or(response.body.len());
+                let mut head = format!(
+                    "HTTP/1.1 {}\r\nConnection: close\r\nContent-Length: {}\r\n",
+                    response.status_line, declared_len
+                );
+                for (k, v) in &response.headers {
+                    head.push_str(&format!("{k}: {v}\r\n"));
+                }
+                head.push_str("\r\n");
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.flush();
+                if response.delay_before_body_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(response.delay_before_body_ms));
+                }
+                let _ = stream.write_all(&response.body);
+                let _ = stream.flush();
+            }
+            observed_ranges
+        });
+        (
+            url,
+            SyntheticServerHandle {
+                stop_flag,
+                join_handle: Some(handle),
+            },
+        )
+    }
+
+    #[test]
+    fn synthetic_http_server_terminates_cleanly_when_no_client_connects() {
+        let started = Instant::now();
+        let (_url, server) = spawn_synthetic_http_server_with_timeout(
+            2,
+            Duration::from_millis(100),
+            |_, _| SyntheticHttpResponse::ok_mp4(vec![0; 16]),
+        );
+        let observed = server.join();
+        assert!(
+            observed.is_empty(),
+            "no requests should be observed when no client connects"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "synthetic HTTP server must terminate cleanly within its accept timeout"
+        );
+    }
+
+    fn create_test_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxnet-ig-range-test-{label}-{}-{}",
+            std::process::id(),
+            rand_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn wait_for_download_settlement(manager: &DownloadManager, id: &str) -> DownloadEntry {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = manager.snapshot().unwrap();
+            let entry = snap.into_iter().find(|e| e.id == id).unwrap();
+            if (entry.status.is_terminal() || entry.status == DownloadStatus::Paused)
+                && manager.worker_count.load(Ordering::Acquire) == 0
+            {
+                return entry;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "download {id} did not settle before timeout; current state: {entry:?}"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    fn valid_fragmented_mp4_with_sidx(fragment_count: usize) -> (Vec<u8>, usize) {
+        let mut init_prefix = mp4_atom(b"ftyp", b"isom\0\0\0\0isom");
+        init_prefix.extend(valid_mp4_initialization(true));
+
+        let mut fragments: Vec<Vec<u8>> = Vec::with_capacity(fragment_count);
+        for index in 0..fragment_count {
+            let mut track_fragment = mp4_atom(b"tfhd", &[0; 8]);
+            track_fragment.extend(mp4_atom(b"trun", &[0; 8]));
+            let mut movie_fragment = mp4_atom(b"mfhd", &[0; 8]);
+            movie_fragment.extend(mp4_atom(b"traf", &track_fragment));
+            let mut fragment = mp4_atom(b"moof", &movie_fragment);
+            fragment.extend(mp4_atom(b"mdat", &vec![(index as u8) + 1; 24]));
+            fragments.push(fragment);
+        }
+
+        // Build ISO BMFF v0 sidx box indexing each subsegment
+        let mut sidx_payload = Vec::with_capacity(24 + fragments.len() * 12);
+        sidx_payload.extend_from_slice(&[0, 0, 0, 0]); // version 0, flags 0
+        sidx_payload.extend_from_slice(&1_u32.to_be_bytes()); // reference_ID
+        sidx_payload.extend_from_slice(&1000_u32.to_be_bytes()); // timescale
+        sidx_payload.extend_from_slice(&0_u32.to_be_bytes()); // earliest_presentation_time
+        sidx_payload.extend_from_slice(&0_u32.to_be_bytes()); // first_offset = 0 from sidx.end
+        sidx_payload.extend_from_slice(&0_u16.to_be_bytes()); // reserved
+        sidx_payload.extend_from_slice(&(fragments.len() as u16).to_be_bytes()); // reference_count
+        for fragment in &fragments {
+            let ref_size = u32::try_from(fragment.len()).unwrap() & 0x7FFF_FFFF;
+            sidx_payload.extend_from_slice(&ref_size.to_be_bytes());
+            sidx_payload.extend_from_slice(&1000_u32.to_be_bytes()); // subsegment_duration
+            sidx_payload.extend_from_slice(&0x8000_0000_u32.to_be_bytes()); // starts_with_SAP
+        }
+        init_prefix.extend(mp4_atom(b"sidx", &sidx_payload));
+        let init_len = init_prefix.len();
+        let mut full = init_prefix;
+        for fragment in fragments {
+            full.extend(fragment);
+        }
+        (full, init_len)
+    }
+
+    #[test]
+    fn synthetic_complete_mp4_http_200_download_succeeds() {
+        let mp4 = valid_mp4(false);
+        let expected_mp4 = mp4.clone();
+        let (url, server) =
+            spawn_synthetic_http_server(1, move |_, _| SyntheticHttpResponse::ok_mp4(mp4.clone()));
+        let dir = create_test_temp_dir("complete-200");
+        let dest = dir.join("complete.mp4");
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        let ranges = server.stop_and_join();
+
+        assert_eq!(settled.status, DownloadStatus::Completed, "error: {:?}", settled.error);
+        assert_eq!(ranges, vec![None]);
+        assert_eq!(settled.downloaded_bytes, expected_mp4.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+        assert!(!partial_path(&dest).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_single_http_206_byte_range_response_succeeds() {
+        let mp4 = valid_mp4(false);
+        let total = mp4.len();
+        let expected_mp4 = mp4.clone();
+        let (url, server) = spawn_synthetic_http_server(1, move |_, _| {
+            SyntheticHttpResponse::partial_mp4(0, total - 1, total, mp4.clone())
+        });
+        let dir = create_test_temp_dir("single-206");
+        let dest = dir.join("single206.mp4");
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        let ranges = server.stop_and_join();
+
+        assert_eq!(settled.status, DownloadStatus::Completed, "error: {:?}", settled.error);
+        assert_eq!(ranges, vec![None]);
+        assert_eq!(settled.total_bytes, Some(total as u64));
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+        assert!(!partial_path(&dest).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_multiple_http_206_byte_range_responses_assemble_complete_mp4() {
+        let mp4 = valid_mp4(false);
+        let total = mp4.len();
+        let c1 = total / 3;
+        let c2 = (total * 2) / 3;
+        let expected_mp4 = mp4.clone();
+        let (url, server) = spawn_synthetic_http_server(3, move |idx, _| match idx {
+            0 => SyntheticHttpResponse::partial_mp4(0, c1 - 1, total, mp4[0..c1].to_vec()),
+            1 => SyntheticHttpResponse::partial_mp4(c1, c2 - 1, total, mp4[c1..c2].to_vec()),
+            _ => SyntheticHttpResponse::partial_mp4(c2, total - 1, total, mp4[c2..total].to_vec()),
+        });
+        let dir = create_test_temp_dir("multi-206");
+        let dest = dir.join("multi206.mp4");
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        let ranges = server.stop_and_join();
+
+        assert_eq!(settled.status, DownloadStatus::Completed, "error: {:?}", settled.error);
+        assert_eq!(
+            ranges,
+            vec![
+                None,
+                Some(format!("bytes={c1}-")),
+                Some(format!("bytes={c2}-")),
+            ]
+        );
+        assert_eq!(settled.downloaded_bytes, total as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+        assert!(!partial_path(&dest).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_http_206_missing_or_invalid_content_range_fails_without_creating_mp4() {
+        let dir = create_test_temp_dir("invalid-content-range");
+        for (index, headers) in [
+            vec![("Content-Type".to_owned(), "video/mp4".to_owned())],
+            vec![
+                ("Content-Type".to_owned(), "video/mp4".to_owned()),
+                ("Content-Range".to_owned(), "bytes invalid/200".to_owned()),
+            ],
+            vec![
+                ("Content-Type".to_owned(), "video/mp4".to_owned()),
+                ("Content-Range".to_owned(), "bytes 0-99/200".to_owned()),
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mp4 = valid_mp4(false);
+            let (url, server) = spawn_synthetic_http_server(1, move |_, _| SyntheticHttpResponse {
+                status_line: "206 Partial Content",
+                headers: headers.clone(),
+                content_length_override: None,
+                body: mp4.clone(),
+                delay_before_body_ms: 0,
+            });
+            let dest = dir.join(format!("bad-cr-{index}.mp4"));
+            let manager = DownloadManager::default();
+            let entry = manager
+                .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+                .unwrap();
+            let settled = wait_for_download_settlement(&manager, &entry.id);
+            let ranges = server.stop_and_join();
+
+            assert_eq!(ranges.len(), 1);
+            assert_eq!(settled.status, DownloadStatus::Failed);
+            assert!(
+                settled.error.as_deref().unwrap_or_default().contains("Content-Range"),
+                "unexpected error: {:?}",
+                settled.error
+            );
+            assert!(!dest.exists());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_fragmented_mp4_with_initialization_and_sidx_reconstructs_across_ranges() {
+        let (fmp4, init_len) = valid_fragmented_mp4_with_sidx(2);
+        let total = fmp4.len();
+        assert_eq!(
+            validate_mp4_bytes(fmp4.clone()),
+            Mp4Validation::FragmentedWithInitialization
+        );
+        // Verify truncated fMP4 missing second subsegment declared in sidx is rejected by validate_mp4_reader
+        let truncated_at_first_frag = fmp4[..total - 20].to_vec();
+        assert!(matches!(
+            validate_mp4_bytes(truncated_at_first_frag),
+            Mp4Validation::Invalid(_)
+        ));
+
+        // Server returns HTTP 200 with ONLY initialization segment (ftyp + moov + sidx) on first request,
+        // and DownloadManager detects incomplete representation via sidx and fetches remaining fragments via HTTP 206!
+        let expected_fmp4 = fmp4.clone();
+        let mid = init_len + (total - init_len) / 2;
+        let (url, server) = spawn_synthetic_http_server(3, move |idx, _| match idx {
+            0 => SyntheticHttpResponse::ok_mp4(fmp4[0..init_len].to_vec()),
+            1 => SyntheticHttpResponse::partial_mp4(
+                init_len,
+                mid - 1,
+                total,
+                fmp4[init_len..mid].to_vec(),
+            ),
+            _ => SyntheticHttpResponse::partial_mp4(
+                mid,
+                total - 1,
+                total,
+                fmp4[mid..total].to_vec(),
+            ),
+        });
+        let dir = create_test_temp_dir("fmp4-sidx");
+        let dest = dir.join("fmp4_initialized.mp4");
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        let ranges = server.stop_and_join();
+
+        assert_eq!(settled.status, DownloadStatus::Completed, "error: {:?}", settled.error);
+        assert_eq!(
+            ranges,
+            vec![
+                None,
+                Some(format!("bytes={init_len}-{}", total - 1)),
+                Some(format!("bytes={mid}-")),
+            ]
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_fmp4);
+        assert!(!partial_path(&dest).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_fragmented_mp4_missing_initialization_segment_is_rejected() {
+        let mut track_fragment = mp4_atom(b"tfhd", &[0; 8]);
+        track_fragment.extend(mp4_atom(b"trun", &[0; 8]));
+        let mut movie_fragment = mp4_atom(b"mfhd", &[0; 8]);
+        movie_fragment.extend(mp4_atom(b"traf", &track_fragment));
+        let mut uninitialized = mp4_atom(b"moof", &movie_fragment);
+        uninitialized.extend(mp4_atom(b"mdat", &[7_u8; 64]));
+        let total = uninitialized.len();
+        let split = total / 2;
+
+        let (url, server) = spawn_synthetic_http_server(2, move |idx, _| match idx {
+            0 => SyntheticHttpResponse::partial_mp4(
+                0,
+                split - 1,
+                total,
+                uninitialized[0..split].to_vec(),
+            ),
+            _ => SyntheticHttpResponse::partial_mp4(
+                split,
+                total - 1,
+                total,
+                uninitialized[split..total].to_vec(),
+            ),
+        });
+        let dir = create_test_temp_dir("fmp4-missing-init");
+        let dest = dir.join("uninitialized.mp4");
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        let ranges = server.stop_and_join();
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(settled.status, DownloadStatus::Failed);
+        assert!(
+            settled
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("fragmented MP4 without its required initialization segment"),
+            "unexpected error: {:?}",
+            settled.error
+        );
+        assert!(!dest.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_interrupted_range_download_resumes_from_exact_offset_on_retry() {
+        let mp4 = valid_mp4(false);
+        let total = mp4.len();
+        let c1 = 48_usize;
+        let dropped_after = 24_usize;
+        let resume_offset = c1 + dropped_after;
+        let expected_mp4 = mp4.clone();
+
+        let (url, server) = spawn_synthetic_http_server(3, move |idx, _| match idx {
+            0 => SyntheticHttpResponse::partial_mp4(0, c1 - 1, total, mp4[0..c1].to_vec()),
+            1 => {
+                // Declare remaining range c1..total, but drop connection after `dropped_after` bytes
+                let mut resp = SyntheticHttpResponse::partial_mp4(
+                    c1,
+                    total - 1,
+                    total,
+                    mp4[c1..resume_offset].to_vec(),
+                );
+                resp.content_length_override = Some(total - c1);
+                resp
+            }
+            _ => SyntheticHttpResponse::partial_mp4(
+                resume_offset,
+                total - 1,
+                total,
+                mp4[resume_offset..total].to_vec(),
+            ),
+        });
+        let dir = create_test_temp_dir("interrupted-retry");
+        let dest = dir.join("interrupted.mp4");
+        let part = partial_path(&dest);
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+        let failed = wait_for_download_settlement(&manager, &entry.id);
+
+        assert_eq!(failed.status, DownloadStatus::Failed);
+        assert_eq!(
+            failed.downloaded_bytes, resume_offset as u64,
+            "interrupted download should preserve partial bytes; error was: {:?}",
+            failed.error
+        );
+        assert!(!dest.exists());
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), resume_offset as u64);
+
+        manager
+            .retry_download_internal(None, entry.id.clone(), false)
+            .unwrap();
+        let completed = wait_for_download_settlement(&manager, &entry.id);
+        let ranges = server.stop_and_join();
+
+        assert_eq!(completed.status, DownloadStatus::Completed, "error: {:?}", completed.error);
+        assert_eq!(
+            ranges,
+            vec![
+                None,
+                Some(format!("bytes={c1}-")),
+                Some(format!("bytes={resume_offset}-")),
+            ]
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+        assert!(!part.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_expired_instagram_signed_url_http_403_fails_cleanly() {
+        let mp4 = valid_mp4(false);
+        let total = mp4.len();
+        let split = total / 2;
+        let (url, server) = spawn_synthetic_http_server(2, move |idx, _| match idx {
+            0 => SyntheticHttpResponse::partial_mp4(0, split - 1, total, mp4[0..split].to_vec()),
+            _ => SyntheticHttpResponse {
+                status_line: "403 Forbidden",
+                headers: vec![("Content-Type".into(), "text/plain".into())],
+                content_length_override: None,
+                body: b"URL signature expired".to_vec(),
+                delay_before_body_ms: 0,
+            },
+        });
+        let dir = create_test_temp_dir("expired-403");
+        let dest = dir.join("expired.mp4");
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        let ranges = server.stop_and_join();
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(settled.status, DownloadStatus::Failed);
+        let err = settled.error.unwrap_or_default();
+        assert!(err.contains("403") && err.contains("expired"), "unexpected error: {err}");
+        assert!(!dest.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_range_request_ignored_with_http_200_is_rejected_without_duplicating_bytes() {
+        let mp4 = valid_mp4(false);
+        let total = mp4.len();
+        let first_len = 50_usize;
+        let (url, server) = spawn_synthetic_http_server(2, move |idx, _| match idx {
+            0 => SyntheticHttpResponse::partial_mp4(
+                0,
+                first_len - 1,
+                total,
+                mp4[0..first_len].to_vec(),
+            ),
+            _ => SyntheticHttpResponse::ok_mp4(mp4.clone()),
+        });
+        let dir = create_test_temp_dir("range-ignored-200");
+        let dest = dir.join("ignored200.mp4");
+        let part = partial_path(&dest);
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        let ranges = server.stop_and_join();
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(settled.status, DownloadStatus::Failed);
+        assert!(
+            settled
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not honor the Range request"),
+            "unexpected error: {:?}",
+            settled.error
+        );
+        assert_eq!(settled.downloaded_bytes, first_len as u64);
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), first_len as u64);
+        assert!(!dest.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_incorrect_content_range_offset_is_rejected() {
+        let mp4 = valid_mp4(false);
+        let total = mp4.len();
+        let first_len = 50_usize;
+        let wrong_start = 40_usize;
+        let (url, server) = spawn_synthetic_http_server(2, move |idx, _| match idx {
+            0 => SyntheticHttpResponse::partial_mp4(
+                0,
+                first_len - 1,
+                total,
+                mp4[0..first_len].to_vec(),
+            ),
+            _ => SyntheticHttpResponse::partial_mp4(
+                wrong_start,
+                total - 1,
+                total,
+                mp4[wrong_start..total].to_vec(),
+            ),
+        });
+        let dir = create_test_temp_dir("wrong-range-offset");
+        let dest = dir.join("wrong_offset.mp4");
+        let part = partial_path(&dest);
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        let ranges = server.stop_and_join();
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(settled.status, DownloadStatus::Failed);
+        assert!(
+            settled
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("wrong starting offset"),
+            "unexpected error: {:?}",
+            settled.error
+        );
+        assert_eq!(settled.downloaded_bytes, first_len as u64);
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), first_len as u64);
+        assert!(!dest.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_application_interruption_during_transfer_recovers_and_resumes_on_retry() {
+        let mp4 = valid_mp4(false);
+        let total = mp4.len();
+        let saved_offset = 64_usize;
+        let expected_mp4 = mp4.clone();
+
+        let dir = create_test_temp_dir("app-interruption");
+        let dest = dir.join("app_interrupt.mp4");
+        let part = partial_path(&dest);
+        std::fs::write(&part, &mp4[0..saved_offset]).unwrap();
+
+        let (url, server) = spawn_synthetic_http_server(1, move |_, _| {
+            SyntheticHttpResponse::partial_mp4(
+                saved_offset,
+                total - 1,
+                total,
+                mp4[saved_offset..total].to_vec(),
+            )
+        });
+
+        let manager = DownloadManager::default();
+        let entry_id = "interrupted-on-exit-entry".to_owned();
+        {
+            let mut state = manager.state.lock().unwrap();
+            let mut entry = DownloadEntry {
+                id: entry_id.clone(),
+                url,
+                destination: dest.to_string_lossy().into_owned(),
+                filename: "app_interrupt.mp4".into(),
+                status: DownloadStatus::Downloading,
+                total_bytes: Some(total as u64),
+                downloaded_bytes: saved_offset as u64,
+                speed_bytes_per_second: 1024.0,
+                elapsed_ms: 150,
+                remaining_seconds: Some(1.0),
+                error: None,
+                created_at_ms: 1000,
+                updated_at_ms: 1150,
+                attempts: 1,
+                hls_playlist: None,
+                hls_completed_parts: None,
+                website_media: None,
+                segments: Vec::new(),
+                etag: Some("\"synthetic-v1\"".into()),
+                last_modified: None,
+                notifications_enabled: false,
+                notify_on_complete: false,
+                notify_on_failure: false,
+            };
+            // Simulate DownloadManager::initialize startup recovery of an interrupted in-flight transfer
+            if matches!(
+                &entry.status,
+                DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Paused
+            ) {
+                entry.status = DownloadStatus::Failed;
+                entry.error = Some(
+                    "Interrupted when FluxNet exited. The partial file was retained; retry explicitly to continue or restart."
+                        .into(),
+                );
+            }
+            state.entries.push(entry);
+        }
+
+        manager
+            .retry_download_internal(None, entry_id.clone(), false)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry_id);
+        let ranges = server.stop_and_join();
+
+        assert_eq!(settled.status, DownloadStatus::Completed, "error: {:?}", settled.error);
+        assert_eq!(ranges, vec![Some(format!("bytes={saved_offset}-"))]);
+        assert_eq!(settled.downloaded_bytes, total as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+        assert!(!part.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_multi_range_pause_resume_and_cancel_preserve_byte_integrity() {
+        let mp4 = valid_mp4(false);
+        let total = mp4.len();
+        let split = total / 2;
+        let expected_mp4 = mp4.clone();
+
+        // 1. Range 0 (0..split) completes immediately; Range 1 pauses before body so pause_download
+        // deterministically catches the active download at exact offset `split`, then resume completes Range 2.
+        let mp4_for_pause = mp4.clone();
+        let (url, server) = spawn_synthetic_http_server(3, move |idx, _| match idx {
+            0 => SyntheticHttpResponse::partial_mp4(
+                0,
+                split - 1,
+                total,
+                mp4_for_pause[0..split].to_vec(),
+            ),
+            1 => {
+                let mut r = SyntheticHttpResponse::partial_mp4(
+                    split,
+                    total - 1,
+                    total,
+                    mp4_for_pause[split..total].to_vec(),
+                );
+                r.delay_before_body_ms = 300;
+                r
+            }
+            _ => SyntheticHttpResponse::partial_mp4(
+                split,
+                total - 1,
+                total,
+                mp4_for_pause[split..total].to_vec(),
+            ),
+        });
+        let dir = create_test_temp_dir("range-pause-resume");
+        let dest = dir.join("paused_range.mp4");
+        let part = partial_path(&dest);
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = manager.snapshot().unwrap();
+            let current = &snap[0];
+            if current.status == DownloadStatus::Downloading
+                && current.downloaded_bytes == split as u64
+            {
+                break;
+            }
+            assert!(
+                !current.status.is_terminal() && Instant::now() < deadline,
+                "download did not reach pause checkpoint at {split} bytes; state: {current:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        manager.pause_download(&entry.id).unwrap();
+        let paused = wait_for_download_settlement(&manager, &entry.id);
+        assert_eq!(paused.status, DownloadStatus::Paused);
+        assert_eq!(paused.downloaded_bytes, split as u64);
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), split as u64);
+        assert!(!dest.exists());
+
+        manager.resume_download(None, &entry.id).unwrap();
+        let completed = wait_for_download_settlement(&manager, &entry.id);
+        let ranges = server.stop_and_join();
+
+        assert_eq!(completed.status, DownloadStatus::Completed, "error: {:?}", completed.error);
+        assert_eq!(
+            ranges,
+            vec![
+                None,
+                Some(format!("bytes={split}-")),
+                Some(format!("bytes={split}-")),
+            ]
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+        assert!(!part.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn parallel_segment_plan_divides_ranges_and_rejects_missing_overlapping_or_duplicated_segments()
+    {
+        assert_eq!(DEFAULT_CONNECTIONS_PER_DOWNLOAD, 4);
+        let manager = DownloadManager::default();
+        assert_eq!(
+            manager.settings().unwrap().max_connections_per_download,
+            DEFAULT_CONNECTIONS_PER_DOWNLOAD
+        );
+        manager.configure_connections_per_download(6).unwrap();
+        assert_eq!(manager.settings().unwrap().max_connections_per_download, 6);
+        assert!(manager.configure_connections_per_download(0).is_err());
+        assert!(
+            manager
+                .configure_connections_per_download(MAX_CONNECTIONS_PER_DOWNLOAD + 1)
+                .is_err()
+        );
+
+        let segments = plan_parallel_segments(212, 4);
+        assert_eq!(segments.len(), 4);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| (s.index, s.start, s.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 52), (1, 53, 105), (2, 106, 158), (3, 159, 211)]
+        );
+        assert!(validate_segment_plan(&segments, 212).is_ok());
+
+        // Missing byte gap between segment 0 and segment 1
+        let mut with_gap = segments.clone();
+        with_gap[1].start = 54;
+        assert!(
+            validate_segment_plan(&with_gap, 212)
+                .unwrap_err()
+                .contains("missing byte gap")
+        );
+
+        // Overlapping segments
+        let mut overlapping = segments.clone();
+        overlapping[2].start = 105;
+        assert!(
+            validate_segment_plan(&overlapping, 212)
+                .unwrap_err()
+                .contains("overlaps")
+        );
+
+        // Duplicated segment index
+        let mut duplicated = segments.clone();
+        duplicated[2].index = 1;
+        assert!(
+            validate_segment_plan(&duplicated, 212)
+                .unwrap_err()
+                .contains("duplicated segment")
+        );
+
+        // Truncated total coverage
+        assert!(
+            validate_segment_plan(&segments, 250)
+                .unwrap_err()
+                .contains("total file size is 250")
+        );
+    }
+
+    #[test]
+    fn startup_auto_resume_rejects_expired_signed_url_and_prevents_completed_paused_cancelled_or_duplicate_restarts()
+     {
+        let dir = create_test_temp_dir("startup-eligibility");
+        let history_path = dir.join("download-history.json");
+
+        let completed_dest = dir.join("completed.mp4");
+        std::fs::write(&completed_dest, valid_mp4(false)).unwrap();
+
+        let paused_dest = dir.join("paused.mp4");
+        std::fs::write(partial_path(&paused_dest), vec![1_u8; 40]).unwrap();
+
+        let expired_ig_url = "https://instagram.fdac5-1.fna.fbcdn.net/o1/v/t2/f2/m367/video.mp4?oh=00_AQR&oe=5F000000";
+        let persisted = PersistedDownloads {
+            version: 1,
+            max_concurrent: 2,
+            max_connections_per_download: 4,
+            bandwidth_limit_bytes_per_second: None,
+            notifications_enabled: false,
+            notify_on_complete: false,
+            notify_on_failure: false,
+            entries: vec![
+                DownloadEntry {
+                    id: "done-1".into(),
+                    url: "http://127.0.0.1:9/never-called.mp4".into(),
+                    destination: completed_dest.to_string_lossy().into_owned(),
+                    filename: "completed.mp4".into(),
+                    status: DownloadStatus::Completed,
+                    total_bytes: Some(212),
+                    downloaded_bytes: 212,
+                    speed_bytes_per_second: 0.0,
+                    elapsed_ms: 50,
+                    remaining_seconds: Some(0.0),
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 150,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments: Vec::new(),
+                    etag: None,
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+                DownloadEntry {
+                    id: "paused-1".into(),
+                    url: "http://127.0.0.1:9/paused.mp4".into(),
+                    destination: paused_dest.to_string_lossy().into_owned(),
+                    filename: "paused.mp4".into(),
+                    status: DownloadStatus::Paused,
+                    total_bytes: Some(212),
+                    downloaded_bytes: 40,
+                    speed_bytes_per_second: 0.0,
+                    elapsed_ms: 20,
+                    remaining_seconds: None,
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 120,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments: Vec::new(),
+                    etag: Some("\"v1\"".into()),
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+                DownloadEntry {
+                    id: "cancelled-1".into(),
+                    url: "http://127.0.0.1:9/cancelled.mp4".into(),
+                    destination: dir.join("cancelled.mp4").to_string_lossy().into_owned(),
+                    filename: "cancelled.mp4".into(),
+                    status: DownloadStatus::Cancelled,
+                    total_bytes: Some(212),
+                    downloaded_bytes: 0,
+                    speed_bytes_per_second: 0.0,
+                    elapsed_ms: 5,
+                    remaining_seconds: None,
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 105,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments: Vec::new(),
+                    etag: None,
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+                DownloadEntry {
+                    id: "expired-ig-1".into(),
+                    url: expired_ig_url.into(),
+                    destination: dir.join("expired_ig.mp4").to_string_lossy().into_owned(),
+                    filename: "expired_ig.mp4".into(),
+                    status: DownloadStatus::Downloading,
+                    total_bytes: Some(212),
+                    downloaded_bytes: 0,
+                    speed_bytes_per_second: 500.0,
+                    elapsed_ms: 10,
+                    remaining_seconds: Some(1.0),
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 110,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments: Vec::new(),
+                    etag: None,
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+                DownloadEntry {
+                    id: "duplicate-guarded-1".into(),
+                    url: "http://127.0.0.1:9/active.mp4".into(),
+                    destination: dir.join("active.mp4").to_string_lossy().into_owned(),
+                    filename: "active.mp4".into(),
+                    status: DownloadStatus::Downloading,
+                    total_bytes: Some(212),
+                    downloaded_bytes: 0,
+                    speed_bytes_per_second: 0.0,
+                    elapsed_ms: 0,
+                    remaining_seconds: None,
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 110,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments: Vec::new(),
+                    etag: None,
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+            ],
+        };
+        std::fs::write(&history_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let manager = DownloadManager::default();
+        // Pre-insert an active control for `duplicate-guarded-1` to verify duplicate worker prevention
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.controls.insert(
+                "duplicate-guarded-1".into(),
+                Arc::new(DownloadTaskControl::default()),
+            );
+        }
+
+        manager
+            .initialize_with_history_path(None, history_path)
+            .unwrap();
+        // Zero background workers should have been spawned!
+        assert_eq!(manager.worker_count.load(Ordering::Acquire), 0);
+
+        let snap = manager.snapshot().unwrap();
+        let done = snap.iter().find(|e| e.id == "done-1").unwrap();
+        assert_eq!(done.status, DownloadStatus::Completed);
+        assert_eq!(done.attempts, 1);
+
+        let paused = snap.iter().find(|e| e.id == "paused-1").unwrap();
+        assert_eq!(paused.status, DownloadStatus::Paused);
+        assert_eq!(paused.downloaded_bytes, 40);
+        assert_eq!(paused.attempts, 1);
+
+        let cancelled = snap.iter().find(|e| e.id == "cancelled-1").unwrap();
+        assert_eq!(cancelled.status, DownloadStatus::Cancelled);
+
+        let expired = snap.iter().find(|e| e.id == "expired-ig-1").unwrap();
+        assert_eq!(expired.status, DownloadStatus::Failed);
+        assert!(
+            expired
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("expired")
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn spawn_concurrent_range_http_server(
+        payload: Vec<u8>,
+        expected_requests: usize,
+        range_hold_ms: u64,
+        ignore_ranges_with_200: bool,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<Option<String>>>>,
+        SyntheticServerHandle,
+    ) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}/parallel.mp4", addr.port());
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop_flag);
+        let active_range_requests = Arc::new(AtomicUsize::new(0));
+        let max_concurrent_range_requests = Arc::new(AtomicUsize::new(0));
+        let max_concurrent_for_server = Arc::clone(&max_concurrent_range_requests);
+        let observed_ranges = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_server = Arc::clone(&observed_ranges);
+
+        let handle = std::thread::spawn(move || {
+            let mut conn_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+            for _ in 0..expected_requests {
+                let accept_deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    if worker_stop.load(Ordering::Acquire) || Instant::now() >= accept_deadline {
+                        for t in conn_threads {
+                            let _ = t.join();
+                        }
+                        return Vec::new();
+                    }
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => {
+                            for t in conn_threads {
+                                let _ = t.join();
+                            }
+                            return Vec::new();
+                        }
+                    }
+                };
+                let data = payload.clone();
+                let active = Arc::clone(&active_range_requests);
+                let max_conc = Arc::clone(&max_concurrent_for_server);
+                let obs = Arc::clone(&observed_for_server);
+
+                conn_threads.push(std::thread::spawn(move || {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+                    let mut req_buf = Vec::new();
+                    let mut temp = [0_u8; 1024];
+                    while !req_buf.windows(4).any(|w| w == b"\r\n\r\n") && req_buf.len() < 16_384 {
+                        match stream.read(&mut temp) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req_buf.extend_from_slice(&temp[..n]),
+                        }
+                    }
+                    let req_text = String::from_utf8_lossy(&req_buf);
+                    let range_header = req_text.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("range")
+                            .then(|| value.trim().to_owned())
+                    });
+                    obs.lock().unwrap().push(range_header.clone());
+
+                    let total = data.len();
+                    if let Some(raw_range) = range_header.filter(|_| !ignore_ranges_with_200) {
+                        let current_active = active.fetch_add(1, Ordering::AcqRel) + 1;
+                        let mut prev_max = max_conc.load(Ordering::Acquire);
+                        while current_active > prev_max {
+                            match max_conc.compare_exchange_weak(
+                                prev_max,
+                                current_active,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            ) {
+                                Ok(_) => break,
+                                Err(actual) => prev_max = actual,
+                            }
+                        }
+
+                        if range_hold_ms > 0 {
+                            std::thread::sleep(Duration::from_millis(range_hold_ms));
+                        }
+
+                        let range_spec = raw_range.strip_prefix("bytes=").unwrap_or("");
+                        let (s_str, e_str) = range_spec.split_once('-').unwrap_or(("0", ""));
+                        let start = s_str.parse::<usize>().unwrap_or(0);
+                        let end = if e_str.is_empty() {
+                            total - 1
+                        } else {
+                            e_str.parse::<usize>().unwrap_or(total - 1).min(total - 1)
+                        };
+                        let slice = &data[start..=end];
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\nConnection: close\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nETag: \"parallel-v1\"\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {}\r\n\r\n",
+                            slice.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(slice);
+                        let _ = stream.flush();
+                        active.fetch_sub(1, Ordering::AcqRel);
+                    } else {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nETag: \"parallel-v1\"\r\nContent-Length: {total}\r\n\r\n"
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&data);
+                        let _ = stream.flush();
+                    }
+                }));
+            }
+            for t in conn_threads {
+                let _ = t.join();
+            }
+            Vec::new()
+        });
+
+        (
+            url,
+            max_concurrent_range_requests,
+            observed_ranges,
+            SyntheticServerHandle {
+                stop_flag,
+                join_handle: Some(handle),
+            },
+        )
+    }
+
+    #[test]
+    fn synthetic_parallel_multi_segment_http_download_overlaps_requests_and_assembles_exact_file() {
+        // Make the MP4 payload larger (~2 KiB) so 4 segments each carry substantial distinct data
+        let mut large_mdat = Vec::with_capacity(2048);
+        for i in 0..2048_usize {
+            large_mdat.push((i % 251) as u8);
+        }
+        let mut mp4 = mp4_atom(b"ftyp", b"isom\0\0\0\0isom");
+        mp4.extend(valid_mp4_initialization(false));
+        mp4.extend(mp4_atom(b"mdat", &large_mdat));
+        let expected_mp4 = mp4.clone();
+
+        // 1 initial probe GET + 4 concurrent Range GETs = 5 requests
+        let (url, max_concurrent_observed, observed_ranges, server) =
+            spawn_concurrent_range_http_server(mp4, 5, 90, false);
+        let dir = create_test_temp_dir("parallel-4-segments");
+        let dest = dir.join("parallel.mp4");
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        server.stop_and_join();
+
+        assert_eq!(
+            settled.status,
+            DownloadStatus::Completed,
+            "parallel download failed: {:?}",
+            settled.error
+        );
+        let max_conc = max_concurrent_observed.load(Ordering::Acquire);
+        assert!(
+            max_conc >= 2,
+            "expected parallel range requests to overlap in time (max concurrent observed = {max_conc})"
+        );
+        let ranges = observed_ranges.lock().unwrap().clone();
+        assert_eq!(ranges.len(), 5);
+        assert_eq!(ranges.iter().filter(|r| r.is_some()).count(), 4);
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+        assert!(!partial_path(&dest).exists());
+        for idx in 0..4 {
+            assert!(!segment_part_path(&dest, &entry.id, idx).exists());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_parallel_download_falls_back_to_sequential_when_ranges_are_ignored() {
+        let mp4 = valid_mp4(false);
+        let expected_mp4 = mp4.clone();
+        // Server advertises `Accept-Ranges: bytes` on initial 200 OK, but ignores `Range` headers with 200 OK.
+        // 1 initial probe + up to 4 parallel attempts + 1 sequential fallback = 6 max connections
+        let (url, _max_conc, _observed, server) =
+            spawn_concurrent_range_http_server(mp4, 6, 0, true);
+        let dir = create_test_temp_dir("parallel-fallback-seq");
+        let dest = dir.join("fallback.mp4");
+        let manager = DownloadManager::default();
+        manager.configure_connections_per_download(2).unwrap();
+        let entry = manager
+            .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        server.stop_and_join();
+
+        assert_eq!(
+            settled.status,
+            DownloadStatus::Completed,
+            "fallback download failed: {:?}",
+            settled.error
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_app_restart_automatically_resumes_single_and_multiple_unfinished_downloads() {
+        let mp4 = valid_mp4(false);
+        let total = mp4.len();
+        let offset1 = 60_usize;
+        let offset2 = 96_usize;
+        let expected_mp4 = mp4.clone();
+
+        let dir = create_test_temp_dir("auto-resume-multiple");
+        let history_path = dir.join("download-history.json");
+        let dest1 = dir.join("resume_one.mp4");
+        let dest2 = dir.join("resume_two.mp4");
+        std::fs::write(partial_path(&dest1), &mp4[0..offset1]).unwrap();
+        std::fs::write(partial_path(&dest2), &mp4[0..offset2]).unwrap();
+
+        let mp4_for_s1 = mp4.clone();
+        let (url1, server1) = spawn_synthetic_http_server(1, move |_, _| {
+            SyntheticHttpResponse::partial_mp4(
+                offset1,
+                total - 1,
+                total,
+                mp4_for_s1[offset1..total].to_vec(),
+            )
+        });
+        let mp4_for_s2 = mp4.clone();
+        let (url2, server2) = spawn_synthetic_http_server(1, move |_, _| {
+            SyntheticHttpResponse::partial_mp4(
+                offset2,
+                total - 1,
+                total,
+                mp4_for_s2[offset2..total].to_vec(),
+            )
+        });
+
+        let persisted = PersistedDownloads {
+            version: 1,
+            max_concurrent: 2,
+            max_connections_per_download: 4,
+            bandwidth_limit_bytes_per_second: None,
+            notifications_enabled: false,
+            notify_on_complete: false,
+            notify_on_failure: false,
+            entries: vec![
+                DownloadEntry {
+                    id: "auto-resume-1".into(),
+                    url: url1,
+                    destination: dest1.to_string_lossy().into_owned(),
+                    filename: "resume_one.mp4".into(),
+                    status: DownloadStatus::Downloading,
+                    total_bytes: Some(total as u64),
+                    downloaded_bytes: offset1 as u64,
+                    speed_bytes_per_second: 100.0,
+                    elapsed_ms: 50,
+                    remaining_seconds: None,
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 150,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments: Vec::new(),
+                    etag: Some("\"synthetic-v1\"".into()),
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+                DownloadEntry {
+                    id: "auto-resume-2".into(),
+                    url: url2,
+                    destination: dest2.to_string_lossy().into_owned(),
+                    filename: "resume_two.mp4".into(),
+                    status: DownloadStatus::Queued,
+                    total_bytes: Some(total as u64),
+                    downloaded_bytes: offset2 as u64,
+                    speed_bytes_per_second: 0.0,
+                    elapsed_ms: 30,
+                    remaining_seconds: None,
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 130,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments: Vec::new(),
+                    etag: Some("\"synthetic-v1\"".into()),
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+            ],
+        };
+        std::fs::write(&history_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let manager = DownloadManager::default();
+        manager
+            .initialize_with_history_path(None, history_path)
+            .unwrap();
+
+        let settled1 = wait_for_download_settlement(&manager, "auto-resume-1");
+        let settled2 = wait_for_download_settlement(&manager, "auto-resume-2");
+        let ranges1 = server1.stop_and_join();
+        let ranges2 = server2.stop_and_join();
+
+        assert_eq!(settled1.status, DownloadStatus::Completed, "err1: {:?}", settled1.error);
+        assert_eq!(settled2.status, DownloadStatus::Completed, "err2: {:?}", settled2.error);
+        assert_eq!(ranges1, vec![Some(format!("bytes={offset1}-"))]);
+        assert_eq!(ranges2, vec![Some(format!("bytes={offset2}-"))]);
+        assert_eq!(std::fs::read(&dest1).unwrap(), expected_mp4);
+        assert_eq!(std::fs::read(&dest2).unwrap(), expected_mp4);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_app_restart_resumes_partially_completed_parallel_segments_and_repairs_corrupted_segment()
+     {
+        let mp4 = valid_mp4(false);
+        let total = mp4.len();
+        let expected_mp4 = mp4.clone();
+        let mut segments = plan_parallel_segments(total as u64, 4);
+        assert_eq!(segments.len(), 4);
+
+        let dir = create_test_temp_dir("auto-resume-parallel-segments");
+        let history_path = dir.join("download-history.json");
+        let dest = dir.join("segmented_resume.mp4");
+        let entry_id = "seg-resume-id";
+
+        // Segment 0: valid completed on disk
+        let s0_len = (segments[0].end - segments[0].start + 1) as usize;
+        std::fs::write(
+            segment_part_path(&dest, entry_id, 0),
+            &mp4[segments[0].start as usize..=segments[0].end as usize],
+        )
+        .unwrap();
+        segments[0].downloaded_bytes = s0_len as u64;
+        segments[0].completed = true;
+
+        // Segment 1: partially completed (20 bytes verified on disk)
+        let s1_partial = 20_usize;
+        let s1_start = segments[1].start as usize;
+        std::fs::write(
+            segment_part_path(&dest, entry_id, 1),
+            &mp4[s1_start..s1_start + s1_partial],
+        )
+        .unwrap();
+        segments[1].downloaded_bytes = s1_partial as u64;
+        segments[1].completed = false;
+
+        // Segment 2: marked completed in metadata, but CORRUPTED (truncated to 7 bytes) on disk!
+        let s2_len = (segments[2].end - segments[2].start + 1) as usize;
+        std::fs::write(segment_part_path(&dest, entry_id, 2), &[0xFF_u8; 7]).unwrap();
+        segments[2].downloaded_bytes = s2_len as u64;
+        segments[2].completed = true;
+
+        // Segment 3: valid completed on disk
+        let s3_len = (segments[3].end - segments[3].start + 1) as usize;
+        std::fs::write(
+            segment_part_path(&dest, entry_id, 3),
+            &mp4[segments[3].start as usize..=segments[3].end as usize],
+        )
+        .unwrap();
+        segments[3].downloaded_bytes = s3_len as u64;
+        segments[3].completed = true;
+
+        // Only 2 HTTP range requests should be made:
+        // - Segment 1 remaining range: (segments[1].start + 20)..=segments[1].end
+        // - Segment 2 full range (repaired from corruption): segments[2].start..=segments[2].end
+        let (url, _max_conc, observed_ranges, server) =
+            spawn_concurrent_range_http_server(mp4, 2, 0, false);
+
+        let persisted = PersistedDownloads {
+            version: 1,
+            max_concurrent: 2,
+            max_connections_per_download: 4,
+            bandwidth_limit_bytes_per_second: None,
+            notifications_enabled: false,
+            notify_on_complete: false,
+            notify_on_failure: false,
+            entries: vec![DownloadEntry {
+                id: entry_id.into(),
+                url,
+                destination: dest.to_string_lossy().into_owned(),
+                filename: "segmented_resume.mp4".into(),
+                status: DownloadStatus::Downloading,
+                total_bytes: Some(total as u64),
+                downloaded_bytes: (s0_len + s1_partial + s2_len + s3_len) as u64,
+                speed_bytes_per_second: 0.0,
+                elapsed_ms: 40,
+                remaining_seconds: None,
+                error: None,
+                created_at_ms: 100,
+                updated_at_ms: 140,
+                attempts: 1,
+                hls_playlist: None,
+                hls_completed_parts: None,
+                website_media: None,
+                segments: segments.clone(),
+                etag: Some("\"parallel-v1\"".into()),
+                last_modified: None,
+                notifications_enabled: false,
+                notify_on_complete: false,
+                notify_on_failure: false,
+            }],
+        };
+        std::fs::write(&history_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let manager = DownloadManager::default();
+        manager
+            .initialize_with_history_path(None, history_path)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, entry_id);
+        server.stop_and_join();
+
+        assert_eq!(
+            settled.status,
+            DownloadStatus::Completed,
+            "segmented auto-resume failed: {:?}",
+            settled.error
+        );
+        let mut ranges = observed_ranges
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .flatten()
+            .collect::<Vec<_>>();
+        ranges.sort();
+        let mut expected_ranges = vec![
+            format!(
+                "bytes={}-{}",
+                segments[1].start + (s1_partial as u64),
+                segments[1].end
+            ),
+            format!("bytes={}-{}", segments[2].start, segments[2].end),
+        ];
+        expected_ranges.sort();
+        assert_eq!(ranges, expected_ranges);
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_app_restart_with_server_expired_403_url_fails_once_and_does_not_retry_indefinitely()
+     {
+        let (url, server) = spawn_synthetic_http_server(1, move |_, _| SyntheticHttpResponse {
+            status_line: "403 Forbidden",
+            headers: vec![("Content-Type".into(), "text/plain".into())],
+            content_length_override: None,
+            body: b"Signed URL expired".to_vec(),
+            delay_before_body_ms: 0,
+        });
+
+        let dir = create_test_temp_dir("auto-resume-expired-403");
+        let history_path = dir.join("download-history.json");
+        let dest = dir.join("expired_on_restart.mp4");
+        let persisted = PersistedDownloads {
+            version: 1,
+            max_concurrent: 2,
+            max_connections_per_download: 4,
+            bandwidth_limit_bytes_per_second: None,
+            notifications_enabled: false,
+            notify_on_complete: false,
+            notify_on_failure: false,
+            entries: vec![DownloadEntry {
+                id: "expired-403-restart".into(),
+                url,
+                destination: dest.to_string_lossy().into_owned(),
+                filename: "expired_on_restart.mp4".into(),
+                status: DownloadStatus::Downloading,
+                total_bytes: Some(212),
+                downloaded_bytes: 0,
+                speed_bytes_per_second: 0.0,
+                elapsed_ms: 10,
+                remaining_seconds: None,
+                error: None,
+                created_at_ms: 100,
+                updated_at_ms: 110,
+                attempts: 1,
+                hls_playlist: None,
+                hls_completed_parts: None,
+                website_media: None,
+                segments: Vec::new(),
+                etag: None,
+                last_modified: None,
+                notifications_enabled: false,
+                notify_on_complete: false,
+                notify_on_failure: false,
+            }],
+        };
+        std::fs::write(&history_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let manager = DownloadManager::default();
+        manager
+            .initialize_with_history_path(None, history_path.clone())
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, "expired-403-restart");
+        let ranges = server.stop_and_join();
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(settled.status, DownloadStatus::Failed);
+        assert!(
+            settled
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("403 Forbidden")
+        );
+        assert!(!dest.exists());
+
+        // Second app restart with the persisted Failed status must NOT re-trigger any download worker!
+        let second_manager = DownloadManager::default();
+        second_manager
+            .initialize_with_history_path(None, history_path)
+            .unwrap();
+        assert_eq!(second_manager.worker_count.load(Ordering::Acquire), 0);
+        let second_snap = second_manager.snapshot().unwrap();
+        assert_eq!(second_snap[0].status, DownloadStatus::Failed);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_auto_resume_handles_website_entries_existing_destinations_and_retry_cap_safely() {
+        let dir = create_test_temp_dir("startup-edge-cases");
+        let history_path = dir.join("download-history.json");
+
+        let pre_existing_dest = dir.join("already_exists.mp4");
+        let original_bytes = b"DO_NOT_OVERWRITE_EXISTING_DESTINATION".to_vec();
+        std::fs::write(&pre_existing_dest, &original_bytes).unwrap();
+
+        let persisted = PersistedDownloads {
+            version: 1,
+            max_concurrent: 2,
+            max_connections_per_download: 4,
+            bandwidth_limit_bytes_per_second: None,
+            notifications_enabled: false,
+            notify_on_complete: false,
+            notify_on_failure: false,
+            entries: vec![
+                DownloadEntry {
+                    id: "website-interrupted".into(),
+                    url: "https://example.com/watch?v=123".into(),
+                    destination: dir.join("website.mp4").to_string_lossy().into_owned(),
+                    filename: "website.mp4".into(),
+                    status: DownloadStatus::Downloading,
+                    total_bytes: Some(1000),
+                    downloaded_bytes: 200,
+                    speed_bytes_per_second: 50.0,
+                    elapsed_ms: 100,
+                    remaining_seconds: Some(10.0),
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 200,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: Some(WebsiteMediaInfo {
+                        format_id: "18".into(),
+                        audio_format_id: None,
+                        container: "mp4".into(),
+                        height: Some(360),
+                    }),
+                    segments: Vec::new(),
+                    etag: None,
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+                DownloadEntry {
+                    id: "existing-dest-conflict".into(),
+                    url: "http://127.0.0.1:9/conflict.mp4".into(),
+                    destination: pre_existing_dest.to_string_lossy().into_owned(),
+                    filename: "already_exists.mp4".into(),
+                    status: DownloadStatus::Downloading,
+                    total_bytes: Some(212),
+                    downloaded_bytes: 50,
+                    speed_bytes_per_second: 0.0,
+                    elapsed_ms: 10,
+                    remaining_seconds: None,
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 110,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments: Vec::new(),
+                    etag: None,
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+                DownloadEntry {
+                    id: "retry-cap-reached".into(),
+                    url: "http://127.0.0.1:9/capped.mp4".into(),
+                    destination: dir.join("capped.mp4").to_string_lossy().into_owned(),
+                    filename: "capped.mp4".into(),
+                    status: DownloadStatus::Queued,
+                    total_bytes: Some(212),
+                    downloaded_bytes: 20,
+                    speed_bytes_per_second: 0.0,
+                    elapsed_ms: 50,
+                    remaining_seconds: None,
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 150,
+                    attempts: MAX_AUTO_RESUME_ATTEMPTS,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments: Vec::new(),
+                    etag: None,
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+                DownloadEntry {
+                    id: "already-failed".into(),
+                    url: "http://127.0.0.1:9/failed.mp4".into(),
+                    destination: dir.join("failed.mp4").to_string_lossy().into_owned(),
+                    filename: "failed.mp4".into(),
+                    status: DownloadStatus::Failed,
+                    total_bytes: Some(212),
+                    downloaded_bytes: 0,
+                    speed_bytes_per_second: 0.0,
+                    elapsed_ms: 10,
+                    remaining_seconds: None,
+                    error: Some("Previous permanent failure.".into()),
+                    created_at_ms: 100,
+                    updated_at_ms: 110,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments: Vec::new(),
+                    etag: None,
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+            ],
+        };
+        std::fs::write(&history_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let manager = DownloadManager::default();
+        manager
+            .initialize_with_history_path(None, history_path)
+            .unwrap();
+        assert_eq!(manager.worker_count.load(Ordering::Acquire), 0);
+
+        let snap = manager.snapshot().unwrap();
+        let website = snap.iter().find(|e| e.id == "website-interrupted").unwrap();
+        assert_eq!(website.status, DownloadStatus::Failed);
+        assert!(
+            website
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Start a new website download")
+        );
+
+        let conflict = snap
+            .iter()
+            .find(|e| e.id == "existing-dest-conflict")
+            .unwrap();
+        assert_eq!(conflict.status, DownloadStatus::Failed);
+        assert!(
+            conflict
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("already exists")
+        );
+        assert_eq!(std::fs::read(&pre_existing_dest).unwrap(), original_bytes);
+
+        let capped = snap.iter().find(|e| e.id == "retry-cap-reached").unwrap();
+        assert_eq!(capped.status, DownloadStatus::Failed);
+        assert!(
+            capped
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Automatic resume limit reached")
+        );
+
+        let failed = snap.iter().find(|e| e.id == "already-failed").unwrap();
+        assert_eq!(failed.status, DownloadStatus::Failed);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("Previous permanent failure.")
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_parallel_pause_resume_and_cancel_wake_active_and_semaphore_waiting_segments() {
+        let mp4 = valid_mp4(false);
+        let expected_mp4 = mp4.clone();
+
+        // 1. Pause while 2 segments hold semaphore permits (delayed 250ms) and 2 segments wait on semaphore,
+        // then resume to completion.
+        let (url1, _max_conc1, _obs1, server1) =
+            spawn_concurrent_range_http_server(mp4.clone(), 9, 250, false);
+        let dir = create_test_temp_dir("parallel-pause-resume-cancel");
+        let dest1 = dir.join("pause_resume_parallel.mp4");
+        let manager = DownloadManager::default();
+        manager.configure_connections_per_download(2).unwrap();
+
+        let entry1 = manager
+            .start_download_internal(None, url1, dest1.to_string_lossy().into_owned(), None)
+            .unwrap();
+
+        // Wait until the parallel segments are planned and the download is active
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = manager.snapshot().unwrap();
+            let e = snap.iter().find(|x| x.id == entry1.id).unwrap();
+            if e.status == DownloadStatus::Downloading && e.segments.len() == 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "did not enter parallel downloading");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        manager.pause_download(&entry1.id).unwrap();
+        let paused = wait_for_download_settlement(&manager, &entry1.id);
+        assert_eq!(paused.status, DownloadStatus::Paused);
+        assert!(!paused.segments.is_empty());
+
+        manager.resume_download(None, &entry1.id).unwrap();
+        let completed = wait_for_download_settlement(&manager, &entry1.id);
+        server1.stop_and_join();
+        assert_eq!(
+            completed.status,
+            DownloadStatus::Completed,
+            "resume failed: {:?}",
+            completed.error
+        );
+        assert_eq!(std::fs::read(&dest1).unwrap(), expected_mp4);
+
+        // 2. Cancel while 2 segments are active (delayed 300ms) and 2 segments are waiting on the semaphore (4 segments total, connection limit 2)
+        let (url2, _max_conc2, _obs2, server2) =
+            spawn_concurrent_range_http_server(mp4.clone(), 6, 300, false);
+        let dest2 = dir.join("cancel_parallel.mp4");
+        let mut preset_segments = plan_parallel_segments(mp4.len() as u64, 4);
+        assert_eq!(preset_segments.len(), 4);
+        let cancel_id = "cancel-4-seg-with-2-permits".to_owned();
+        let control = Arc::new(DownloadTaskControl::default());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.max_connections_per_download = 2;
+            state.entries.push(DownloadEntry {
+                id: cancel_id.clone(),
+                url: url2,
+                destination: dest2.to_string_lossy().into_owned(),
+                filename: "cancel_parallel.mp4".into(),
+                status: DownloadStatus::Queued,
+                total_bytes: Some(mp4.len() as u64),
+                downloaded_bytes: 0,
+                speed_bytes_per_second: 0.0,
+                elapsed_ms: 0,
+                remaining_seconds: None,
+                error: None,
+                created_at_ms: 100,
+                updated_at_ms: 100,
+                attempts: 1,
+                hls_playlist: None,
+                hls_completed_parts: None,
+                website_media: None,
+                segments: preset_segments.clone(),
+                etag: Some("\"parallel-v1\"".into()),
+                last_modified: None,
+                notifications_enabled: false,
+                notify_on_complete: false,
+                notify_on_failure: false,
+            });
+            state
+                .controls
+                .insert(cancel_id.clone(), Arc::clone(&control));
+        }
+        spawn_worker(
+            None,
+            Arc::clone(&manager.state),
+            Arc::clone(&manager.concurrency),
+            Arc::clone(&manager.bandwidth),
+            Arc::clone(&manager.worker_count),
+            cancel_id.clone(),
+            control,
+            false,
+        );
+
+        std::thread::sleep(Duration::from_millis(40));
+        manager.cancel_download(None, &cancel_id).unwrap();
+        let cancelled = wait_for_download_settlement(&manager, &cancel_id);
+        server2.stop_and_join();
+
+        assert_eq!(cancelled.status, DownloadStatus::Cancelled);
+        assert!(cancelled.segments.is_empty());
+        assert!(!dest2.exists());
+        assert!(!partial_path(&dest2).exists());
+        for seg in &mut preset_segments {
+            assert!(!segment_part_path(&dest2, &cancel_id, seg.index).exists());
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_parallel_segment_retries_from_exact_offset_and_rejects_changed_validator() {
+        let mp4 = valid_mp4(false);
+        let total = mp4.len();
+        let expected_mp4 = mp4.clone();
+        let segments = plan_parallel_segments(total as u64, 2);
+        assert_eq!(segments.len(), 2);
+        let s0_end = segments[0].end as usize;
+        let s1_start = segments[1].start as usize;
+        let s1_end = segments[1].end as usize;
+        let s1_partial_len = 18_usize;
+
+        // Request 0:Segment 0 full range (0..=s0_end)
+        // Request 1: Segment 1 range (s1_start..=s1_end), but server truncates body after 18 bytes while declaring full Content-Length!
+        // Request 2: Segment 1 retry range ((s1_start + 18)..=s1_end) -> returns remaining bytes!
+        let mp4_for_retry = mp4.clone();
+        let (url1, server1) = spawn_synthetic_http_server(3, move |req_idx, range_hdr| {
+            let range_str = range_hdr.unwrap_or_default();
+            if range_str == format!("bytes=0-{s0_end}") {
+                SyntheticHttpResponse::partial_mp4(
+                    0,
+                    s0_end,
+                    total,
+                    mp4_for_retry[0..=s0_end].to_vec(),
+                )
+            } else if range_str == format!("bytes={s1_start}-{s1_end}") && req_idx <= 1 {
+                let mut r = SyntheticHttpResponse::partial_mp4(
+                    s1_start,
+                    s1_end,
+                    total,
+                    mp4_for_retry[s1_start..s1_start + s1_partial_len].to_vec(),
+                );
+                r.content_length_override = Some(s1_end - s1_start + 1);
+                r
+            } else {
+                let expected_retry_start = s1_start + s1_partial_len;
+                assert_eq!(
+                    range_str,
+                    format!("bytes={expected_retry_start}-{s1_end}"),
+                    "segment retry must request from exact already-written offset"
+                );
+                SyntheticHttpResponse::partial_mp4(
+                    expected_retry_start,
+                    s1_end,
+                    total,
+                    mp4_for_retry[expected_retry_start..=s1_end].to_vec(),
+                )
+            }
+        });
+
+        let dir = create_test_temp_dir("parallel-retry-and-validator");
+        let dest1 = dir.join("retry_offset.mp4");
+        let history_path = dir.join("download-history.json");
+
+        // Also test validator mismatch on a second segmented entry
+        let mp4_for_val = mp4.clone();
+        let (url2, server2) = spawn_synthetic_http_server(2, move |_, range_hdr| {
+            let range_str = range_hdr.unwrap_or_default();
+            if range_str == format!("bytes=0-{s0_end}") {
+                SyntheticHttpResponse::partial_mp4(
+                    0,
+                    s0_end,
+                    total,
+                    mp4_for_val[0..=s0_end].to_vec(),
+                )
+            } else {
+                let mut r = SyntheticHttpResponse::partial_mp4(
+                    s1_start,
+                    s1_end,
+                    total,
+                    mp4_for_val[s1_start..=s1_end].to_vec(),
+                );
+                r.headers = vec![
+                    ("Content-Type".into(), "video/mp4".into()),
+                    (
+                        "Content-Range".into(),
+                        format!("bytes {s1_start}-{s1_end}/{total}"),
+                    ),
+                    ("ETag".into(), "\"changed-etag-v2\"".into()),
+                ];
+                r
+            }
+        });
+        let dest2 = dir.join("validator_changed.mp4");
+
+        let persisted = PersistedDownloads {
+            version: 1,
+            max_concurrent: 2,
+            max_connections_per_download: 1, // serialize requests to our deterministic single-thread server
+            bandwidth_limit_bytes_per_second: None,
+            notifications_enabled: false,
+            notify_on_complete: false,
+            notify_on_failure: false,
+            entries: vec![
+                DownloadEntry {
+                    id: "seg-exact-retry".into(),
+                    url: url1,
+                    destination: dest1.to_string_lossy().into_owned(),
+                    filename: "retry_offset.mp4".into(),
+                    status: DownloadStatus::Downloading,
+                    total_bytes: Some(total as u64),
+                    downloaded_bytes: 0,
+                    speed_bytes_per_second: 0.0,
+                    elapsed_ms: 0,
+                    remaining_seconds: None,
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 100,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments: segments.clone(),
+                    etag: Some("\"synthetic-v1\"".into()),
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+                DownloadEntry {
+                    id: "seg-validator-mismatch".into(),
+                    url: url2,
+                    destination: dest2.to_string_lossy().into_owned(),
+                    filename: "validator_changed.mp4".into(),
+                    status: DownloadStatus::Downloading,
+                    total_bytes: Some(total as u64),
+                    downloaded_bytes: 0,
+                    speed_bytes_per_second: 0.0,
+                    elapsed_ms: 0,
+                    remaining_seconds: None,
+                    error: None,
+                    created_at_ms: 100,
+                    updated_at_ms: 100,
+                    attempts: 1,
+                    hls_playlist: None,
+                    hls_completed_parts: None,
+                    website_media: None,
+                    segments,
+                    etag: Some("\"synthetic-v1\"".into()),
+                    last_modified: None,
+                    notifications_enabled: false,
+                    notify_on_complete: false,
+                    notify_on_failure: false,
+                },
+            ],
+        };
+        std::fs::write(&history_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let manager = DownloadManager::default();
+        manager
+            .initialize_with_history_path(None, history_path)
+            .unwrap();
+
+        let settled1 = wait_for_download_settlement(&manager, "seg-exact-retry");
+        let settled2 = wait_for_download_settlement(&manager, "seg-validator-mismatch");
+        let ranges1 = server1.stop_and_join();
+        let _ranges2 = server2.stop_and_join();
+
+        assert_eq!(
+            settled1.status,
+            DownloadStatus::Completed,
+            "retry download failed: {:?}",
+            settled1.error
+        );
+        assert_eq!(
+            ranges1,
+            vec![
+                Some(format!("bytes=0-{s0_end}")),
+                Some(format!("bytes={s1_start}-{s1_end}")),
+                Some(format!("bytes={}-{s1_end}", s1_start + s1_partial_len)),
+            ]
+        );
+        assert_eq!(std::fs::read(&dest1).unwrap(), expected_mp4);
+
+        assert_eq!(settled2.status, DownloadStatus::Failed);
+        assert!(
+            settled2
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("file validator changed")
+        );
+        assert!(!dest2.exists());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_clean_shutdown_checkpoints_active_and_paused_downloads_for_automatic_startup_resume()
+     {
+        let mp4 = valid_mp4(false);
+        let expected_mp4 = mp4.clone();
+
+        // Server holds range responses for 300ms so cancel_all_downloads catches the active parallel download mid-flight,
+        // and then serves the 4 range requests when the new DownloadManager instance starts up!
+        let (url, _max_conc, _obs, server) =
+            spawn_concurrent_range_http_server(mp4.clone(), 9, 200, false);
+        let dir = create_test_temp_dir("clean-shutdown-auto-resume");
+        let history_path = dir.join("download-history.json");
+        let active_dest = dir.join("active_on_exit.mp4");
+        let paused_dest = dir.join("paused_on_exit.mp4");
+        std::fs::write(partial_path(&paused_dest), &mp4[0..32]).unwrap();
+
+        let manager1 = DownloadManager::default();
+        manager1
+            .initialize_with_history_path(None, history_path.clone())
+            .unwrap();
+        {
+            let mut state = manager1.state.lock().unwrap();
+            state.entries.push(DownloadEntry {
+                id: "stay-paused-across-exit".into(),
+                url: "http://127.0.0.1:9/paused.mp4".into(),
+                destination: paused_dest.to_string_lossy().into_owned(),
+                filename: "paused_on_exit.mp4".into(),
+                status: DownloadStatus::Paused,
+                total_bytes: Some(mp4.len() as u64),
+                downloaded_bytes: 32,
+                speed_bytes_per_second: 0.0,
+                elapsed_ms: 25,
+                remaining_seconds: None,
+                error: None,
+                created_at_ms: 100,
+                updated_at_ms: 125,
+                attempts: 1,
+                hls_playlist: None,
+                hls_completed_parts: None,
+                website_media: None,
+                segments: Vec::new(),
+                etag: Some("\"parallel-v1\"".into()),
+                last_modified: None,
+                notifications_enabled: false,
+                notify_on_complete: false,
+                notify_on_failure: false,
+            });
+            persist_locked(&state).unwrap();
+        }
+
+        let active_entry = manager1
+            .start_download_internal(None, url, active_dest.to_string_lossy().into_owned(), None)
+            .unwrap();
+
+        // Wait until parallel segments are planned and active
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = manager1.snapshot().unwrap();
+            let e = snap.iter().find(|x| x.id == active_entry.id).unwrap();
+            if e.status == DownloadStatus::Downloading && e.segments.len() == 4 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "did not enter parallel download");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Simulate clean application exit (`request_exit` -> `cancel_all_downloads`)
+        let (workers, count) = cancel_all_downloads(&manager1).unwrap();
+        assert_eq!(count, 1);
+        while workers.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(workers.load(Ordering::Acquire), 0);
+
+        // Verify persisted history kept active download in Downloading and paused download in Paused
+        let manager2 = DownloadManager::default();
+        manager2
+            .initialize_with_history_path(None, history_path)
+            .unwrap();
+
+        let settled = wait_for_download_settlement(&manager2, &active_entry.id);
+        server.stop_and_join();
+
+        assert_eq!(
+            settled.status,
+            DownloadStatus::Completed,
+            "auto-resume after clean shutdown failed: {:?}",
+            settled.error
+        );
+        assert_eq!(std::fs::read(&active_dest).unwrap(), expected_mp4);
+
+        let snap2 = manager2.snapshot().unwrap();
+        let paused_after = snap2
+            .iter()
+            .find(|x| x.id == "stay-paused-across-exit")
+            .unwrap();
+        assert_eq!(paused_after.status, DownloadStatus::Paused);
+        assert_eq!(paused_after.downloaded_bytes, 32);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn build_synthetic_hls_fmp4_parts() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut init = mp4_atom(b"ftyp", b"isom\0\0\0\0isom");
+        init.extend(valid_mp4_initialization(true));
+
+        let make_fragment = |marker: u8| {
+            let mut track_fragment = mp4_atom(b"tfhd", &[0; 8]);
+            track_fragment.extend(mp4_atom(b"trun", &[0; 8]));
+            let mut movie_fragment = mp4_atom(b"mfhd", &[0; 8]);
+            movie_fragment.extend(mp4_atom(b"traf", &track_fragment));
+            let mut frag = mp4_atom(b"moof", &movie_fragment);
+            frag.extend(mp4_atom(b"mdat", &[marker; 24]));
+            frag
+        };
+
+        (init, make_fragment(0x11), make_fragment(0x22))
+    }
+
+    #[test]
+    fn synthetic_hls_clean_shutdown_checkpoints_parts_and_resumes_automatically_on_restart() {
+        let (init, seg1, seg2) = build_synthetic_hls_fmp4_parts();
+        let mut expected_mp4 = Vec::new();
+        expected_mp4.extend_from_slice(&init);
+        expected_mp4.extend_from_slice(&seg1);
+        expected_mp4.extend_from_slice(&seg2);
+
+        let init_len = init.len();
+        let seg1_len = seg1.len();
+        let seg2_len = seg2.len();
+        let init_for_srv = init.clone();
+        let seg1_for_srv = seg1.clone();
+        let seg2_for_srv = seg2.clone();
+
+        // Request 0: init.mp4 (fast)
+        // Request 1: seg1.m4s (fast)
+        // Request 2: seg2.m4s (delayed 350ms so clean shutdown catches HLS mid-segment)
+        // Request 3: seg2.m4s (fast, requested on startup automatic resume!)
+        let (base_url, server) = spawn_synthetic_http_server(4, move |idx, _| match idx {
+            0 => SyntheticHttpResponse::ok_mp4(init_for_srv.clone()),
+            1 => SyntheticHttpResponse::ok_mp4(seg1_for_srv.clone()),
+            2 => {
+                let mut r = SyntheticHttpResponse::ok_mp4(seg2_for_srv.clone());
+                r.delay_before_body_ms = 350;
+                r
+            }
+            _ => SyntheticHttpResponse::ok_mp4(seg2_for_srv.clone()),
+        });
+        let origin = base_url.trim_end_matches("/video.mp4");
+        let manifest_url = format!("{origin}/playlist.m3u8");
+        let playlist = HlsPlaylist {
+            version: 1,
+            container: "fmp4".into(),
+            manifest_size_bytes: 256,
+            init: HlsResource {
+                url: format!("{origin}/init.mp4"),
+                byte_range: None,
+            },
+            segments: vec![
+                HlsResource {
+                    url: format!("{origin}/seg1.m4s"),
+                    byte_range: None,
+                },
+                HlsResource {
+                    url: format!("{origin}/seg2.m4s"),
+                    byte_range: None,
+                },
+            ],
+            expected_bytes: None,
+        };
+
+        let dir = create_test_temp_dir("hls-clean-shutdown-resume");
+        let history_path = dir.join("download-history.json");
+        let dest = dir.join("hls_resume.mp4");
+
+        let manager1 = DownloadManager::default();
+        manager1
+            .initialize_with_history_path(None, history_path.clone())
+            .unwrap();
+        let entry = manager1
+            .start_download_internal(
+                None,
+                manifest_url,
+                dest.to_string_lossy().into_owned(),
+                Some(playlist),
+            )
+            .unwrap();
+
+        // Wait until init + seg1 (2 parts) are committed and seg2 is in-flight
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = manager1.snapshot().unwrap();
+            let current = snap.iter().find(|e| e.id == entry.id).unwrap();
+            if current.hls_completed_parts == Some(2) {
+                break;
+            }
+            assert!(
+                !current.status.is_terminal() && Instant::now() < deadline,
+                "HLS download did not reach 2 committed parts; state: {current:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Trigger clean application shutdown
+        let (workers, active_count) = cancel_all_downloads(&manager1).unwrap();
+        assert_eq!(active_count, 1);
+        while workers.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            workers.load(Ordering::Acquire),
+            0,
+            "HLS worker must exit promptly on clean shutdown"
+        );
+
+        let snap_after_shutdown = manager1.snapshot().unwrap();
+        let checkpointed = snap_after_shutdown
+            .iter()
+            .find(|e| e.id == entry.id)
+            .unwrap();
+        assert_eq!(checkpointed.status, DownloadStatus::Downloading);
+        assert_eq!(checkpointed.hls_completed_parts, Some(2));
+        assert_eq!(
+            checkpointed.downloaded_bytes,
+            (init_len + seg1_len) as u64
+        );
+        assert!(
+            !hls_staging_path(&dest, &entry.id).exists(),
+            "incomplete HLS temporary staging file must be cleaned up on shutdown"
+        );
+        assert_eq!(
+            std::fs::metadata(partial_path(&dest)).unwrap().len(),
+            (init_len + seg1_len) as u64
+        );
+        assert!(!dest.exists());
+
+        // Reload history in a fresh DownloadManager and verify automatic resume completes HLS
+        let manager2 = DownloadManager::default();
+        manager2
+            .initialize_with_history_path(None, history_path)
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager2, &entry.id);
+        let observed_requests = server.stop_and_join();
+
+        assert_eq!(
+            settled.status,
+            DownloadStatus::Completed,
+            "HLS auto-resume failed: {:?}",
+            settled.error
+        );
+        assert_eq!(settled.hls_completed_parts, Some(3));
+        assert_eq!(
+            settled.downloaded_bytes,
+            (init_len + seg1_len + seg2_len) as u64
+        );
+        assert_eq!(observed_requests.len(), 4);
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+        assert!(!partial_path(&dest).exists());
+        assert!(!hls_staging_path(&dest, &entry.id).exists());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_cancel_vs_completion_race_across_parallel_sequential_and_hls_workers() {
+        struct CommitHookGuard;
+        impl Drop for CommitHookGuard {
+            fn drop(&mut self) {
+                if let Ok(mut guard) = TEST_COMMIT_HOOK.lock() {
+                    *guard = None;
+                }
+            }
+        }
+        let _hook_guard = CommitHookGuard;
+
+        let dir = create_test_temp_dir("cancel-vs-completion-races");
+        let mp4 = valid_mp4(false);
+
+        // 1. Parallel worker: cancel immediately after MP4 validation AND immediately after fs::rename
+        for trigger_stage in ["parallel_after_validation", "parallel_after_rename"] {
+            {
+                let mut guard = TEST_COMMIT_HOOK.lock().unwrap();
+                let stage_target = trigger_stage.to_owned();
+                *guard = Some(Box::new(move |stage, _id, ctrl| {
+                    if stage == stage_target {
+                        ctrl.request_cancel();
+                    }
+                }));
+            }
+            let (url, _max_c, _obs, server) =
+                spawn_concurrent_range_http_server(mp4.clone(), 5, 0, false);
+            let dest = dir.join(format!("{trigger_stage}.mp4"));
+            let manager = DownloadManager::default();
+            let entry = manager
+                .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+                .unwrap();
+            let settled = wait_for_download_settlement(&manager, &entry.id);
+            server.stop_and_join();
+
+            assert_eq!(
+                settled.status,
+                DownloadStatus::Cancelled,
+                "parallel {trigger_stage} must end Cancelled, not Completed"
+            );
+            assert!(
+                !dest.exists(),
+                "parallel {trigger_stage} must not leave newly created destination file"
+            );
+            assert!(!partial_path(&dest).exists());
+        }
+
+        // 2. Sequential worker: cancel immediately after MP4 validation AND immediately after fs::rename
+        for trigger_stage in ["sequential_after_validation", "sequential_after_rename"] {
+            {
+                let mut guard = TEST_COMMIT_HOOK.lock().unwrap();
+                let stage_target = trigger_stage.to_owned();
+                *guard = Some(Box::new(move |stage, _id, ctrl| {
+                    if stage == stage_target {
+                        ctrl.request_cancel();
+                    }
+                }));
+            }
+            let mp4_srv = mp4.clone();
+            let (url, server) = spawn_synthetic_http_server(1, move |_, _| {
+                SyntheticHttpResponse::ok_mp4(mp4_srv.clone())
+            });
+            let dest = dir.join(format!("{trigger_stage}.mp4"));
+            let manager = DownloadManager::default();
+            let entry = manager
+                .start_download_internal(None, url, dest.to_string_lossy().into_owned(), None)
+                .unwrap();
+            let settled = wait_for_download_settlement(&manager, &entry.id);
+            server.stop_and_join();
+
+            assert_eq!(
+                settled.status,
+                DownloadStatus::Cancelled,
+                "sequential {trigger_stage} must end Cancelled, not Completed"
+            );
+            assert!(
+                !dest.exists(),
+                "sequential {trigger_stage} must not leave newly created destination file"
+            );
+        }
+
+        // 3. HLS worker: cancel immediately after MP4 validation AND immediately after fs::rename
+        let (init, seg1, seg2) = build_synthetic_hls_fmp4_parts();
+        for trigger_stage in ["hls_after_validation", "hls_after_rename"] {
+            {
+                let mut guard = TEST_COMMIT_HOOK.lock().unwrap();
+                let stage_target = trigger_stage.to_owned();
+                *guard = Some(Box::new(move |stage, _id, ctrl| {
+                    if stage == stage_target {
+                        ctrl.request_cancel();
+                    }
+                }));
+            }
+            let i_srv = init.clone();
+            let s1_srv = seg1.clone();
+            let s2_srv = seg2.clone();
+            let (base_url, server) = spawn_synthetic_http_server(3, move |idx, _| match idx {
+                0 => SyntheticHttpResponse::ok_mp4(i_srv.clone()),
+                1 => SyntheticHttpResponse::ok_mp4(s1_srv.clone()),
+                _ => SyntheticHttpResponse::ok_mp4(s2_srv.clone()),
+            });
+            let origin = base_url.trim_end_matches("/video.mp4");
+            let playlist = HlsPlaylist {
+                version: 1,
+                container: "fmp4".into(),
+                manifest_size_bytes: 256,
+                init: HlsResource {
+                    url: format!("{origin}/init.mp4"),
+                    byte_range: None,
+                },
+                segments: vec![
+                    HlsResource {
+                        url: format!("{origin}/seg1.m4s"),
+                        byte_range: None,
+                    },
+                    HlsResource {
+                        url: format!("{origin}/seg2.m4s"),
+                        byte_range: None,
+                    },
+                ],
+                expected_bytes: None,
+            };
+            let dest = dir.join(format!("{trigger_stage}.mp4"));
+            let manager = DownloadManager::default();
+            let entry = manager
+                .start_download_internal(
+                    None,
+                    format!("{origin}/playlist.m3u8"),
+                    dest.to_string_lossy().into_owned(),
+                    Some(playlist),
+                )
+                .unwrap();
+            let settled = wait_for_download_settlement(&manager, &entry.id);
+            server.stop_and_join();
+
+            assert_eq!(
+                settled.status,
+                DownloadStatus::Cancelled,
+                "HLS {trigger_stage} must end Cancelled, not Completed"
+            );
+            assert!(
+                !dest.exists(),
+                "HLS {trigger_stage} must not leave newly created destination file"
+            );
+        }
+
+        // 4. Verify pre-existing destination appearing before rename is NEVER overwritten or deleted
+        let existing_dest = dir.join("preexisting_protected.mp4");
+        let existing_bytes = b"UNRELATED_EXISTING_USER_FILE".to_vec();
+        {
+            let existing_path_for_hook = existing_dest.clone();
+            let existing_bytes_for_hook = existing_bytes.clone();
+            let mut guard = TEST_COMMIT_HOOK.lock().unwrap();
+            *guard = Some(Box::new(move |stage, _id, _ctrl| {
+                if stage == "hls_after_validation" {
+                    let _ = std::fs::write(&existing_path_for_hook, &existing_bytes_for_hook);
+                }
+            }));
+        }
+        let i_srv = init.clone();
+        let s1_srv = seg1.clone();
+        let s2_srv = seg2.clone();
+        let (base_url, server) = spawn_synthetic_http_server(3, move |idx, _| match idx {
+            0 => SyntheticHttpResponse::ok_mp4(i_srv.clone()),
+            1 => SyntheticHttpResponse::ok_mp4(s1_srv.clone()),
+            _ => SyntheticHttpResponse::ok_mp4(s2_srv.clone()),
+        });
+        let origin = base_url.trim_end_matches("/video.mp4");
+        let playlist = HlsPlaylist {
+            version: 1,
+            container: "fmp4".into(),
+            manifest_size_bytes: 256,
+            init: HlsResource {
+                url: format!("{origin}/init.mp4"),
+                byte_range: None,
+            },
+            segments: vec![
+                HlsResource {
+                    url: format!("{origin}/seg1.m4s"),
+                    byte_range: None,
+                },
+                HlsResource {
+                    url: format!("{origin}/seg2.m4s"),
+                    byte_range: None,
+                },
+            ],
+            expected_bytes: None,
+        };
+        let manager = DownloadManager::default();
+        let entry = manager
+            .start_download_internal(
+                None,
+                format!("{origin}/playlist.m3u8"),
+                existing_dest.to_string_lossy().into_owned(),
+                Some(playlist),
+            )
+            .unwrap();
+        let settled = wait_for_download_settlement(&manager, &entry.id);
+        server.stop_and_join();
+
+        assert_eq!(settled.status, DownloadStatus::Failed);
+        assert!(
+            settled
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("appeared during the HLS download")
+        );
+        assert_eq!(
+            std::fs::read(&existing_dest).unwrap(),
+            existing_bytes,
+            "pre-existing destination file must never be overwritten or deleted"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_retry_emits_queued_immediately_when_concurrency_slots_are_full_and_completes_on_release()
+     {
+        let mp4 = valid_mp4(false);
+        let expected_mp4 = mp4.clone();
+        let (url, server) = spawn_synthetic_http_server(1, move |_, _| {
+            SyntheticHttpResponse::ok_mp4(mp4.clone())
+        });
+        let dir = create_test_temp_dir("retry-full-slots");
+        let dest = dir.join("retried_queued.mp4");
+        let manager = DownloadManager::default();
+        let retry_id = "failed-entry-for-full-slot-retry".to_owned();
+
+        // Occupy the only concurrency slot (`max_concurrent = 1`)
+        let hold_control = Arc::new(DownloadTaskControl::default());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.max_concurrent = 1;
+            state.entries.push(DownloadEntry {
+                id: retry_id.clone(),
+                url,
+                destination: dest.to_string_lossy().into_owned(),
+                filename: "retried_queued.mp4".into(),
+                status: DownloadStatus::Failed,
+                total_bytes: None,
+                downloaded_bytes: 0,
+                speed_bytes_per_second: 0.0,
+                elapsed_ms: 10,
+                remaining_seconds: None,
+                error: Some("Transient network failure".into()),
+                created_at_ms: 100,
+                updated_at_ms: 110,
+                attempts: 1,
+                hls_playlist: None,
+                hls_completed_parts: None,
+                website_media: None,
+                segments: Vec::new(),
+                etag: None,
+                last_modified: None,
+                notifications_enabled: false,
+                notify_on_complete: false,
+                notify_on_failure: false,
+            });
+        }
+        let held_slot = tauri::async_runtime::block_on(async {
+            manager
+                .concurrency
+                .acquire(&manager.state, &hold_control)
+                .await
+                .unwrap()
+                .expect("should occupy the only concurrency slot")
+        });
+
+        TEST_EMITTED_EVENTS.lock().unwrap().clear();
+        manager
+            .retry_download_internal(None, retry_id.clone(), false)
+            .unwrap();
+
+        // Verify Queued event was emitted synchronously before worker could execute
+        let emitted_immediately = TEST_EMITTED_EVENTS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _, _)| id == &retry_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            emitted_immediately,
+            vec![(retry_id.clone(), DownloadStatus::Queued, 2)],
+            "retry_download_internal must emit Queued with incremented attempts before worker execution"
+        );
+
+        // Confirm entry remains Queued while concurrency slot is held
+        std::thread::sleep(Duration::from_millis(40));
+        let snap_while_full = manager.snapshot().unwrap();
+        let queued_entry = snap_while_full.iter().find(|e| e.id == retry_id).unwrap();
+        assert_eq!(queued_entry.status, DownloadStatus::Queued);
+        assert_eq!(queued_entry.attempts, 2);
+        assert!(queued_entry.error.is_none());
+
+        // Release slot and verify the retry proceeds to Completed
+        drop(held_slot);
+        let settled = wait_for_download_settlement(&manager, &retry_id);
+        server.stop_and_join();
+
+        assert_eq!(
+            settled.status,
+            DownloadStatus::Completed,
+            "retry failed after slot release: {:?}",
+            settled.error
+        );
+        assert_eq!(settled.attempts, 2);
+        assert_eq!(std::fs::read(&dest).unwrap(), expected_mp4);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
